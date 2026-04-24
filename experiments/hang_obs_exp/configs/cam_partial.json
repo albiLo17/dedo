@@ -1,0 +1,11 @@
+{
+    "_description": "Partial-observability camera for HangProcCloth-v1. Near-top-down view at -82 deg pitch. The cloth surface is visible from above but the spatial relationship between the hole and the hanger hook is lost (depth ambiguity).",
+    "_cam_viewmat_equivalent": [8.0, -82.0, 45.0, 0.0, 0.5, 8.0],
+    "proj_matrix": [
+        0.7499999403953552, 0.0,  0.0,                   0.0,
+        0.0,                1.0,  0.0,                   0.0,
+        0.0,                0.0, -1.0000200271606445,    -1.0,
+        0.0,                0.0, -0.02000020071864128,    0.0
+    ],
+    "_note": "The cam_viewmat [dist,pitch,yaw,tx,ty,tz] = [8,-82,45,0,0.5,8.0] is the authoritative spec used in training scripts."
+}
