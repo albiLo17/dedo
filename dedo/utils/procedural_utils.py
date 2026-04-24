@@ -17,6 +17,7 @@ add further comments, unify the style, improve efficiency and add unittests.
 """
 
 import os
+import tempfile
 import numpy as np
 from matplotlib import pyplot as plt
 
@@ -48,9 +49,8 @@ def gen_procedural_hang_cloth(args, preset_obj_name, deform_info_dict):
 
     # cloth save path
     rand_id = np.random.uniform(1e7)
-    args.deform_obj = f'/tmp/procedural_hang{rand_id}.obj'
-    data_path = os.path.join(os.path.split(__file__)[0], '..', 'data')
-    savepath = os.path.join(data_path, args.deform_obj)
+    args.deform_obj = os.path.join(tempfile.gettempdir(), f'procedural_hang{rand_id}.obj')
+    savepath = args.deform_obj
 
     cloth_obj_path, cloth_anchor_indices, gt_loop_vertices = create_cloth_obj(
         # min_point=[0.00, -0.3, -0.3], max_point=[0.00, 0.3, 0.3],
@@ -98,9 +98,8 @@ def gen_procedural_button_cloth(args, preset_obj_name, deform_info_dict):
 
     # Make temporary obj file path.
     rand_id = np.random.uniform(1e7)
-    args.deform_obj = f'/tmp/procedural_hang{rand_id}.obj'
-    data_path = os.path.join(os.path.split(__file__)[0], '..', 'data')
-    savepath = os.path.join(data_path, args.deform_obj)
+    args.deform_obj = os.path.join(tempfile.gettempdir(), f'procedural_hang{rand_id}.obj')
+    savepath = args.deform_obj
 
     node_coords = []
     cloth_obj_path, cloth_anchor_indices, gt_loop_vertices, fixed_anchors = create_cloth_obj(

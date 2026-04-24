@@ -58,14 +58,16 @@ def visualize_pcd(pcd:np.ndarray, ids=None, intersection:bool=False, save_path=N
     plt.close(fig)
 
 
-def visualize_data(img:np.ndarray, pcd:np.ndarray, ids:np.ndarray, 
+def visualize_data(img:np.ndarray, pcd:np.ndarray, ids:np.ndarray,
                     azimuth:float=160, elevation:float=12,
-                    status:bool=True, fig=None, save_path=None) -> None:
-    """ Two pannel plot, with 3D pcd view on left, 2D RGB view on the right
-    
-    """
+                    status:bool=True, fig=None, save_path=None,
+                    bbox_pcd:np.ndarray=None) -> None:
+    """ Two or three panel plot: 3D pcd | RGB | (optional) bounding box """
+    from dedo.utils.bbox_utils import visualize_aabb
+
+    n_panels = 4 if bbox_pcd is not None else 2
     if fig is None:
-        fig = plt.figure(figsize=(10,5))
+        fig = plt.figure(figsize=(5 * n_panels, 5))
 
     color = 'green' if status else 'red'
 
@@ -74,8 +76,8 @@ def visualize_data(img:np.ndarray, pcd:np.ndarray, ids:np.ndarray,
     id_remapped = np.array([id_remap[id] for id in ids])
 
     # The combined pcd
-    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
-    ax1.scatter(pcd[:,0], pcd[:,1], pcd[:,2], 
+    ax1 = fig.add_subplot(1, n_panels, 1, projection='3d')
+    ax1.scatter(pcd[:,0], pcd[:,1], pcd[:,2],
                     marker='.', s=2.0, c=id_remapped, cmap=plt.cm.PRGn)
     ax1.set_xlim([-5, 5])
     ax1.set_ylim([-3, 10])
@@ -84,11 +86,17 @@ def visualize_data(img:np.ndarray, pcd:np.ndarray, ids:np.ndarray,
     ax1.view_init(elev=elevation, azim=azimuth)
 
     # The original image
-    ax2 = fig.add_subplot(1, 2, 2)
+    ax2 = fig.add_subplot(1, n_panels, 2)
     ax2.imshow(img)
     ax2.set_xticks([])
     ax2.set_yticks([])
     ax2.set_title('RGB View')
+
+    # Bounding box + 2D grid panels
+    if bbox_pcd is not None:
+        ax3 = fig.add_subplot(1, n_panels, 3, projection='3d')
+        ax4 = fig.add_subplot(1, n_panels, 4)
+        visualize_aabb(bbox_pcd, ax=ax3, ax_2d=ax4)
 
     if save_path is not None:
         plt.savefig(save_path)

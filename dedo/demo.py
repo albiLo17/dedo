@@ -23,6 +23,7 @@ import gym
 
 from dedo.utils.args import get_args
 from dedo.utils.pcd_utils import visualize_data, render_video
+from dedo.utils.bbox_utils import find_holes, save_pca_grid_frame
 
 def policy_simple(obs, act, task, step):
     """A very simple default policy."""
@@ -73,9 +74,17 @@ def play(env, num_episodes, args):
                 pcd_obs = env.get_pcd_obs()
                 img, pcd, ids = pcd_obs.values()
                 if args.cam_resolution > 0:
-                    os.makedirs(f"{args.logdir}/pcd", exist_ok=True) # tmpfolder
+                    os.makedirs(f"{args.logdir}/pcd", exist_ok=True)
                     save_path = f'{args.logdir}/pcd/{step:06d}.png'
-                    visualize_data(img, pcd, ids, fig=pcd_fig, save_path=save_path)
+                    cloth_mask = ids.squeeze() == env.deform_id
+                    cloth_pcd = pcd[cloth_mask]
+                    if step == 0:
+                        os.makedirs(f"{args.logdir}/debug", exist_ok=True)
+                        find_holes(cloth_pcd, debug_save=f"{args.logdir}/debug/grid_step0.png")[0]
+                    os.makedirs(f"{args.logdir}/grid", exist_ok=True)
+                    save_pca_grid_frame(cloth_pcd, f"{args.logdir}/grid/{step:06d}.png")
+                    visualize_data(img, pcd, ids, fig=pcd_fig, save_path=save_path,
+ x m     m =                                  bbox_pcd=cloth_pcd)
 
             if args.viz and (args.cam_resolution > 0) and step % 10 == 0:
                 if not args.pcd: # Other visual for pcd mode
@@ -88,7 +97,8 @@ def play(env, num_episodes, args):
         input('Episode ended; press enter to go on')
         
         if args.pcd:
-            render_video(f'{args.logdir}/pcd', f'{args.logdir}/pcd_test.mp4')            
+            render_video(f'{args.logdir}/pcd', f'{args.logdir}/pcd_test.mp4')
+            render_video(f'{args.logdir}/grid', f'{args.logdir}/grid_test.mp4')
 
         env.close()
 
