@@ -1,0 +1,17 @@
+{
+    "_description": "Full-observability camera for HangProcCloth-v1. Front-angled view at 45 deg yaw, -25 deg pitch. Both the cloth hole and the hanger hook are clearly visible in frame.",
+    "_cam_viewmat_equivalent": [9.0, -25.0, 45.0, 0.0, 0.5, 6.5],
+    "view_matrix": [
+        0.7071067690849304, -0.35355338454246521, 0.6123724579811096, 0.0,
+        0.7071067690849304,  0.35355338454246521,-0.6123724579811096, 0.0,
+        0.0,                 0.8660253882408142,  0.5,                0.0,
+        0.0,                 0.0,                -9.0,                1.0
+    ],
+    "_note": "view_matrix is approximate; actual matrix computed by pybullet from cam_viewmat args. The cam_viewmat [dist,pitch,yaw,tx,ty,tz] = [9,-25,45,0,0.5,6.5] is the authoritative spec used in training scripts.",
+    "proj_matrix": [
+        0.7499999403953552, 0.0,  0.0,                   0.0,
+        0.0,                1.0,  0.0,                   0.0,
+        0.0,                0.0, -1.0000200271606445,    -1.0,
+        0.0,                0.0, -0.02000020071864128,    0.0
+    ]
+}
