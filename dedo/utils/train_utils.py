@@ -40,11 +40,10 @@ def init_train(algo, args, tags=None):
         logdir = os.path.join(os.path.expanduser(args.logdir), subdir)
         if args.use_wandb:
             wandb.init(config=vars(args), project='dedo',
-                       name=logdir, tags=tags)
-            wandb.init(sync_tensorboard=False)
+                       name=logdir, tags=tags, sync_tensorboard=True)
             try:  # patch only once, if more than one run, ignore error
-                wandb.tensorboard.patch(tensorboardX=True, pytorch=True)
-            except ValueError as e:
+                wandb.tensorboard.patch()
+            except Exception:
                 pass
     device = args.device
     if not torch.cuda.is_available():

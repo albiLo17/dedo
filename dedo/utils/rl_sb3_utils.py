@@ -11,6 +11,7 @@ add further comments, unify the style, improve efficiency and add unittests.
 """
 import os
 import pickle
+from collections import deque
 
 import cv2
 import torch
@@ -94,6 +95,9 @@ class CustomCallback(BaseCallback):
         self._viz = viz
         self._debug = debug
         self._steps_since_save = num_steps_between_save  # save right away
+        self._episode_count = 0
+        self._success_window = deque(maxlen=100)
+        self._eval_count = 0
 
     def _on_training_start(self) -> None:
         """
@@ -119,6 +123,14 @@ class CustomCallback(BaseCallback):
 
         :return: (bool) If the callback returns False, training is aborted early.
         """
+        for info in self.locals.get('infos', []):
+            if 'is_success' in info:
+                self._episode_count += 1
+                self._success_window.append(int(info['is_success']))
+                self.logger.record('rollout/success_rate_100',
+                                   sum(self._success_window) / len(self._success_window))
+                self.logger.record('rollout/episodes', self._episode_count)
+
         self._steps_since_save += self._num_train_envs
         if self._steps_since_save >= self._num_steps_between_save:
             # Save checkpoint.
@@ -128,23 +140,36 @@ class CustomCallback(BaseCallback):
                             open(os.path.join(self._logdir, 'args.pkl'), 'wb'),
                             protocol=pickle.HIGHEST_PROTOCOL)
             self._steps_since_save = 0
-            # Record video.
-            if not self._my_args.disable_logging_video:
+            self._eval_count += 1
+            # Eval every 2 checkpoints, video every 4.
+            if self._eval_count % 2 == 0:
+                log_video = (not self._my_args.disable_logging_video
+                             and self._eval_count % 4 == 0)
                 screens = []
+                eval_successes = []
 
-                def grab_screens(_locals, _globals):
-                    screen = self._eval_env.render(
-                        mode='rgb_array', width=300, height=300)
-                    # PyTorch uses CxHxW vs HxWxC gym (and TF) images
-                    screens.append(screen.transpose(2, 0, 1))
+                def grab_screens(_locals, _globals=None):
+                    if log_video:
+                        screen = self._eval_env.render(
+                            mode='rgb_array', width=300, height=300)
+                        screens.append(screen.transpose(2, 0, 1))
+                    info = _locals.get('info', {})
+                    if 'is_success' in info:
+                        eval_successes.append(int(info['is_success']))
 
                 evaluate_policy(
                     self.model, self._eval_env, callback=grab_screens,
-                    n_eval_episodes=1, deterministic=False)
-                self.logger.record(
-                    'trajectory/video',
-                    Video(torch.ByteTensor([screens]), fps=50),
-                    exclude=('stdout', 'log', 'json', 'csv'))
+                    n_eval_episodes=5, deterministic=True)
+
+                if eval_successes:
+                    self.logger.record('eval/success_rate',
+                                       sum(eval_successes) / len(eval_successes))
+
+                if screens:
+                    self.logger.record(
+                        'trajectory/video',
+                        Video(torch.ByteTensor([screens]), fps=50),
+                        exclude=('stdout', 'log', 'json', 'csv'))
 
         return True
 

@@ -28,4 +28,5 @@ ${PYTHON} -m dedo.run_rl_sb3 \
     --log_save_interval=50 \
     --lr=3e-4 \
     --seed=42 \
+    --use_wandb \
     "$@"

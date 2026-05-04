@@ -42,7 +42,7 @@ class DeformEnv(gym.Env):
     STEPS_AFTER_DONE = 500     # steps after releasing anchors at the end
     FORCE_REWARD_MULT = 1e-4   # scaling for the force penalties
     FINAL_REWARD_MULT = 400    # multiply the final reward (for sparse rewards)
-    SUCESS_REWARD_TRESHOLD = 2.5  # approx. threshold for task success/failure
+    SUCESS_REWARD_TRESHOLD = 7.5  # approx. threshold for task success/failure
 
     def __init__(self, args):
         self.args = args
@@ -87,6 +87,14 @@ class DeformEnv(gym.Env):
         if self.args.debug:
             print('Created DeformEnv with obs', self.observation_space.shape,
                   'act', self.action_space.shape)
+
+        # Optional: render frames during make_final_steps (the post-policy
+        # settle phase) so external video loggers can show the cloth falling.
+        # Toggled by an external callback before/after each eval episode;
+        # default off to avoid render cost during training.
+        self._record_settle_frames = False
+        self._settle_render_kwargs = dict(width=300, height=300)
+        self._settle_frame_stride = 1  # every Nth recorded sub-step
 
         # Point cloud observation initilization
         self.pcd_mode = args.pcd
@@ -402,6 +410,9 @@ class DeformEnv(gym.Env):
         change_anchor_color_gray(self.sim, self.anchor_ids[0])
         change_anchor_color_gray(self.sim, self.anchor_ids[1])
         info = {'final_obs': []}
+        if self._record_settle_frames:
+            info['settle_frames'] = []
+        sub_step_idx = 0
         for sim_step in range(DeformEnv.STEPS_AFTER_DONE):
             # For lasso pull the string at the end to test lasso loop.
             # For other tasks noop action to let the anchors fall.
@@ -414,6 +425,11 @@ class DeformEnv(gym.Env):
             if sim_step % self.args.sim_steps_per_action == 0:
                 next_obs, _ = self.get_obs()
                 info['final_obs'].append(next_obs)
+                if (self._record_settle_frames and
+                        sub_step_idx % self._settle_frame_stride == 0):
+                    info['settle_frames'].append(self.render(
+                        mode='rgb_array', **self._settle_render_kwargs))
+                sub_step_idx += 1
         return info
 
     def get_pcd_obs(self):

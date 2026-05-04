@@ -85,7 +85,7 @@ def main(args):
                  'tensorboard_log': args.logdir, 'verbose': 1}
     num_steps_between_save = args.log_save_interval*10
     if on_policy:
-        num_steps_between_save *= 10  # less frequent logging
+        num_steps_between_save *= 50  # ~5 PPO rollouts between checkpoints
     if not on_policy and args.cam_resolution > 0:
         rl_kwargs['buffer_size'] = args.replay_size
     policy_name = 'MlpPolicy'
