@@ -104,14 +104,24 @@ parser.add_argument('--vel_penalty', type=float, default=0.0,
                          'identical reward functions. 0 = off.')
 # BC pretrain.
 parser.add_argument('--bc_episodes', type=int, default=0,
-                    help='If >0 and --bc_demo_path not set: collect '
-                         'scripted hole-aware demos for BC pretrain.')
+                    help='If >0 and --bc_demo_path not set: target '
+                         'number of scripted hole-aware demos to KEEP '
+                         'for BC pretrain. The collector retries until '
+                         'it has this many demos that pass the keep '
+                         'criterion (any if --bc_demos_only_success '
+                         'off; only is_success=1 if on), capped at '
+                         '~3x attempts. Dataset size is therefore '
+                         'deterministic across seeds.')
 parser.add_argument('--bc_epochs', type=int, default=20)
 parser.add_argument('--bc_lr', type=float, default=1e-3)
 parser.add_argument('--bc_demo_path', type=str, default=None,
                     help='Directory of demo_NNN.pkl files from '
                          'record_demo.py.')
-parser.add_argument('--bc_demos_only_success', action='store_true')
+parser.add_argument('--bc_demos_only_success', action='store_true',
+                    help='Filter BC demos to only those that fire '
+                         'is_success at terminal step. Applies to BOTH '
+                         'manual demos (loaded from --bc_demo_path) and '
+                         'scripted demos collected via --bc_episodes.')
 extra_args, remaining = parser.parse_known_args()
 
 # `--no_adaptive_success` is the single switch for "use dedo's base reward
@@ -310,7 +320,16 @@ dump_run_config(extra_args, dedo_args, dedo_args.logdir,
 # ---------------------------------------------------------------------------
 # Demo collection / loading (same as PPO version).
 # ---------------------------------------------------------------------------
-def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
+def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
+                           only_success=False, max_attempt_factor=3):
+    """Roll out the scripted hole-aware waypoint controller.
+
+    `num_episodes` is the **target number of demos kept**, not the number
+    of attempts. The collector retries until that many demos pass the
+    keep criterion (any rollout if `only_success=False`; only those with
+    `is_success=1` if `only_success=True`), capped at
+    `num_episodes * max_attempt_factor` attempts to avoid an infinite
+    loop. Dataset size is therefore deterministic across seeds."""
     from dedo.demo_preset import build_traj, merge_traj
     from dedo.envs.deform_env import DeformEnv
 
@@ -324,7 +343,12 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
 
     obs_buf, act_buf = [], []
     succeeded = 0
-    for ep in range(num_episodes):
+    n_kept, n_dropped = 0, 0
+    target_kept = num_episodes
+    max_attempts = max(num_episodes * max_attempt_factor, num_episodes + 5)
+    attempts = 0
+    while n_kept < target_kept and attempts < max_attempts:
+        attempts += 1
         obs = raw.reset()
         underlying = raw
         while hasattr(underlying, 'env'):
@@ -335,7 +359,8 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
 
         preset_wp = build_hole_aware_waypoints(underlying)
         if preset_wp is None:
-            print(f'[BC] demo {ep+1}: no hole loop, skipping')
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
+                  f'no hole loop, retrying')
             continue
         try:
             _, vel_a = build_traj(underlying, preset_wp, 'a',
@@ -344,7 +369,8 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
                                   anchor_idx=1, ctrl_freq=ctrl_freq, robot=None)
             traj = merge_traj(vel_a, vel_b)
         except Exception as e:
-            print(f'[BC] demo {ep+1}: build_traj failed ({e!r})')
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
+                  f'build_traj failed ({e!r}), retrying')
             continue
 
         last = np.zeros_like(traj[0])
@@ -365,13 +391,29 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
             if done:
                 break
             step += 1
+        if only_success and not ep_succ:
+            n_dropped += 1
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
+                  f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success=0  '
+                  f'(dropped, --bc_demos_only_success)')
+            continue
         obs_buf.extend(ep_obs)
         act_buf.extend(ep_act)
         succeeded += ep_succ
-        print(f'[BC] demo {ep+1}/{num_episodes}  '
+        n_kept += 1
+        print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
               f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success={ep_succ}')
 
     raw.close()
+    if n_kept < target_kept:
+        print(f'[BC] WARNING: only collected {n_kept}/{target_kept} demos '
+              f'after {attempts} attempts (cap={max_attempts}). Either '
+              f'increase --bc_episodes, raise the attempt cap, or lower '
+              f'--success_factor.')
+    elif only_success:
+        print(f'[BC] kept {n_kept}/{target_kept} successful demos in '
+              f'{attempts} attempts ({n_dropped} dropped, '
+              f'~{n_kept/max(attempts,1):.0%} scripted success rate)')
     return (np.asarray(obs_buf, dtype=np.float32),
             np.asarray(act_buf, dtype=np.float32),
             succeeded)
@@ -468,9 +510,11 @@ if extra_args.bc_demo_path:
         only_success=extra_args.bc_demos_only_success)
 elif extra_args.bc_episodes > 0:
     print(f'\n=== BC pretrain: collecting {extra_args.bc_episodes} '
-          f'scripted demo rollouts ===')
+          f'scripted demo rollouts '
+          f'(only_success={extra_args.bc_demos_only_success}) ===')
     demo_obs, demo_acts, n_success = _collect_demo_rollouts(
-        dedo_args, obs_mode, extra_args.bc_episodes)
+        dedo_args, obs_mode, extra_args.bc_episodes,
+        only_success=extra_args.bc_demos_only_success)
     n_demos = extra_args.bc_episodes
 else:
     demo_obs = np.zeros((0, 0), dtype=np.float32)

@@ -63,8 +63,13 @@ parser.add_argument('--use_wandb', action='store_true',
 parser.add_argument('--n_final_eval_episodes', type=int, default=20,
                     help='Number of deterministic eval episodes at end of training')
 parser.add_argument('--bc_episodes', type=int, default=50,
-                    help='Number of scripted demo episodes for BC pretrain '
-                         '(0 to skip)')
+                    help='Target number of scripted demos to KEEP for BC '
+                         'pretrain (0 to skip). The collector retries '
+                         'until it has this many demos that pass the '
+                         'keep criterion (any if --bc_demos_only_success '
+                         'off; only is_success=1 if on), capped at '
+                         '~3x attempts. Dataset size is therefore '
+                         'deterministic across seeds.')
 parser.add_argument('--bc_epochs', type=int, default=20,
                     help='BC pretrain epochs over collected demos')
 parser.add_argument('--bc_lr', type=float, default=1e-3,
@@ -74,8 +79,14 @@ parser.add_argument('--bc_demo_path', type=str, default=None,
                          'record_demo.py). If set, skip scripted demo '
                          'collection and BC on these manual demos instead.')
 parser.add_argument('--bc_demos_only_success', action='store_true',
-                    help='When loading manual demos, keep only those marked '
-                         'success=1 in the pkl.')
+                    help='Filter BC demos to only those that fire '
+                         'is_success at terminal step. Applies to BOTH '
+                         'manual demos (loaded from --bc_demo_path) and '
+                         'scripted demos collected via --bc_episodes. '
+                         'Strongly recommended for scripted demos: the '
+                         'hole-aware waypoint controller succeeds ~60-80% '
+                         'of the time, and dropping the failures leaves '
+                         'a cleaner BC dataset.')
 parser.add_argument('--success_factor', type=float, default=1.2,
                     help='If set, override env success threshold with '
                          'dist < success_factor * hole_radius (adaptive). '
@@ -320,7 +331,23 @@ dump_run_config(extra_args, dedo_args, dedo_args.logdir,
 # (HangProcCloth always uses the apron preset regardless of which procedural
 # cloth was generated — it's a fixed-target trajectory).
 # ---------------------------------------------------------------------------
-def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
+def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
+                           only_success=False, max_attempt_factor=3):
+    """Roll out the scripted hole-aware waypoint controller and return
+    (obs, act) pairs.
+
+    `num_episodes` is the **target number of demos kept**, NOT the number
+    of attempts. We loop until we have collected that many demos that pass
+    the keep criterion (any rollout if `only_success=False`; only those
+    with `info['is_success']=1` if `only_success=True`). Build_traj
+    failures and dropped failed-success demos do NOT count toward the
+    target — they trigger a retry — so dataset size is identical across
+    runs / seeds, regardless of how often the scripted controller misses.
+
+    `max_attempt_factor` caps the retry budget at
+    `num_episodes * max_attempt_factor` to avoid an infinite loop when
+    the scripted controller's success rate is pathologically low. Hitting
+    the cap prints a warning and returns whatever was collected."""
     from dedo.demo_preset import build_traj, merge_traj
     from dedo.envs.deform_env import DeformEnv
 
@@ -335,7 +362,12 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
 
     obs_buf, act_buf = [], []
     succeeded = 0
-    for ep in range(num_episodes):
+    n_kept, n_dropped = 0, 0
+    target_kept = num_episodes
+    max_attempts = max(num_episodes * max_attempt_factor, num_episodes + 5)
+    attempts = 0
+    while n_kept < target_kept and attempts < max_attempts:
+        attempts += 1
         obs = raw.reset()
         # Walk down to the underlying DeformEnv to read sim_freq for build_traj.
         underlying = raw
@@ -348,7 +380,8 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
         # Build hole-aware waypoints per episode.
         preset_wp = build_hole_aware_waypoints(underlying)
         if preset_wp is None:
-            print(f'[BC] demo {ep+1}: no hole loop on cloth, skipping')
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
+                  f'no hole loop on cloth, retrying')
             continue
         try:
             _, vel_a = build_traj(underlying, preset_wp, 'a',
@@ -357,7 +390,8 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
                                   anchor_idx=1, ctrl_freq=ctrl_freq, robot=None)
             traj = merge_traj(vel_a, vel_b)
         except Exception as e:
-            print(f'[BC] demo {ep+1}: build_traj failed ({e!r}), skipping')
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
+                  f'build_traj failed ({e!r}), retrying')
             continue
 
         last_action = np.zeros_like(traj[0])
@@ -376,13 +410,30 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
             if done:
                 break
             step += 1
+        if only_success and not ep_success:
+            n_dropped += 1
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
+                  f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success=0  '
+                  f'(dropped, --bc_demos_only_success)')
+            continue
         obs_buf.extend(ep_obs)
         act_buf.extend(ep_act)
         succeeded += ep_success
-        print(f'[BC] demo {ep+1}/{num_episodes}  '
+        n_kept += 1
+        print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
               f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success={ep_success}')
 
     raw.close()
+    if n_kept < target_kept:
+        print(f'[BC] WARNING: only collected {n_kept}/{target_kept} demos '
+              f'after {attempts} attempts (cap={max_attempts}). Either '
+              f'increase --bc_episodes, raise the attempt cap, or lower '
+              f'--success_factor — the scripted controller is missing '
+              f'too often on this cloth distribution.')
+    elif only_success:
+        print(f'[BC] kept {n_kept}/{target_kept} successful demos in '
+              f'{attempts} attempts ({n_dropped} dropped, '
+              f'~{n_kept/max(attempts,1):.0%} scripted success rate)')
     return (np.array(obs_buf, dtype=np.float32),
             np.array(act_buf, dtype=np.float32),
             succeeded)
@@ -487,9 +538,11 @@ if extra_args.bc_demo_path:
           f'{n_demos} manual demos ({n_success} succeeded)')
 elif extra_args.bc_episodes > 0:
     print(f'\n=== BC pretrain: collecting {extra_args.bc_episodes} '
-          f'scripted demo rollouts ===')
+          f'scripted demo rollouts '
+          f'(only_success={extra_args.bc_demos_only_success}) ===')
     demo_obs, demo_acts, n_success = _collect_demo_rollouts(
-        dedo_args, obs_mode, extra_args.bc_episodes)
+        dedo_args, obs_mode, extra_args.bc_episodes,
+        only_success=extra_args.bc_demos_only_success)
     n_demos = extra_args.bc_episodes
     print(f'[BC] collected {len(demo_obs)} (obs,act) pairs from '
           f'{n_demos} demos ({n_success} succeeded)')

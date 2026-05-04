@@ -103,9 +103,25 @@ parser.add_argument('--success_bonus', type=float, default=200.0)
 parser.add_argument('--fail_penalty', type=float, default=0.0)
 parser.add_argument('--vel_penalty', type=float, default=0.0)
 # BC pretrain.
-parser.add_argument('--bc_episodes', type=int, default=0)
+parser.add_argument('--bc_episodes', type=int, default=0,
+                    help='Target number of scripted demos to KEEP for '
+                         'BC pretrain. 0 = skip. The collector retries '
+                         'until it has this many demos that pass the '
+                         'keep criterion (any if --bc_demos_only_success '
+                         'off; only is_success=1 if on), capped at '
+                         '~3x attempts. Dataset size is therefore '
+                         'deterministic across seeds.')
 parser.add_argument('--bc_epochs', type=int, default=20)
 parser.add_argument('--bc_lr', type=float, default=1e-3)
+parser.add_argument('--bc_demos_only_success', action='store_true',
+                    help='Drop scripted demos whose terminal '
+                         'is_success=0 from the BC dataset. The hole-'
+                         'aware waypoint controller succeeds on most '
+                         'but not all procedural cloth shapes; '
+                         'filtering yields a cleaner BC dataset at the '
+                         'cost of fewer (obs, act) pairs. Strongly '
+                         'recommended unless --bc_episodes is small '
+                         '(<20) and the scripted success rate is low.')
 parser.add_argument('--cpu', action='store_true')
 extra_args, remaining = parser.parse_known_args()
 
@@ -322,7 +338,16 @@ dump_run_config(extra_args, dedo_args, dedo_args.logdir,
 # only (deterministic_action = tanh(mu(latent_pi)) — same pattern as
 # train_privileged_sac.py).
 # ---------------------------------------------------------------------------
-def _collect_pixel_demos(args, num_episodes):
+def _collect_pixel_demos(args, num_episodes, only_success=False,
+                         max_attempt_factor=3):
+    """Roll out scripted hole-aware waypoints in the pixel obs env.
+
+    `num_episodes` is the **target number of demos kept**, not the
+    number of attempts. The collector retries until that many demos
+    pass the keep criterion (any rollout if `only_success=False`; only
+    those with `is_success=1` if `only_success=True`), capped at
+    `num_episodes * max_attempt_factor` attempts. Dataset size is
+    therefore deterministic across seeds."""
     from dedo.demo_preset import build_traj, merge_traj
     from dedo.envs.deform_env import DeformEnv
 
@@ -339,7 +364,12 @@ def _collect_pixel_demos(args, num_episodes):
 
     obs_buf, act_buf = [], []
     succeeded = 0
-    for ep in range(num_episodes):
+    n_kept, n_dropped = 0, 0
+    target_kept = num_episodes
+    max_attempts = max(num_episodes * max_attempt_factor, num_episodes + 5)
+    attempts = 0
+    while n_kept < target_kept and attempts < max_attempts:
+        attempts += 1
         obs = raw.reset()
         underlying = raw
         while hasattr(underlying, 'env'):
@@ -350,7 +380,8 @@ def _collect_pixel_demos(args, num_episodes):
 
         preset_wp = build_hole_aware_waypoints(underlying)
         if preset_wp is None:
-            print(f'[BC] demo {ep+1}: no hole loop, skipping')
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
+                  f'no hole loop, retrying')
             continue
         try:
             _, vel_a = build_traj(underlying, preset_wp, 'a',
@@ -359,7 +390,8 @@ def _collect_pixel_demos(args, num_episodes):
                                   anchor_idx=1, ctrl_freq=ctrl_freq, robot=None)
             traj = merge_traj(vel_a, vel_b)
         except Exception as e:
-            print(f'[BC] demo {ep+1}: build_traj failed ({e!r})')
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
+                  f'build_traj failed ({e!r}), retrying')
             continue
 
         last = np.zeros_like(traj[0])
@@ -380,13 +412,29 @@ def _collect_pixel_demos(args, num_episodes):
             if done:
                 break
             step += 1
+        if only_success and not ep_succ:
+            n_dropped += 1
+            print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
+                  f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success=0  '
+                  f'(dropped, --bc_demos_only_success)')
+            continue
         obs_buf.extend(ep_obs)
         act_buf.extend(ep_act)
         succeeded += ep_succ
-        print(f'[BC] demo {ep+1}/{num_episodes}  '
+        n_kept += 1
+        print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
               f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success={ep_succ}')
 
     raw.close()
+    if n_kept < target_kept:
+        print(f'[BC] WARNING: only collected {n_kept}/{target_kept} demos '
+              f'after {attempts} attempts (cap={max_attempts}). Either '
+              f'increase --bc_episodes, raise the attempt cap, or lower '
+              f'--success_factor.')
+    elif only_success:
+        print(f'[BC] kept {n_kept}/{target_kept} successful demos in '
+              f'{attempts} attempts ({n_dropped} dropped, '
+              f'~{n_kept/max(attempts,1):.0%} scripted success rate)')
 
     if not obs_buf:
         return None, np.zeros((0, 0), dtype=np.float32), 0
@@ -451,9 +499,11 @@ def _bc_pretrain_sac(agent, demo_obs, demo_acts, epochs, batch_size, lr):
 
 if extra_args.bc_episodes > 0:
     print(f'\n=== BC pretrain: collecting {extra_args.bc_episodes} '
-          f'scripted pixel demos ===')
+          f'scripted pixel demos '
+          f'(only_success={extra_args.bc_demos_only_success}) ===')
     demo_obs, demo_acts, n_success = _collect_pixel_demos(
-        dedo_args, extra_args.bc_episodes)
+        dedo_args, extra_args.bc_episodes,
+        only_success=extra_args.bc_demos_only_success)
     if demo_obs is not None and len(demo_acts) > 0:
         n_pairs = (len(next(iter(demo_obs.values())))
                    if isinstance(demo_obs, dict) else len(demo_obs))
