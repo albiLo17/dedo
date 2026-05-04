@@ -72,6 +72,13 @@ parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true')
 parser.add_argument('--n_final_eval_episodes', type=int, default=20)
+parser.add_argument('--log_save_interval', type=int, default=50,
+                    help='Controls checkpoint / eval / video cadence. '
+                         'Checkpoint every (log_save_interval * 10 * 50) '
+                         'env steps; eval every 2nd checkpoint; video '
+                         'every 4th checkpoint. Lower = more frequent. '
+                         'Default 50 → checkpoint @ 25k / eval @ 50k / '
+                         'video @ 100k.')
 # Camera config (matches train_pixels.py).
 parser.add_argument('--cam_resolution', type=int, default=64)
 parser.add_argument('--cam_viewmat', type=float, nargs=6,
@@ -113,6 +120,17 @@ parser.add_argument('--bc_episodes', type=int, default=0,
                          'deterministic across seeds.')
 parser.add_argument('--bc_epochs', type=int, default=20)
 parser.add_argument('--bc_lr', type=float, default=1e-3)
+parser.add_argument('--bc_demo_path', type=str, default=None,
+                    help='Directory of pixel demo_NNN.pkl files. If '
+                         'set, skip scripted collection and BC on the '
+                         'loaded demos instead. Demos must match the '
+                         'current --cam_resolution and --no_grip mode.')
+parser.add_argument('--no_save_scripted_demos', action='store_true',
+                    help='Skip persisting scripted BC demos to '
+                         '<logdir>/scripted_demos/. Default behaviour '
+                         'saves them so they can be reused via '
+                         '--bc_demo_path; opt out for big sweeps to '
+                         'avoid ~100 MB / run of disk.')
 parser.add_argument('--bc_demos_only_success', action='store_true',
                     help='Drop scripted demos whose terminal '
                          'is_success=0 from the BC dataset. The hole-'
@@ -128,6 +146,19 @@ extra_args, remaining = parser.parse_known_args()
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
 
+# Single source of truth: `extra_args.success_factor` flows into the
+# training env, the eval env, AND the BC scripted-demo collection env
+# below — so `info['is_success']` is identical across all three. When
+# adaptive success is off (success_factor=None), the wrapper's override
+# block is skipped and `info['is_success']` falls through to dedo's
+# default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m). Print the
+# active criterion at startup so logs make this auditable for any run.
+_sf_descr = (
+    f'adaptive (sf={extra_args.success_factor} * hole_radius)'
+    if extra_args.success_factor is not None
+    else 'dedo default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m)')
+print(f'[success-criterion] training = eval = BC scripted: {_sf_descr}')
+
 _grip_str = 'pixgrip' if not extra_args.no_grip else 'pixonly'
 run_subdir = f'{_grip_str}_{extra_args.cam_resolution}_sac'
 
@@ -142,7 +173,7 @@ sys.argv = [
     '--uint8_pixels',
     '--num_envs=0',
     '--total_env_steps=0',
-    '--log_save_interval=50',
+    f'--log_save_interval={extra_args.log_save_interval}',
     '--seed', str(extra_args.seed),
     '--max_episode_len', str(extra_args.max_episode_len),
     '--cam_viewmat',
@@ -160,7 +191,7 @@ dedo_args.num_envs = extra_args.num_envs
 dedo_args.lr = extra_args.lr
 dedo_args.debug = False
 dedo_args.viz = False
-dedo_args.log_save_interval = 50
+dedo_args.log_save_interval = extra_args.log_save_interval
 dedo_args.disable_logging_video = False
 
 logdir_base = os.path.join(extra_args.logdir_root, run_subdir)
@@ -265,7 +296,6 @@ if dedo_args.use_wandb:
         wandb.run.name = (f'{wandb.run.name}_pixels{extra_args.cam_resolution}'
                           f'{grip_tag}_sac'
                           f'{sf_tag}{sb_tag}{fp_tag}{vp_tag}{bc_tag}')
-        wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             'algo=sac',
             'obs=pixels',
@@ -339,7 +369,7 @@ dump_run_config(extra_args, dedo_args, dedo_args.logdir,
 # train_privileged_sac.py).
 # ---------------------------------------------------------------------------
 def _collect_pixel_demos(args, num_episodes, only_success=False,
-                         max_attempt_factor=3):
+                         max_attempt_factor=3, save_dir=None):
     """Roll out scripted hole-aware waypoints in the pixel obs env.
 
     `num_episodes` is the **target number of demos kept**, not the
@@ -347,7 +377,12 @@ def _collect_pixel_demos(args, num_episodes, only_success=False,
     pass the keep criterion (any rollout if `only_success=False`; only
     those with `is_success=1` if `only_success=True`), capped at
     `num_episodes * max_attempt_factor` attempts. Dataset size is
-    therefore deterministic across seeds."""
+    therefore deterministic across seeds.
+
+    `save_dir`: if non-None, persist each kept demo as
+    `<save_dir>/demo_NNN.pkl` (one episode per pkl) so it can be
+    reloaded later via `--bc_demo_path`. Same schema as train_pixels.py
+    (PPO) so demos can be shared across PPO and SAC runs."""
     from dedo.demo_preset import build_traj, merge_traj
     from dedo.envs.deform_env import DeformEnv
 
@@ -361,6 +396,9 @@ def _collect_pixel_demos(args, num_episodes, only_success=False,
         success_bonus=0.0, fail_penalty=0.0, vel_penalty=0.0,
     )
     raw.seed(args.seed + 1000)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
 
     obs_buf, act_buf = [], []
     succeeded = 0
@@ -422,6 +460,33 @@ def _collect_pixel_demos(args, num_episodes, only_success=False,
         act_buf.extend(ep_act)
         succeeded += ep_succ
         n_kept += 1
+
+        # Persist this episode so it can be reloaded via --bc_demo_path.
+        # Same payload schema as the PPO pixel collector.
+        if save_dir is not None:
+            demo_idx = n_kept - 1
+            pkl_path = os.path.join(save_dir, f'demo_{demo_idx:03d}.pkl')
+            if isinstance(ep_obs[0], dict):
+                ep_obs_stacked = {
+                    k: np.stack([o[k] for o in ep_obs], axis=0)
+                    for k in ep_obs[0].keys()}
+            else:
+                ep_obs_stacked = np.stack(ep_obs, axis=0)
+            payload = {
+                'obs': ep_obs_stacked,
+                'acts': np.asarray(ep_act, dtype=np.float32),
+                'reward': float(ep_rwd),
+                'success': int(ep_succ),
+                'obs_type': 'pixels',
+                'cam_resolution': extra_args.cam_resolution,
+                'include_grip': bool(not extra_args.no_grip),
+                'success_factor': extra_args.success_factor,
+                'len': len(ep_act),
+                'source': 'scripted',
+            }
+            with open(pkl_path, 'wb') as f:
+                pickle.dump(payload, f)
+
         print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
               f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success={ep_succ}')
 
@@ -446,6 +511,75 @@ def _collect_pixel_demos(args, num_episodes, only_success=False,
     return (stacked,
             np.asarray(act_buf, dtype=np.float32),
             succeeded)
+
+
+def _load_manual_pixel_demos(demo_dir, cam_resolution, include_grip,
+                             only_success=False):
+    """Load per-episode pixel demos written by `_collect_pixel_demos`.
+    Mirrors train_pixels.py's loader so demos are interchangeable
+    between PPO and SAC pixel runs. See the PPO version for full
+    docstring."""
+    obs_buf, act_buf = [], []
+    n_files, n_success_demos = 0, 0
+    sf_train = extra_args.success_factor
+    sf_mismatches, sf_unknown = 0, 0
+    for fname in sorted(os.listdir(demo_dir)):
+        if not (fname.startswith('demo_') and fname.endswith('.pkl')):
+            continue
+        path = os.path.join(demo_dir, fname)
+        with open(path, 'rb') as f:
+            d = pickle.load(f)
+        if d.get('obs_type') != 'pixels':
+            print(f'[BC] {fname}: obs_type={d.get("obs_type")!r} '
+                  f'not pixels, skipping')
+            continue
+        if d.get('cam_resolution') != cam_resolution:
+            print(f'[BC] {fname}: cam_resolution='
+                  f'{d.get("cam_resolution")} != {cam_resolution}, '
+                  f'skipping')
+            continue
+        if bool(d.get('include_grip')) != bool(include_grip):
+            print(f'[BC] {fname}: include_grip='
+                  f'{d.get("include_grip")} != {include_grip}, skipping')
+            continue
+
+        if 'success_factor' in d:
+            if d['success_factor'] != sf_train:
+                sf_mismatches += 1
+        else:
+            sf_unknown += 1
+
+        if only_success and not d.get('success', 0):
+            print(f'[BC] {fname}: success=0, skipping')
+            continue
+
+        n_files += 1
+        n_success_demos += int(d.get('success', 0))
+        obs_buf.append(d['obs'])
+        act_buf.append(d['acts'])
+        print(f'[BC] loaded {fname}  len={d.get("len", len(d["acts"]))}  '
+              f'rwd={d.get("reward", 0):.2f}  '
+              f'success={d.get("success", 0)}')
+
+    if sf_mismatches > 0 or sf_unknown > 0:
+        print(f'[BC] WARNING: {sf_mismatches} demo(s) recorded under a '
+              f'different success_factor than training '
+              f'(training sf={sf_train}); {sf_unknown} demo(s) have no '
+              f'recorded success_factor (legacy pkls). Their `success` '
+              f'flags may not reflect the training criterion — '
+              f'--bc_demos_only_success could keep/drop the wrong demos.')
+
+    if not obs_buf:
+        return None, np.zeros((0, 0), dtype=np.float32), 0, 0
+    if isinstance(obs_buf[0], dict):
+        keys = obs_buf[0].keys()
+        stacked = {k: np.concatenate([o[k] for o in obs_buf], axis=0)
+                   for k in keys}
+    else:
+        stacked = np.concatenate(obs_buf, axis=0)
+    return (stacked,
+            np.concatenate(act_buf, axis=0).astype(np.float32),
+            n_success_demos, n_files)
 
 
 def _bc_pretrain_sac(agent, demo_obs, demo_acts, epochs, batch_size, lr):
@@ -497,28 +631,47 @@ def _bc_pretrain_sac(agent, demo_obs, demo_acts, epochs, batch_size, lr):
             wandb.log({'bc/mse': avg, 'bc/epoch': epoch + 1})
 
 
-if extra_args.bc_episodes > 0:
+if extra_args.bc_demo_path:
+    print(f'\n=== BC pretrain: loading manual pixel demos from '
+          f'{extra_args.bc_demo_path} ===')
+    demo_obs, demo_acts, n_success, n_demos = _load_manual_pixel_demos(
+        extra_args.bc_demo_path,
+        cam_resolution=extra_args.cam_resolution,
+        include_grip=not extra_args.no_grip,
+        only_success=extra_args.bc_demos_only_success)
+elif extra_args.bc_episodes > 0:
+    _scripted_demos_dir = (
+        None if extra_args.no_save_scripted_demos
+        else os.path.join(dedo_args.logdir, 'scripted_demos'))
     print(f'\n=== BC pretrain: collecting {extra_args.bc_episodes} '
           f'scripted pixel demos '
           f'(only_success={extra_args.bc_demos_only_success}) ===')
+    if _scripted_demos_dir is not None:
+        print(f'[BC] saving scripted demos to {_scripted_demos_dir}')
     demo_obs, demo_acts, n_success = _collect_pixel_demos(
         dedo_args, extra_args.bc_episodes,
-        only_success=extra_args.bc_demos_only_success)
-    if demo_obs is not None and len(demo_acts) > 0:
-        n_pairs = (len(next(iter(demo_obs.values())))
-                   if isinstance(demo_obs, dict) else len(demo_obs))
-        _bc_pretrain_sac(agent, demo_obs, demo_acts,
-                         epochs=extra_args.bc_epochs,
-                         batch_size=128, lr=extra_args.bc_lr)
-        if dedo_args.use_wandb:
-            import wandb
-            wandb.log({'bc/n_pairs': n_pairs,
-                       'bc/n_success_demos': n_success,
-                       'bc/n_demos': extra_args.bc_episodes})
-        print('[BC] note: SAC critic starts random; expect actor to drift '
-              'from BC init for ~50k steps until critic stabilizes.')
-    else:
-        print('[BC] no usable demos — skipping BC pretrain')
+        only_success=extra_args.bc_demos_only_success,
+        save_dir=_scripted_demos_dir)
+    n_demos = extra_args.bc_episodes
+else:
+    demo_obs, demo_acts, n_success, n_demos = (
+        None, np.zeros((0, 0), dtype=np.float32), 0, 0)
+
+if demo_obs is not None and len(demo_acts) > 0:
+    n_pairs = (len(next(iter(demo_obs.values())))
+               if isinstance(demo_obs, dict) else len(demo_obs))
+    _bc_pretrain_sac(agent, demo_obs, demo_acts,
+                     epochs=extra_args.bc_epochs,
+                     batch_size=128, lr=extra_args.bc_lr)
+    if dedo_args.use_wandb:
+        import wandb
+        wandb.log({'bc/n_pairs': n_pairs,
+                   'bc/n_success_demos': n_success,
+                   'bc/n_demos': n_demos})
+    print('[BC] note: SAC critic starts random; expect actor to drift '
+          'from BC init for ~50k steps until critic stabilizes.')
+elif extra_args.bc_demo_path or extra_args.bc_episodes > 0:
+    print('[BC] no usable demos — skipping BC pretrain')
 
 
 # ---------------------------------------------------------------------------

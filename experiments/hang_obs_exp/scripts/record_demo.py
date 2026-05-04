@@ -275,6 +275,11 @@ def _save_demo(ep_obs_per_mode, ep_act, ep_rwd, ep_success):
         'success': int(ep_success),
         'obs_modes': list(ALL_MODES),
         'recorded_in': extra.obs_mode,
+        # Persist the success criterion used to compute the `success`
+        # field above. Consumed by _load_manual_demos in the training
+        # scripts to warn when the recorded criterion differs from the
+        # one the agent will actually be trained against.
+        'success_factor': extra.success_factor,
         'len': len(ep_act),
     }
     with open(path, 'wb') as f:

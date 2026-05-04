@@ -74,6 +74,14 @@ parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true')
 parser.add_argument('--n_final_eval_episodes', type=int, default=20)
+parser.add_argument('--log_save_interval', type=int, default=50,
+                    help='Controls checkpoint / eval / video cadence. '
+                         'Checkpoint every (log_save_interval * 10 * 50) '
+                         'env steps; eval every 2nd checkpoint; video '
+                         'every 4th checkpoint. Lower = more frequent. '
+                         'Default 50 → checkpoint @ 25k / eval @ 50k / '
+                         'video @ 100k. Try 20 for ~2.5x faster '
+                         'feedback during early training.')
 # SAC-specific knobs.
 parser.add_argument('--buffer_size', type=int, default=1_000_000)
 parser.add_argument('--learning_starts', type=int, default=1_000)
@@ -130,6 +138,19 @@ extra_args, remaining = parser.parse_known_args()
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
 
+# Single source of truth: `extra_args.success_factor` flows into the
+# training env, the eval env, AND the BC scripted-demo collection env
+# below — so `info['is_success']` is identical across all three. When
+# adaptive success is off (success_factor=None), the wrapper's override
+# block is skipped and `info['is_success']` falls through to dedo's
+# default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m). Print the
+# active criterion at startup so logs make this auditable for any run.
+_sf_descr = (
+    f'adaptive (sf={extra_args.success_factor} * hole_radius)'
+    if extra_args.success_factor is not None
+    else 'dedo default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m)')
+print(f'[success-criterion] training = eval = BC scripted: {_sf_descr}')
+
 
 # ---------------------------------------------------------------------------
 # Build dedo args.
@@ -140,7 +161,7 @@ sys.argv = [
     '--cam_resolution=0',
     '--num_envs=0',
     '--total_env_steps=0',
-    '--log_save_interval=50',
+    f'--log_save_interval={extra_args.log_save_interval}',
     '--seed', str(extra_args.seed),
     # Lock cam_viewmat against preset_override_util — see train_privileged.py.
     '--cam_viewmat', '9.0', '-25.0', '45.0', '0.0', '0.5', '6.5',
@@ -155,7 +176,7 @@ dedo_args.num_envs = extra_args.num_envs
 dedo_args.lr = extra_args.lr
 dedo_args.debug = False
 dedo_args.viz = False
-dedo_args.log_save_interval = 50
+dedo_args.log_save_interval = extra_args.log_save_interval
 dedo_args.disable_logging_video = False
 
 obs_mode = extra_args.obs_mode
@@ -254,7 +275,6 @@ if dedo_args.use_wandb:
                             extra_args.bc_episodes > 0) else '')
         wandb.run.name = (f'{wandb.run.name}_sac_256x256'
                           f'{sf_tag}{sb_tag}{fp_tag}{vp_tag}{bc_tag}')
-        wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             'algo=sac',
             f'obs_mode={obs_mode}',
@@ -321,7 +341,8 @@ dump_run_config(extra_args, dedo_args, dedo_args.logdir,
 # Demo collection / loading (same as PPO version).
 # ---------------------------------------------------------------------------
 def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
-                           only_success=False, max_attempt_factor=3):
+                           only_success=False, max_attempt_factor=3,
+                           save_dir=None):
     """Roll out the scripted hole-aware waypoint controller.
 
     `num_episodes` is the **target number of demos kept**, not the number
@@ -329,7 +350,12 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
     keep criterion (any rollout if `only_success=False`; only those with
     `is_success=1` if `only_success=True`), capped at
     `num_episodes * max_attempt_factor` attempts to avoid an infinite
-    loop. Dataset size is therefore deterministic across seeds."""
+    loop. Dataset size is therefore deterministic across seeds.
+
+    `save_dir`: see train_privileged.py — when set, kept demos are
+    persisted as `<save_dir>/demo_NNN.pkl` in the same payload format
+    `record_demo.py` writes, so they can be reloaded via
+    `--bc_demo_path`."""
     from dedo.demo_preset import build_traj, merge_traj
     from dedo.envs.deform_env import DeformEnv
 
@@ -340,6 +366,9 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
                                 success_bonus=0.0, fail_penalty=0.0,
                                 vel_penalty=0.0)
     raw.seed(args.seed + 1000)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
 
     obs_buf, act_buf = [], []
     succeeded = 0
@@ -401,6 +430,26 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
         act_buf.extend(ep_act)
         succeeded += ep_succ
         n_kept += 1
+
+        # Persist this demo using the same pkl schema record_demo.py
+        # writes, so _load_manual_demos can read it back unchanged.
+        if save_dir is not None:
+            demo_idx = n_kept - 1
+            pkl_path = os.path.join(save_dir, f'demo_{demo_idx:03d}.pkl')
+            payload = {
+                'obs': {obs_mode_str: np.asarray(ep_obs, dtype=np.float32)},
+                'acts': np.asarray(ep_act, dtype=np.float32),
+                'reward': float(ep_rwd),
+                'success': int(ep_succ),
+                'obs_modes': [obs_mode_str],
+                'recorded_in': obs_mode_str,
+                'success_factor': extra_args.success_factor,
+                'len': len(ep_act),
+                'source': 'scripted',
+            }
+            with open(pkl_path, 'wb') as f:
+                pickle.dump(payload, f)
+
         print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept})  '
               f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success={ep_succ}')
 
@@ -420,14 +469,25 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
 
 
 def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
+    """See train_privileged.py for the full docstring. The success_factor
+    mismatch warning here is identical: filtering by `d['success']` only
+    matches training when the recorder used the same success_factor."""
     obs_buf, act_buf = [], []
     n_files, n_success_demos = 0, 0
+    sf_train = extra_args.success_factor
+    sf_mismatches, sf_unknown = 0, 0
     for fname in sorted(os.listdir(demo_dir)):
         if not (fname.startswith('demo_') and fname.endswith('.pkl')):
             continue
         path = os.path.join(demo_dir, fname)
         with open(path, 'rb') as f:
             d = pickle.load(f)
+
+        if 'success_factor' in d:
+            if d['success_factor'] != sf_train:
+                sf_mismatches += 1
+        else:
+            sf_unknown += 1
 
         if only_success and not d.get('success', 0):
             print(f'[BC] {fname}: success=0, skipping')
@@ -452,6 +512,15 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
         print(f'[BC] loaded {fname}  len={d.get("len", len(d["acts"]))}  '
               f'rwd={d.get("reward", 0):.2f}  '
               f'success={d.get("success", 0)}')
+
+    if sf_mismatches > 0 or sf_unknown > 0:
+        print(f'[BC] WARNING: {sf_mismatches} demo(s) recorded under a '
+              f'different success_factor than training '
+              f'(training sf={sf_train}); {sf_unknown} demo(s) have no '
+              f'recorded success_factor (legacy pkls). Their `success` '
+              f'flags may not reflect the training criterion — '
+              f'--bc_demos_only_success could keep/drop the wrong demos. '
+              f'Re-record with the current --success_factor to align.')
 
     if not obs_buf:
         return (np.zeros((0, 0), dtype=np.float32),
@@ -509,12 +578,18 @@ if extra_args.bc_demo_path:
         extra_args.bc_demo_path, obs_mode,
         only_success=extra_args.bc_demos_only_success)
 elif extra_args.bc_episodes > 0:
+    # Persist scripted demos under <logdir>/scripted_demos/ so they can
+    # be inspected post-hoc and reused on a future run via
+    # `--bc_demo_path <logdir>/scripted_demos`.
+    _scripted_demos_dir = os.path.join(dedo_args.logdir, 'scripted_demos')
     print(f'\n=== BC pretrain: collecting {extra_args.bc_episodes} '
           f'scripted demo rollouts '
           f'(only_success={extra_args.bc_demos_only_success}) ===')
+    print(f'[BC] saving scripted demos to {_scripted_demos_dir}')
     demo_obs, demo_acts, n_success = _collect_demo_rollouts(
         dedo_args, obs_mode, extra_args.bc_episodes,
-        only_success=extra_args.bc_demos_only_success)
+        only_success=extra_args.bc_demos_only_success,
+        save_dir=_scripted_demos_dir)
     n_demos = extra_args.bc_episodes
 else:
     demo_obs = np.zeros((0, 0), dtype=np.float32)

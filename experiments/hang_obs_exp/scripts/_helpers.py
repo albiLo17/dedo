@@ -46,6 +46,25 @@ class RetryResetEnv(gym.Wrapper):
 # Per-episode hole-aware waypoint builder. Reads privileged sim state
 # (hole centroid, hanger goal, gripper init) and returns a {'a': ..., 'b': ...}
 # dict consumable by dedo.demo_preset.build_traj.
+#
+# Waypoints are reasoned about in *hole* space (not gripper space). Each
+# gripper sits ~Δ above and to the side of the cloth's hole; we want the
+# hole — not the gripper — to track a desired path over the hanger. So we
+# compute the per-gripper offset Δ = grip - hole at episode start and shift
+# the gripper waypoints by Δ. Translating both grippers by the same vector
+# preserves the gripper baseline so the cloth stays taut.
+#
+# Phases:
+#   1. LIFT_AND_ALIGN: translate xy so the hole sits directly over the
+#      hanger apex AND lift z so the hole is well above the apex pin top
+#      (which extends to ~hanger.z + 0.55). We aim for hole.z = hanger.z
+#      + 1.2.
+#   2. THREAD: lower the hole through the pin so it ends right at the
+#      apex (hole.z ≈ hanger.z).
+#   3. HOLD: keep the gripper waypoint constant for the last fraction of
+#      the trajectory so cloth dynamics settle while the hole is parked
+#      at the apex; the post-trajectory zero-velocity hold and
+#      make_final_steps then let the hanger catch the hole.
 # ---------------------------------------------------------------------------
 def build_hole_aware_waypoints(underlying):
     from dedo.utils.mesh_utils import get_mesh_data
@@ -71,20 +90,50 @@ def build_hole_aware_waypoints(underlying):
     grip_a = np.array(underlying.anchors[anc_ids[0]]['pos'], dtype=np.float32)
     grip_b = np.array(underlying.anchors[anc_ids[1]]['pos'], dtype=np.float32)
 
-    offset_xy = hanger[:2] - hole_centroid[:2]
+    delta_a = grip_a - hole_centroid  # 3-vector, gripper sits at hole + delta
+    delta_b = grip_b - hole_centroid
 
-    z_hover = hanger[2] + 2.0
-    z_thread = hanger[2] + 0.3
-    z_settle = hanger[2] - 0.8
+    # Hole targets in world coordinates. Three-phase trajectory inspired
+    # by the original `cloth/apron_0.obj` preset in dedo.utils.preset_info
+    # (which ends at gripper y = -1.2, well past the hanger):
+    #
+    #   1. HOVER  — lift the hole well above the apex pin top
+    #               (apex + 2.0; pin spans apex+0.05..apex+0.55) and
+    #               translate it directly over the apex. Aligns the hole
+    #               for the descent.
+    #   2. THREAD — descend so the hole sweeps DOWN through the pin
+    #               region and at the same time begin a y-overshoot:
+    #               (y = apex.y - 0.5, z = apex.z + 0.0). The cloth body
+    #               starts to sweep past the hanger plane, dragging the
+    #               hanger arms through the cloth.
+    #   3. CATCH  — continue past in y and slightly below in z
+    #               (y = apex.y - 1.1, z = apex.z - 0.4). This is the
+    #               key step: as the hole boundary slides past the apex
+    #               in -y, the apex catches on the trailing edge of the
+    #               hole. The cloth weight then drapes around the hanger
+    #               arms during the make_final_steps gravity settle.
+    hole_hover = np.array([hanger[0], hanger[1] + 0.2, hanger[2] + 1.8])
+    hole_thread = np.array([hanger[0], hanger[1] - 0.4, hanger[2] + 0.1])
+    hole_hold = np.array([hanger[0], hanger[1] - 1.2, hanger[2] - 0.5])
 
+    def grip_target(hole_target, delta):
+        return [float(hole_target[0] + delta[0]),
+                float(hole_target[1] + delta[1]),
+                float(hole_target[2] + delta[2])]
+
+    # Phase 1: 1.4 s gives cloth time to translate from y=5 even when
+    # initial gripper xy is far from the apex. Phase 2: 1.0 s slow swing
+    # past the apex with the hole right at the pin's z range. Phase 3:
+    # 0.6 s final overshoot that drags the cloth past so the apex catches
+    # on the cloth's hole boundary.
     wp_a = [
-        [grip_a[0] + offset_xy[0], grip_a[1] + offset_xy[1], z_hover, 1.5],
-        [grip_a[0] + offset_xy[0], grip_a[1] + offset_xy[1], z_thread, 1.0],
-        [grip_a[0] + offset_xy[0], grip_a[1] + offset_xy[1], z_settle, 0.5],
+        [*grip_target(hole_hover, delta_a), 1.4],
+        [*grip_target(hole_thread, delta_a), 1.0],
+        [*grip_target(hole_hold, delta_a), 0.6],
     ]
     wp_b = [
-        [grip_b[0] + offset_xy[0], grip_b[1] + offset_xy[1], z_hover, 1.5],
-        [grip_b[0] + offset_xy[0], grip_b[1] + offset_xy[1], z_thread, 1.0],
-        [grip_b[0] + offset_xy[0], grip_b[1] + offset_xy[1], z_settle, 0.5],
+        [*grip_target(hole_hover, delta_b), 1.4],
+        [*grip_target(hole_thread, delta_b), 1.0],
+        [*grip_target(hole_hold, delta_b), 0.6],
     ]
     return {'a': wp_a, 'b': wp_b}

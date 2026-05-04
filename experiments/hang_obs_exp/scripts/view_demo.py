@@ -49,7 +49,13 @@ parser.add_argument('--logdir', type=str,
 parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--obs_mode', type=str, default='hole_centroid',
                     choices=['hole_centroid', 'hole_vertices', 'full_mesh'])
+parser.add_argument('--success_factor', type=float, default=1.2,
+                    help='Adaptive success: dist < success_factor*hole_radius. '
+                         'Matches the default used by train_privileged.py / '
+                         'train_pixels.py. Pass a negative value to disable '
+                         'and use dedo\'s fixed 0.125 m criterion instead.')
 extra = parser.parse_args()
+sf = None if extra.success_factor < 0 else float(extra.success_factor)
 
 # Build dedo args.
 sys.argv = [
@@ -70,8 +76,10 @@ os.makedirs(extra.logdir, exist_ok=True)
 
 env = gym.make(args.env, args=args)
 env = RetryResetEnv(env)
-env = PrivilegedObsWrapper(env, obs_mode=extra.obs_mode)
+env = PrivilegedObsWrapper(env, obs_mode=extra.obs_mode, success_factor=sf)
 env.seed(extra.seed)
+print(f'[view_demo] success criterion: '
+      f'{"adaptive (sf=" + str(sf) + " * hole_radius)" if sf is not None else "dedo fixed 0.125 m"}')
 
 n_success = 0
 for ep in range(extra.num_episodes):
@@ -126,7 +134,12 @@ for ep in range(extra.num_episodes):
     if vidwriter is not None:
         vidwriter.release()
     n_success += ep_success
-    print(f'[ep {ep+1}] reward={ep_rwd:.2f}  success={ep_success}')
+    extra_info = ''
+    if sf is not None and env.hole_radius is not None:
+        extra_info = (f'  hole_r={env.hole_radius:.3f}m  '
+                      f'thresh<{env.success_threshold_m:.3f}m')
+    print(f'[ep {ep+1}] reward={ep_rwd:.2f}  success={ep_success}{extra_info}')
 
-print(f'\nDone — {n_success}/{extra.num_episodes} demos succeeded.')
+print(f'\nDone — {n_success}/{extra.num_episodes} demos succeeded '
+      f'({100.0 * n_success / max(extra.num_episodes, 1):.1f}%).')
 env.close()

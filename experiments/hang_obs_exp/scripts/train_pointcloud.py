@@ -128,6 +128,19 @@ extra_args, remaining = parser.parse_known_args()
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
 
+# Single source of truth: `extra_args.success_factor` flows into the
+# training env, the eval env, AND the BC scripted-demo collection env
+# below — so `info['is_success']` is identical across all three. When
+# adaptive success is off (success_factor=None), the wrapper's override
+# block is skipped and `info['is_success']` falls through to dedo's
+# default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m). Print the
+# active criterion at startup so logs make this auditable for any run.
+_sf_descr = (
+    f'adaptive (sf={extra_args.success_factor} * hole_radius)'
+    if extra_args.success_factor is not None
+    else 'dedo default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m)')
+print(f'[success-criterion] training = eval = BC scripted: {_sf_descr}')
+
 # Subdir distinguishes BC vs non-BC runs.
 _use_bc = (extra_args.bc_demo_path is not None
            or extra_args.bc_episodes > 0)
@@ -265,7 +278,6 @@ if dedo_args.use_wandb:
         vp_tag = f'_vp{vp:g}' if vp else ''
         wandb.run.name = (f'{wandb.run.name}_pcd{extra_args.n_points}'
                           f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}{vp_tag}')
-        wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pointcloud',
             f'bc={"yes" if _use_bc else "no"}',
@@ -277,7 +289,6 @@ if dedo_args.use_wandb:
             f'policy={extra_args.policy}',
         ]
         wandb.run.name = wandb.run.name + f'_{extra_args.policy}'
-        wandb.run.save()
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +338,14 @@ dump_run_config(extra_args, dedo_args, dedo_args.logdir,
 # ---------------------------------------------------------------------------
 # Optional BC pretrain on scripted hole-aware demos collected in PCD space.
 # ---------------------------------------------------------------------------
-def _collect_pcd_demos(args, num_episodes):
+def _collect_pcd_demos(args, num_episodes, save_dir=None):
+    """Roll out scripted hole-aware waypoints in PCD obs space.
+
+    `save_dir`: if non-None, persist each rollout as
+    `<save_dir>/demo_NNN.pkl` using the same payload schema
+    `record_demo_pcd.py` writes, so they can be reloaded via
+    `--bc_demo_path` (which routes through `_load_manual_pcd_demos`).
+    """
     from dedo.demo_preset import build_traj, merge_traj
     from dedo.envs.deform_env import DeformEnv
 
@@ -342,6 +360,10 @@ def _collect_pcd_demos(args, num_episodes):
         fail_penalty=0.0,
         vel_penalty=0.0)
     raw.seed(args.seed + 1000)
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+    n_kept = 0
 
     obs_buf, act_buf = [], []
     n_success = 0
@@ -389,6 +411,28 @@ def _collect_pcd_demos(args, num_episodes):
         obs_buf.extend(ep_obs)
         act_buf.extend(ep_act)
         n_success += ep_succ
+        n_kept += 1
+
+        # Persist this demo using the same pkl schema record_demo_pcd.py
+        # writes, so _load_manual_pcd_demos can read it back unchanged.
+        if save_dir is not None:
+            demo_idx = n_kept - 1
+            pkl_path = os.path.join(save_dir, f'demo_{demo_idx:03d}.pkl')
+            payload = {
+                'obs':  np.asarray(ep_obs, dtype=np.float32),
+                'acts': np.asarray(ep_act, dtype=np.float32),
+                'reward': float(ep_rwd),
+                'success': int(ep_succ),
+                'obs_type': 'pointcloud',
+                'n_points': extra_args.n_points,
+                'cam_resolution_pcd': extra_args.cam_resolution_pcd,
+                'success_factor': extra_args.success_factor,
+                'len': len(ep_act),
+                'source': 'scripted',
+            }
+            with open(pkl_path, 'wb') as f:
+                pickle.dump(payload, f)
+
         print(f'[BC] demo {ep+1}/{num_episodes}  '
               f'len={len(ep_obs)}  rwd={ep_rwd:.1f}  success={ep_succ}')
 
@@ -434,9 +478,16 @@ def _bc_pretrain(agent, demo_obs, demo_acts, vec_normalize,
 
 
 def _load_manual_pcd_demos(demo_dir, n_points, only_success=False):
-    """Load (obs, act) pairs from record_demo_pcd.py outputs."""
+    """Load (obs, act) pairs from record_demo_pcd.py outputs.
+
+    `--bc_demos_only_success` filters by the per-pkl `success` flag, set
+    at record time using the recorder's success_factor. If that doesn't
+    match training, the filter throws out the wrong demos. Emit a single
+    aggregate warning when we see any mismatch."""
     obs_buf, act_buf = [], []
     n_files, n_success_demos = 0, 0
+    sf_train = extra_args.success_factor
+    sf_mismatches, sf_unknown = 0, 0
     for fname in sorted(os.listdir(demo_dir)):
         if not (fname.startswith('demo_') and fname.endswith('.pkl')):
             continue
@@ -451,6 +502,11 @@ def _load_manual_pcd_demos(demo_dir, n_points, only_success=False):
             print(f'[BC] {fname}: n_points={d.get("n_points")} != '
                   f'{n_points}, skipping (re-record at matching n_points)')
             continue
+        if 'success_factor' in d:
+            if d['success_factor'] != sf_train:
+                sf_mismatches += 1
+        else:
+            sf_unknown += 1
         if only_success and not d.get('success', 0):
             print(f'[BC] {fname}: success=0, skipping '
                   f'(--bc_demos_only_success)')
@@ -462,6 +518,14 @@ def _load_manual_pcd_demos(demo_dir, n_points, only_success=False):
         print(f'[BC] loaded {fname}  len={d.get("len", len(d["acts"]))}  '
               f'rwd={d.get("reward", 0):.2f}  '
               f'success={d.get("success", 0)}')
+    if sf_mismatches > 0 or sf_unknown > 0:
+        print(f'[BC] WARNING: {sf_mismatches} demo(s) recorded under a '
+              f'different success_factor than training '
+              f'(training sf={sf_train}); {sf_unknown} demo(s) have no '
+              f'recorded success_factor (legacy pkls). Their `success` '
+              f'flags may not reflect the training criterion — '
+              f'--bc_demos_only_success could keep/drop the wrong demos. '
+              f'Re-record with the current --success_factor to align.')
     if not obs_buf:
         return (np.zeros((0, 0), dtype=np.float32),
                 np.zeros((0, 0), dtype=np.float32),
@@ -480,10 +544,16 @@ if extra_args.bc_demo_path:
     print(f'[BC] loaded {len(demo_obs)} (obs,act) pairs from '
           f'{n_demos} manual demos ({n_success} succeeded)')
 elif extra_args.bc_episodes > 0:
+    # Persist scripted demos under <logdir>/scripted_demos/ so they can
+    # be inspected post-hoc and reused on a future run via
+    # `--bc_demo_path <logdir>/scripted_demos`.
+    _scripted_demos_dir = os.path.join(dedo_args.logdir, 'scripted_demos')
     print(f'\n=== BC pretrain: collecting {extra_args.bc_episodes} '
           f'scripted PCD demos ===')
+    print(f'[BC] saving scripted demos to {_scripted_demos_dir}')
     demo_obs, demo_acts, n_success = _collect_pcd_demos(
-        dedo_args, extra_args.bc_episodes)
+        dedo_args, extra_args.bc_episodes,
+        save_dir=_scripted_demos_dir)
     n_demos = extra_args.bc_episodes
     print(f'[BC] collected {len(demo_obs)} (obs,act) pairs from '
           f'{n_demos} demos ({n_success} succeeded)')
