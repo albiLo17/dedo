@@ -75,6 +75,13 @@ parser.add_argument('--no_adaptive_success', action='store_true',
                          'inert. Use to compare against base reward.')
 parser.add_argument('--success_bonus', type=float, default=200.0)
 parser.add_argument('--fail_penalty', type=float, default=0.0)
+parser.add_argument('--vel_penalty', type=float, default=0.0,
+                    help='Per-step penalty proportional to cloth mean '
+                         'vertex displacement (proxy for cloth speed). '
+                         'Mirrors train_privileged.py so the same coef '
+                         'has the same meaning across obs modes; needed '
+                         'to remove a reward-shaping confound from the '
+                         'obs-modality comparison. 0 = off.')
 # BC pretrain (scripted hole-aware demos in PCD obs space).
 parser.add_argument('--bc_episodes', type=int, default=0,
                     help='If >0 AND --bc_demo_path not set: collect this '
@@ -175,7 +182,8 @@ def make_wrapped_env(args, monitor_dir=None):
             cam_resolution=extra_args.cam_resolution_pcd,
             success_factor=extra_args.success_factor,
             success_bonus=extra_args.success_bonus,
-            fail_penalty=extra_args.fail_penalty)
+            fail_penalty=extra_args.fail_penalty,
+            vel_penalty=extra_args.vel_penalty)
         env = Monitor(env, filename=monitor_dir)
         return env
     return _init
@@ -207,7 +215,8 @@ eval_env_raw = PointCloudObsWrapper(
     cam_resolution=extra_args.cam_resolution_pcd,
     success_factor=extra_args.success_factor,
     success_bonus=extra_args.success_bonus,
-    fail_penalty=extra_args.fail_penalty)
+    fail_penalty=extra_args.fail_penalty,
+    vel_penalty=extra_args.vel_penalty)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -248,12 +257,14 @@ if dedo_args.use_wandb:
         sf = extra_args.success_factor
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
+        vp = extra_args.vel_penalty
         bc_tag = '_bc' if _use_bc else ''
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
+        vp_tag = f'_vp{vp:g}' if vp else ''
         wandb.run.name = (f'{wandb.run.name}_pcd{extra_args.n_points}'
-                          f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}')
+                          f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}{vp_tag}')
         wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pointcloud',
@@ -261,6 +272,7 @@ if dedo_args.use_wandb:
             f'success_factor={sf}',
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
+            f'vel_penalty={vp}',
             f'n_points={extra_args.n_points}',
             f'policy={extra_args.policy}',
         ]
@@ -327,7 +339,8 @@ def _collect_pcd_demos(args, num_episodes):
         cam_resolution=extra_args.cam_resolution_pcd,
         success_factor=extra_args.success_factor,
         success_bonus=0.0,  # don't shape demo rewards
-        fail_penalty=0.0)
+        fail_penalty=0.0,
+        vel_penalty=0.0)
     raw.seed(args.seed + 1000)
 
     obs_buf, act_buf = [], []

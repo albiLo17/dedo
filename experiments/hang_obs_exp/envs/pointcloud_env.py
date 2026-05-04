@@ -41,7 +41,17 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
                  cam_resolution: int = 128,
                  success_factor: float = None,
                  success_bonus: float = 0.0,
-                 fail_penalty: float = 0.0):
+                 fail_penalty: float = 0.0,
+                 vel_penalty: float = 0.0):
+        """
+        vel_penalty: per-step penalty proportional to the cloth's mean
+        per-vertex displacement between consecutive policy steps (proxy
+        for cloth speed). Mirrors PrivilegedObsWrapper exactly so the
+        same shaping can be applied across obs modes for fair
+        comparison. 0 = off (default). Only applied during the policy
+        phase, not on the terminal step (the terminal mesh delta would
+        mix policy motion with the post-policy gravity settle).
+        """
         # PCD wrapper requires a working camera — force cam_resolution.
         env.args.cam_resolution = cam_resolution
         super().__init__(env)
@@ -51,6 +61,8 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._success_factor = success_factor
         self._success_bonus = float(success_bonus)
         self._fail_penalty = float(fail_penalty)
+        self._vel_penalty = float(vel_penalty)
+        self._prev_verts = None
 
         self._hole_vertex_indices = []
         self._goal_pos = None
@@ -60,6 +72,7 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         # Per-episode reward bookkeeping for the diagnostics callback.
         self._ep_step_count = 0
         self._ep_base_reward_sum = 0.0
+        self._ep_vel_penalty_sum = 0.0  # accumulates magnitude (>= 0)
 
         # Resolve the actual DeformEnv once. Anything wrapped between us
         # and the inner env (e.g. RetryResetEnv) blocks attribute access
@@ -175,8 +188,14 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._hole_vertex_indices = self._get_hole_indices()
         self._goal_pos = self._deform.goal_pos.copy()
         self._hole_radius = self._measure_hole_radius()
+        if self._vel_penalty > 0.0:
+            _, verts = get_mesh_data(self._deform.sim, self._deform.deform_id)
+            self._prev_verts = np.asarray(verts, dtype=np.float32)
+        else:
+            self._prev_verts = None
         self._ep_step_count = 0
         self._ep_base_reward_sum = 0.0
+        self._ep_vel_penalty_sum = 0.0
         return self._build_obs()
 
     def observation(self, obs):
@@ -188,6 +207,28 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
 
         base_reward = float(reward)
         base_is_success = info.get('is_success', None)
+
+        # ------------------------------------------------------------------
+        # Cloth-velocity penalty (non-terminal only). Mirrors
+        # PrivilegedObsWrapper so the same shaping coef means the same
+        # thing across obs modes.
+        # ------------------------------------------------------------------
+        vel_pen = 0.0
+        if self._vel_penalty > 0.0 and not done:
+            _, verts_now = get_mesh_data(
+                self._deform.sim, self._deform.deform_id)
+            verts_now = np.asarray(verts_now, dtype=np.float32)
+            if (self._prev_verts is not None
+                    and self._prev_verts.shape == verts_now.shape):
+                disp = np.linalg.norm(verts_now - self._prev_verts, axis=1)
+                disp = disp[~np.isnan(disp)]
+                if len(disp) > 0:
+                    mean_speed = float(disp.mean())
+                    vel_pen = self._vel_penalty * mean_speed
+                    reward = base_reward - vel_pen
+                    info['vel_penalty'] = vel_pen
+                    info['cloth_mean_speed'] = mean_speed
+            self._prev_verts = verts_now
 
         # Adaptive success + reward shaping (same logic as PrivilegedObsWrapper).
         adaptive_dist = None
@@ -227,6 +268,7 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         # Per-episode accumulators + diagnostic emission on done.
         self._ep_step_count += 1
         self._ep_base_reward_sum += base_reward
+        self._ep_vel_penalty_sum += vel_pen
 
         if done:
             self._emit_episode_diagnostics(
@@ -244,7 +286,7 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
 
     # ----------------------------------------------------------------------
     # Diagnostics emission. Mirrors PrivilegedObsWrapper for cross-comparable
-    # logs in TB / wandb. No vel_penalty here so that field is always 0.
+    # logs in TB / wandb.
     # ----------------------------------------------------------------------
     def _emit_episode_diagnostics(self, info, *,
                                   terminal_base, terminal_shaping,
@@ -252,9 +294,13 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
                                   base_is_success, adaptive_is_success,
                                   adaptive_dist, adaptive_thresh):
         info['rwd_diag/reward/episode_total'] = float(
-            self._ep_base_reward_sum + terminal_shaping)
+            self._ep_base_reward_sum
+            - self._ep_vel_penalty_sum
+            + terminal_shaping
+        )
         info['rwd_diag/reward/base_sum'] = float(self._ep_base_reward_sum)
-        info['rwd_diag/reward/vel_penalty_sum'] = 0.0
+        info['rwd_diag/reward/vel_penalty_sum'] = float(
+            self._ep_vel_penalty_sum)
         info['rwd_diag/reward/terminal_base'] = float(terminal_base)
         info['rwd_diag/reward/terminal_shaping'] = float(terminal_shaping)
         info['rwd_diag/reward/episode_length'] = int(self._ep_step_count)
