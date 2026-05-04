@@ -36,11 +36,15 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
+from _reward_diagnostics import (  # noqa: E402
+    RewardDiagnosticsCallback, dump_run_config, make_final_eval_collector,
+    log_final_eval_metrics)
 
 import dedo  # registers gym envs
 from dedo.utils.args import get_args_parser, args_postprocess
 from dedo.utils.train_utils import init_train
 from dedo.utils.rl_sb3_utils import CustomCallback
+from stable_baselines3.common.callbacks import CallbackList
 
 from experiments.hang_obs_exp.envs.pointcloud_env import PointCloudObsWrapper
 
@@ -64,6 +68,11 @@ parser.add_argument('--cam_resolution_pcd', type=int, default=128,
                     help='Render resolution used for the depth → PCD pipe.')
 # Adaptive success + shaping (same defaults as train_privileged.py).
 parser.add_argument('--success_factor', type=float, default=1.2)
+parser.add_argument('--no_adaptive_success', action='store_true',
+                    help='Disable the adaptive success override entirely '
+                         '(equivalent to success_factor=None). dedo '
+                         'is_success is used as-is and bonus/penalty are '
+                         'inert. Use to compare against base reward.')
 parser.add_argument('--success_bonus', type=float, default=200.0)
 parser.add_argument('--fail_penalty', type=float, default=0.0)
 # BC pretrain (scripted hole-aware demos in PCD obs space).
@@ -105,6 +114,12 @@ parser.add_argument('--n_epochs', type=int, default=4,
                          '(was 10) for pointnet2-friendly wall-clock; bump '
                          'back to 8-10 for mlp policy if needed.')
 extra_args, remaining = parser.parse_known_args()
+
+# `--no_adaptive_success` is the single switch for "use dedo's base reward
+# and success unchanged". The wrapper treats success_factor=None as the
+# disable signal, so we flip it here once for all downstream consumers.
+if extra_args.no_adaptive_success:
+    extra_args.success_factor = None
 
 # Subdir distinguishes BC vs non-BC runs.
 _use_bc = (extra_args.bc_demo_path is not None
@@ -285,9 +300,16 @@ rl_kwargs = dict(
 agent = PPO('MlpPolicy', vec_env, **rl_kwargs)
 
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
-cb = CustomCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
-                    num_steps_between_save=num_steps_between_save,
-                    viz=False, debug=False)
+base_cb = CustomCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
+                         num_steps_between_save=num_steps_between_save,
+                         viz=False, debug=False)
+diag_cb = RewardDiagnosticsCallback(window=100)
+cb = CallbackList([base_cb, diag_cb])
+
+# Persist a self-describing config.json + push to wandb.config so future
+# debugging never has to guess what reward this run optimized.
+dump_run_config(extra_args, dedo_args, dedo_args.logdir,
+                use_wandb=dedo_args.use_wandb)
 
 
 # ---------------------------------------------------------------------------
@@ -489,32 +511,30 @@ print(f'\nDone. Checkpoint: {ckpt_path}')
 from stable_baselines3.common.evaluation import evaluate_policy
 
 print(f'\nRunning final eval ({extra_args.n_final_eval_episodes} episodes)...')
-final_successes = []
-
-
-def _final_cb(_locals, _globals=None):
-    info = _locals.get('info', {})
-    if 'is_success' in info:
-        final_successes.append(int(info['is_success']))
-
-
+collector = make_final_eval_collector()
 mean_rwd, std_rwd = evaluate_policy(
     agent, eval_env, n_eval_episodes=extra_args.n_final_eval_episodes,
-    deterministic=True, callback=_final_cb, return_episode_rewards=False)
+    deterministic=True, callback=collector, return_episode_rewards=False)
 
-final_success_rate = (sum(final_successes) / len(final_successes)
-                      if final_successes else float('nan'))
+final_metrics = log_final_eval_metrics(
+    collector, use_wandb=dedo_args.use_wandb, prefix='final_eval')
+final_metrics['final_eval/mean_reward'] = float(mean_rwd)
+final_metrics['final_eval/std_reward'] = float(std_rwd)
+
 print(f'Final eval — mean_rwd={mean_rwd:.3f} ± {std_rwd:.3f}  '
-      f'success_rate={final_success_rate:.3f}  (n={len(final_successes)})')
+      f"success_rate={final_metrics.get('final_eval/success_rate', float('nan')):.3f}  "
+      f"(n={int(final_metrics.get('final_eval/n_episodes', 0))})")
+print('  Per-metric means over the eval set:')
+for k in sorted(final_metrics):
+    if k.endswith('__std') or k in (
+            'final_eval/mean_reward', 'final_eval/std_reward',
+            'final_eval/success_rate', 'final_eval/n_episodes'):
+        continue
+    print(f'    {k:48s} = {final_metrics[k]:.4f}')
 
 if dedo_args.use_wandb:
     import wandb
-    wandb.log({
-        'final_eval/mean_reward': mean_rwd,
-        'final_eval/std_reward': std_rwd,
-        'final_eval/success_rate': final_success_rate,
-        'final_eval/n_episodes': len(final_successes),
-    })
+    wandb.log(final_metrics)
     wandb.finish()
 
 vec_env.close()

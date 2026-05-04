@@ -57,6 +57,10 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._hole_radius = None
         self._last_pcd_world = None  # cached for overlay viz
 
+        # Per-episode reward bookkeeping for the diagnostics callback.
+        self._ep_step_count = 0
+        self._ep_base_reward_sum = 0.0
+
         # Resolve the actual DeformEnv once. Anything wrapped between us
         # and the inner env (e.g. RetryResetEnv) blocks attribute access
         # to underscore-prefixed members like `_cam_viewmat`.
@@ -171,6 +175,8 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._hole_vertex_indices = self._get_hole_indices()
         self._goal_pos = self._deform.goal_pos.copy()
         self._hole_radius = self._measure_hole_radius()
+        self._ep_step_count = 0
+        self._ep_base_reward_sum = 0.0
         return self._build_obs()
 
     def observation(self, obs):
@@ -180,35 +186,98 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         _, reward, done, info = self.env.step(action)
         obs = self._build_obs()
 
+        base_reward = float(reward)
+        base_is_success = info.get('is_success', None)
+
         # Adaptive success + reward shaping (same logic as PrivilegedObsWrapper).
+        adaptive_dist = None
+        adaptive_thresh = None
+        adaptive_is_success = None
+        terminal_shaping = 0.0
+
         if (done and 'is_success' in info
                 and self._success_factor is not None
                 and self._hole_radius is not None):
             _, verts = get_mesh_data(self._deform.sim, self._deform.deform_id)
             verts = np.asarray(verts, dtype=np.float32)
-            hv = verts[self._hole_vertex_indices] \
-                if self._hole_vertex_indices else np.zeros((0, 3))
+            hv = (verts[self._hole_vertex_indices]
+                  if self._hole_vertex_indices else np.zeros((0, 3)))
             hv = hv[~np.isnan(hv).any(axis=1)]
             if len(hv) > 0:
                 centroid = hv.mean(axis=0)
                 goal = np.asarray(self._deform.goal_pos[0], dtype=np.float32)
-                dist = float(np.linalg.norm(centroid - goal))
-                thresh = self._hole_radius * self._success_factor
-                is_success = bool(dist < thresh)
-                info['is_success'] = is_success
-                info['adaptive_dist'] = dist
-                info['adaptive_thresh'] = thresh
+                adaptive_dist = float(np.linalg.norm(centroid - goal))
+                adaptive_thresh = float(
+                    self._hole_radius * self._success_factor)
+                adaptive_is_success = bool(adaptive_dist < adaptive_thresh)
+
+                info['is_success'] = adaptive_is_success
+                info['adaptive_dist'] = adaptive_dist
+                info['adaptive_thresh'] = adaptive_thresh
                 info['hole_radius'] = self._hole_radius
 
-                shaping = 0.0
-                if is_success and self._success_bonus != 0.0:
-                    shaping += self._success_bonus
-                elif (not is_success) and self._fail_penalty != 0.0:
-                    shaping -= self._fail_penalty
-                if shaping != 0.0:
-                    reward = float(reward) + shaping
-                    info['shaping_added'] = shaping
+                if adaptive_is_success and self._success_bonus != 0.0:
+                    terminal_shaping = self._success_bonus
+                elif (not adaptive_is_success) and self._fail_penalty != 0.0:
+                    terminal_shaping = -self._fail_penalty
+                if terminal_shaping != 0.0:
+                    reward = float(reward) + terminal_shaping
+                    info['shaping_added'] = terminal_shaping
+
+        # Per-episode accumulators + diagnostic emission on done.
+        self._ep_step_count += 1
+        self._ep_base_reward_sum += base_reward
+
+        if done:
+            self._emit_episode_diagnostics(
+                info,
+                terminal_base=base_reward,
+                terminal_shaping=terminal_shaping,
+                total_reward=float(reward),
+                base_is_success=base_is_success,
+                adaptive_is_success=adaptive_is_success,
+                adaptive_dist=adaptive_dist,
+                adaptive_thresh=adaptive_thresh,
+            )
+
         return obs, reward, done, info
+
+    # ----------------------------------------------------------------------
+    # Diagnostics emission. Mirrors PrivilegedObsWrapper for cross-comparable
+    # logs in TB / wandb. No vel_penalty here so that field is always 0.
+    # ----------------------------------------------------------------------
+    def _emit_episode_diagnostics(self, info, *,
+                                  terminal_base, terminal_shaping,
+                                  total_reward,
+                                  base_is_success, adaptive_is_success,
+                                  adaptive_dist, adaptive_thresh):
+        info['rwd_diag/reward/episode_total'] = float(
+            self._ep_base_reward_sum + terminal_shaping)
+        info['rwd_diag/reward/base_sum'] = float(self._ep_base_reward_sum)
+        info['rwd_diag/reward/vel_penalty_sum'] = 0.0
+        info['rwd_diag/reward/terminal_base'] = float(terminal_base)
+        info['rwd_diag/reward/terminal_shaping'] = float(terminal_shaping)
+        info['rwd_diag/reward/episode_length'] = int(self._ep_step_count)
+
+        if base_is_success is not None:
+            info['rwd_diag/success/base_rate'] = int(bool(base_is_success))
+        if adaptive_is_success is not None:
+            info['rwd_diag/success/adaptive_rate'] = int(
+                bool(adaptive_is_success))
+        if base_is_success is not None and adaptive_is_success is not None:
+            info['rwd_diag/success/disagree_rate'] = int(
+                bool(base_is_success) != bool(adaptive_is_success))
+        active = (adaptive_is_success
+                  if adaptive_is_success is not None else base_is_success)
+        if active is not None:
+            info['rwd_diag/success/active_rate'] = int(bool(active))
+
+        if adaptive_dist is not None:
+            info['rwd_diag/task/adaptive_dist'] = adaptive_dist
+        if adaptive_thresh is not None:
+            info['rwd_diag/task/adaptive_thresh'] = adaptive_thresh
+        if self._hole_radius is not None:
+            info['rwd_diag/task/hole_radius'] = float(self._hole_radius)
 
     # ------------------------------------------------------------------
     # Render with PCD overlay (CustomCallback uses this for eval videos).

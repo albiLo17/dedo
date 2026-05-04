@@ -143,6 +143,11 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._prev_verts = None
         self._hole_radius = None
 
+        # Per-episode reward bookkeeping for the diagnostics callback.
+        self._ep_step_count = 0
+        self._ep_base_reward_sum = 0.0
+        self._ep_vel_penalty_sum = 0.0  # accumulates magnitude (>= 0)
+
         grip_dim = 12
 
         if obs_mode == 'hole_centroid':
@@ -194,6 +199,9 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
             self._prev_verts = np.asarray(verts, dtype=np.float32)
         else:
             self._prev_verts = None
+        self._ep_step_count = 0
+        self._ep_base_reward_sum = 0.0
+        self._ep_vel_penalty_sum = 0.0
         return self._build_obs()
 
     def observation(self, obs):
@@ -202,57 +210,136 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
     def step(self, action):
         _, reward, done, info = self.env.step(action)
         obs = self._build_obs()
-        # Cloth-velocity penalty: discourages whippy trajectories. Only
-        # active during the policy phase — on the terminal step, the
-        # underlying step() already ran make_final_steps, so the verts
-        # delta would mix policy motion with gravity-driven settle motion
-        # which the policy can't control. Skip it there.
+
+        # Capture base values BEFORE any wrapper modification, so diagnostics
+        # can attribute every reward component cleanly.
+        base_reward = float(reward)
+        base_is_success = info.get('is_success', None)
+
+        # ------------------------------------------------------------------
+        # (1) Cloth-velocity penalty (non-terminal only).
+        #     The terminal step's verts delta would mix policy motion with
+        #     gravity-driven settle motion the policy can't control, so we
+        #     skip it there.
+        # ------------------------------------------------------------------
+        vel_pen = 0.0
         if self._vel_penalty > 0.0 and not done:
             _, verts_now = get_mesh_data(self.env.sim, self.env.deform_id)
             verts_now = np.asarray(verts_now, dtype=np.float32)
-            if self._prev_verts is not None and \
-                    self._prev_verts.shape == verts_now.shape:
+            if (self._prev_verts is not None
+                    and self._prev_verts.shape == verts_now.shape):
                 disp = np.linalg.norm(verts_now - self._prev_verts, axis=1)
                 disp = disp[~np.isnan(disp)]
                 if len(disp) > 0:
                     mean_speed = float(disp.mean())
-                    pen = self._vel_penalty * mean_speed
-                    reward = float(reward) - pen
-                    info['vel_penalty'] = pen
+                    vel_pen = self._vel_penalty * mean_speed
+                    reward = base_reward - vel_pen
+                    info['vel_penalty'] = vel_pen
                     info['cloth_mean_speed'] = mean_speed
             self._prev_verts = verts_now
-        # Adaptive success: override env's fixed 0.125m threshold with one
-        # proportional to the hole's effective radius. Optionally inject
-        # a terminal bonus/penalty into the reward so PPO actually
-        # optimizes the (adaptive) success criterion, not just distance.
+
+        # ------------------------------------------------------------------
+        # (2) Adaptive success override + terminal shaping.
+        # ------------------------------------------------------------------
+        adaptive_dist = None
+        adaptive_thresh = None
+        adaptive_is_success = None
+        terminal_shaping = 0.0
+
         if (done and 'is_success' in info
                 and self._success_factor is not None
                 and self._hole_radius is not None):
             _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
             verts = np.asarray(verts, dtype=np.float32)
-            hv = verts[self._hole_vertex_indices] \
-                if self._hole_vertex_indices else np.zeros((0, 3))
+            hv = (verts[self._hole_vertex_indices]
+                  if self._hole_vertex_indices else np.zeros((0, 3)))
             hv = hv[~np.isnan(hv).any(axis=1)]
             if len(hv) > 0:
                 centroid = hv.mean(axis=0)
                 goal = np.asarray(self.env.goal_pos[0], dtype=np.float32)
-                dist = float(np.linalg.norm(centroid - goal))
-                thresh = self._hole_radius * self._success_factor
-                is_success = bool(dist < thresh)
-                info['is_success'] = is_success
-                info['adaptive_dist'] = dist
-                info['adaptive_thresh'] = thresh
+                adaptive_dist = float(np.linalg.norm(centroid - goal))
+                adaptive_thresh = float(
+                    self._hole_radius * self._success_factor)
+                adaptive_is_success = bool(adaptive_dist < adaptive_thresh)
+
+                info['is_success'] = adaptive_is_success
+                info['adaptive_dist'] = adaptive_dist
+                info['adaptive_thresh'] = adaptive_thresh
                 info['hole_radius'] = self._hole_radius
 
-                shaping = 0.0
-                if is_success and self._success_bonus != 0.0:
-                    shaping += self._success_bonus
-                elif (not is_success) and self._fail_penalty != 0.0:
-                    shaping -= self._fail_penalty
-                if shaping != 0.0:
-                    reward = float(reward) + shaping
-                    info['shaping_added'] = shaping
+                if adaptive_is_success and self._success_bonus != 0.0:
+                    terminal_shaping = self._success_bonus
+                elif (not adaptive_is_success) and self._fail_penalty != 0.0:
+                    terminal_shaping = -self._fail_penalty
+                if terminal_shaping != 0.0:
+                    reward = float(reward) + terminal_shaping
+                    info['shaping_added'] = terminal_shaping
+
+        # ------------------------------------------------------------------
+        # (3) Update per-episode accumulators and emit diagnostics on done.
+        # ------------------------------------------------------------------
+        self._ep_step_count += 1
+        self._ep_base_reward_sum += base_reward
+        self._ep_vel_penalty_sum += vel_pen
+
+        if done:
+            self._emit_episode_diagnostics(
+                info,
+                terminal_base=base_reward,
+                terminal_shaping=terminal_shaping,
+                total_reward=float(reward),
+                base_is_success=base_is_success,
+                adaptive_is_success=adaptive_is_success,
+                adaptive_dist=adaptive_dist,
+                adaptive_thresh=adaptive_thresh,
+            )
+
         return obs, reward, done, info
+
+    # ----------------------------------------------------------------------
+    # Diagnostics emission. Keys live under 'rwd_diag/<group>/<metric>' and
+    # are drained by RewardDiagnosticsCallback into TB/wandb. Only emitted
+    # at terminal step so the callback can compute per-episode statistics.
+    # ----------------------------------------------------------------------
+    def _emit_episode_diagnostics(self, info, *,
+                                  terminal_base, terminal_shaping,
+                                  total_reward,
+                                  base_is_success, adaptive_is_success,
+                                  adaptive_dist, adaptive_thresh):
+        info['rwd_diag/reward/episode_total'] = float(
+            self._ep_base_reward_sum
+            - self._ep_vel_penalty_sum
+            + terminal_shaping
+        )
+        info['rwd_diag/reward/base_sum'] = float(self._ep_base_reward_sum)
+        info['rwd_diag/reward/vel_penalty_sum'] = float(
+            self._ep_vel_penalty_sum)
+        info['rwd_diag/reward/terminal_base'] = float(terminal_base)
+        info['rwd_diag/reward/terminal_shaping'] = float(terminal_shaping)
+        info['rwd_diag/reward/episode_length'] = int(self._ep_step_count)
+
+        # Successes: which definition each run uses, and disagreement rate.
+        if base_is_success is not None:
+            info['rwd_diag/success/base_rate'] = int(bool(base_is_success))
+        if adaptive_is_success is not None:
+            info['rwd_diag/success/adaptive_rate'] = int(
+                bool(adaptive_is_success))
+        if base_is_success is not None and adaptive_is_success is not None:
+            info['rwd_diag/success/disagree_rate'] = int(
+                bool(base_is_success) != bool(adaptive_is_success))
+        # The success label the agent was actually trained against.
+        active = (adaptive_is_success
+                  if adaptive_is_success is not None else base_is_success)
+        if active is not None:
+            info['rwd_diag/success/active_rate'] = int(bool(active))
+
+        # Task geometry (only meaningful when adaptive computation ran).
+        if adaptive_dist is not None:
+            info['rwd_diag/task/adaptive_dist'] = adaptive_dist
+        if adaptive_thresh is not None:
+            info['rwd_diag/task/adaptive_thresh'] = adaptive_thresh
+        if self._hole_radius is not None:
+            info['rwd_diag/task/hole_radius'] = float(self._hole_radius)
 
     @property
     def hole_radius(self):
