@@ -42,7 +42,7 @@ class DeformEnv(gym.Env):
     STEPS_AFTER_DONE = 500     # steps after releasing anchors at the end
     FORCE_REWARD_MULT = 1e-4   # scaling for the force penalties
     FINAL_REWARD_MULT = 400    # multiply the final reward (for sparse rewards)
-    SUCESS_REWARD_TRESHOLD = 7.5  # approx. threshold for task success/failure
+    SUCESS_REWARD_TRESHOLD = 2.5  # approx. threshold for task success/failure
 
     def __init__(self, args):
         self.args = args
