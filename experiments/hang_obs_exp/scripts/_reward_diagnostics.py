@@ -31,8 +31,10 @@ Why the wrapper emits and the callback consumes:
     obs wrappers) only requires updating the wrapper; the callback and
     config dump stay generic.
 
-Metric layout in TB / wandb (everything is rolling mean over `window`
-finished episodes):
+Metric layout in TB / wandb. Two layers per metric:
+
+  (1) Rolling-mean (default), one record per metric per `_on_step`. Path
+      = the metric name without prefix:
 
     reward/episode_total       full reward seen by the agent per episode
     reward/base_sum            sum of all per-step base env rewards
@@ -51,6 +53,19 @@ finished episodes):
     task/adaptive_dist         ||hole_centroid - goal|| at terminal step
     task/adaptive_thresh       success_factor * hole_radius
     task/hole_radius           per-episode mean hole radius
+
+  (2) Per-episode RAW (no averaging), one wandb.log call at episode end.
+      These are essential for spotting individual successful episodes
+      since the rolling-mean charts smear them across 100 eps:
+
+    last_episode/success            0/1, the active success criterion
+    last_episode/success_adaptive   0/1 adaptive (== success when sf set)
+    last_episode/success_base       0/1 dedo's strict criterion
+    last_episode/dist               final hole→goal distance in meters
+    last_episode/episode_total      total reward including shaping
+    last_episode/episode_length     step count of the just-ended episode
+    train/episodes_total            running episode counter (good x-axis)
+    train/cumulative_successes      monotone tally of successes so far
 """
 
 from __future__ import annotations
@@ -91,12 +106,17 @@ class RewardDiagnosticsCallback(BaseCallback):
         self._window = int(window)
         self._buffers: Dict[str, deque] = defaultdict(
             lambda: deque(maxlen=self._window))
-        # Total finished episodes seen across all parallel envs.
+        # Total finished episodes / successes seen across all parallel envs.
+        # These power the per-episode raw wandb stream (last_episode/*,
+        # train/episodes_total, train/cumulative_successes) so charts can
+        # show individual successes instead of rolling-window averages.
         self._n_episodes = 0
+        self._n_successes = 0
 
     def _on_step(self) -> bool:
         for info in self.locals.get('infos', []):
             episode_ended = False
+            ep_metrics: Dict[str, float] = {}
             for key, value in info.items():
                 if not key.startswith(_RWD_DIAG_PREFIX):
                     continue
@@ -107,10 +127,21 @@ class RewardDiagnosticsCallback(BaseCallback):
                     value = int(value)
                 if isinstance(value, (int, float, np.floating, np.integer)):
                     metric = key[len(_RWD_DIAG_PREFIX):]
-                    self._buffers[metric].append(float(value))
+                    val = float(value)
+                    self._buffers[metric].append(val)
+                    ep_metrics[metric] = val
                     episode_ended = True
             if episode_ended:
                 self._n_episodes += 1
+                # success/active_rate is the criterion the agent actually
+                # trained against; fall back to adaptive then base. 0/1.
+                ep_success = (ep_metrics.get('success/active_rate')
+                              or ep_metrics.get('success/adaptive_rate')
+                              or ep_metrics.get('success/base_rate')
+                              or 0.0)
+                if ep_success > 0.5:
+                    self._n_successes += 1
+                self._log_per_episode_to_wandb(ep_metrics, ep_success)
 
         # Record current rolling means. SB3 will dump them to TB at the
         # next logger.dump() (every n_steps for PPO, every step-with-log
@@ -125,6 +156,46 @@ class RewardDiagnosticsCallback(BaseCallback):
                                len(next(iter(self._buffers.values())))
                                if self._buffers else 0)
         return True
+
+    def _log_per_episode_to_wandb(self, ep_metrics: Dict[str, float],
+                                  ep_success: float) -> None:
+        """Emit raw (un-averaged) per-episode values to wandb so charts can
+        show individual successful episodes as 0/1 spikes instead of
+        100-ep rolling means. Runs only when wandb is the active logger.
+
+        We use wandb.log directly (not self.logger.record) because SB3's
+        logger overwrites repeated record() calls between dumps — if 4
+        episodes finish in one rollout window and only 1 is a success,
+        the 1 gets clobbered by the next 0. Logging directly to wandb
+        with step=num_timesteps preserves every episode."""
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+
+        log_dict: Dict[str, float] = {
+            'last_episode/success': float(ep_success),
+            'train/episodes_total': float(self._n_episodes),
+            'train/cumulative_successes': float(self._n_successes),
+        }
+        # Mirror a few of the most useful per-episode raw values so users
+        # can see individual-episode behavior on the same axes that the
+        # rolling-mean charts already use.
+        for src, dst in (
+                ('success/adaptive_rate', 'last_episode/success_adaptive'),
+                ('success/base_rate', 'last_episode/success_base'),
+                ('task/adaptive_dist', 'last_episode/dist'),
+                ('reward/episode_total', 'last_episode/episode_total'),
+                ('reward/episode_length', 'last_episode/episode_length')):
+            if src in ep_metrics:
+                log_dict[dst] = float(ep_metrics[src])
+        try:
+            wandb.log(log_dict, step=int(self.num_timesteps))
+        except Exception:
+            # Swallow wandb errors so a logging glitch never kills training.
+            pass
 
 
 # =========================================================================

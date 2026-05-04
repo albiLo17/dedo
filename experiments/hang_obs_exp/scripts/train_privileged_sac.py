@@ -94,7 +94,21 @@ parser.add_argument('--gradient_steps', type=int, default=1,
                     help='Gradient updates per train trigger.')
 parser.add_argument('--ent_coef', type=str, default='auto',
                     help='SAC entropy coef. "auto" = auto-tuned. '
-                         'Or float like "0.1".')
+                         'Or float like "0.1". NOTE: with large terminal '
+                         'rewards (success_bonus + FINAL_REWARD_MULT) auto '
+                         'reliably collapses ent_coef toward 0 within '
+                         '~50–200k steps, killing exploration. Pinning it '
+                         'at 0.1–0.2 is safer with this reward scale.')
+parser.add_argument('--log_std_init', type=float, default=None,
+                    help='Initial log_std for the SAC actor head. SB3 '
+                         'default leaves log_std as a freshly-initialized '
+                         'nn.Linear whose output ≈ N(0, ~1), so initial '
+                         'exploration noise std ≈ 1 in pre-tanh space. '
+                         'Demo actions are ~0.15, so the BC-trained mu '
+                         'signal is mostly drowned out at deploy. Set to '
+                         '-2 (std≈0.135) when BC is on, so the BC mean '
+                         'is visible from step 0. Pass None to leave '
+                         'log_std at its random init.')
 # Adaptive success + shaping (same defaults as train_privileged.py).
 parser.add_argument('--success_factor', type=float, default=1.2)
 parser.add_argument('--no_adaptive_success', action='store_true',
@@ -130,6 +144,19 @@ parser.add_argument('--bc_demos_only_success', action='store_true',
                          'is_success at terminal step. Applies to BOTH '
                          'manual demos (loaded from --bc_demo_path) and '
                          'scripted demos collected via --bc_episodes.')
+# Resume.
+parser.add_argument('--load_checkpoint', type=str, default=None,
+                    help='Path to a previous run logdir (e.g. '
+                         'hole_centroid_sac/SAC_<timestamp>_HangProcCloth-v1) '
+                         'to resume training from. Loads agent.zip, '
+                         'replay_buffer.pkl, and vec_normalize.pkl from '
+                         'that directory; skips BC pretrain and '
+                         'log_std_init patch (those are already baked in '
+                         'to the saved policy). A NEW wandb run is started '
+                         'with tags resumed_from=<orig> and '
+                         'resume_step=<n_timesteps_at_load> so you can '
+                         'group the original + resumed runs in the wandb '
+                         'UI for one continuous chart.')
 extra_args, remaining = parser.parse_known_args()
 
 # `--no_adaptive_success` is the single switch for "use dedo's base reward
@@ -310,7 +337,116 @@ rl_kwargs = dict(
     gradient_steps=extra_args.gradient_steps,
     ent_coef=ent_coef_arg,
 )
-agent = SAC('MlpPolicy', vec_env, **rl_kwargs)
+# ---------------------------------------------------------------------------
+# Build agent. Two paths:
+#   * Fresh: construct SAC, then optionally patch log_std and run BC.
+#   * Resume: SAC.load() + load_replay_buffer() + apply saved
+#     VecNormalize stats. Skip log_std patch and BC since both are
+#     already baked into the saved policy / replay state.
+# ---------------------------------------------------------------------------
+_resuming = bool(extra_args.load_checkpoint)
+
+if _resuming:
+    ckpt_dir = extra_args.load_checkpoint
+    if not os.path.isdir(ckpt_dir):
+        raise FileNotFoundError(
+            f'--load_checkpoint dir does not exist: {ckpt_dir}')
+    agent_path = os.path.join(ckpt_dir, 'agent.zip')
+    rb_path = os.path.join(ckpt_dir, 'replay_buffer.pkl')
+    vn_path = os.path.join(ckpt_dir, 'vec_normalize.pkl')
+    if not os.path.exists(agent_path):
+        raise FileNotFoundError(f'no agent.zip in {ckpt_dir}')
+
+    # 1. Restore VecNormalize stats IN PLACE (must happen before SAC.load
+    #    so the loaded policy sees normalized obs at the same scale it
+    #    was trained against).
+    if os.path.exists(vn_path):
+        _loaded_vn = VecNormalize.load(vn_path, vec_env.venv)
+        vec_env.obs_rms = _loaded_vn.obs_rms
+        vec_env.ret_rms = _loaded_vn.ret_rms
+        vec_env.training = True
+        print(f'[resume] loaded VecNormalize stats from {vn_path}')
+    else:
+        print(f'[resume] WARN: no vec_normalize.pkl at {vn_path}; '
+              f'using fresh obs/ret rms (policy will see drifted obs scale)')
+
+    # 2. Load SAC weights + optimizer + num_timesteps. Pass current rl_kwargs
+    #    via custom_objects so e.g. learning_rate / ent_coef from the *new*
+    #    command-line override the saved ones (you almost always want this
+    #    on resume — that's why you're resuming).
+    agent = SAC.load(
+        agent_path, env=vec_env, device=dedo_args.device,
+        tensorboard_log=dedo_args.logdir,
+        custom_objects={
+            'learning_rate': dedo_args.lr,
+            'lr_schedule': lambda _progress: dedo_args.lr,
+            'ent_coef': ent_coef_arg,
+        })
+    print(f'[resume] loaded SAC policy from {agent_path}; '
+          f'num_timesteps={agent.num_timesteps:,}')
+
+    # 3. Replay buffer: critical for SAC. Without it, SAC's first updates
+    #    after resume are on whatever buffer SAC.load reconstructs (usually
+    #    empty or tiny), making the policy drift quickly.
+    if os.path.exists(rb_path):
+        agent.load_replay_buffer(rb_path)
+        try:
+            _rb_size = agent.replay_buffer.size()
+        except Exception:
+            _rb_size = '?'
+        print(f'[resume] loaded replay buffer from {rb_path} '
+              f'(size={_rb_size})')
+    else:
+        print(f'[resume] WARN: no replay_buffer.pkl at {rb_path}; '
+              f'SAC will resume with an empty buffer (expect actor drift).')
+
+    # 4. Tag the new wandb run so it's clearly linked to its origin.
+    if dedo_args.use_wandb:
+        try:
+            import wandb
+            if wandb.run is not None:
+                _orig_name = os.path.basename(ckpt_dir.rstrip('/'))
+                wandb.run.tags = list(wandb.run.tags or []) + [
+                    f'resumed_from={_orig_name}',
+                    f'resume_step={agent.num_timesteps}',
+                ]
+                wandb.run.notes = (
+                    f'Resumed from `{ckpt_dir}` at step '
+                    f'{agent.num_timesteps:,}.\n'
+                    f'Use the wandb "Group by tag" UI to overlay this '
+                    f'run with the origin for a continuous chart.')
+        except Exception:
+            pass
+
+else:
+    # ---- Fresh agent ------------------------------------------------------
+    agent = SAC('MlpPolicy', vec_env, **rl_kwargs)
+
+    # -----------------------------------------------------------------------
+    # Force-init the actor's log_std head to a small constant.
+    #
+    # Why: SB3 SAC (non-SDE) builds log_std as `nn.Linear(latent_dim,
+    # action_dim)` with default torch init; `policy_kwargs={'log_std_init':
+    # ...}` is silently ignored in this code path (it's only consumed by
+    # the SDE branch). The resulting initial std is ~1.0 in pre-tanh space,
+    # so tanh-squashed actions average |a| ≈ 0.55 before any learning —
+    # overwhelming the ~0.15 magnitude of BC-trained mu. Patching the bias
+    # to a constant (and zeroing the weight) pins log_std to that constant
+    # at initialization; SAC's gradient updates then move it as needed.
+    #
+    # Effect with --log_std_init -2: std ≈ 0.135, comparable to demo
+    # |action|, so BC pretrain is immediately visible at deploy. Not
+    # setting this knob preserves SB3 default behavior.
+    # -----------------------------------------------------------------------
+    if extra_args.log_std_init is not None:
+        with torch.no_grad():
+            agent.policy.actor.log_std.bias.fill_(
+                float(extra_args.log_std_init))
+            agent.policy.actor.log_std.weight.zero_()
+        _init_std = float(np.exp(extra_args.log_std_init))
+        print(f'[init] forced actor.log_std to constant '
+              f'{extra_args.log_std_init} (std ≈ {_init_std:.3f}); '
+              f'BC mean will be visible at deploy.')
 
 # Eval cadence: keep PPO-comparable so wandb plots line up.
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
@@ -571,7 +707,17 @@ def _bc_pretrain_sac(agent, demo_obs, demo_acts, vec_normalize,
             wandb.log({'bc/mse': avg, 'bc/epoch': epoch + 1})
 
 
-if extra_args.bc_demo_path:
+if _resuming:
+    # On resume, skip BC entirely — the saved policy already encodes
+    # whatever BC was applied in the originating run, and re-running BC
+    # on top of a partially-RL-trained policy would clobber the RL
+    # progress.
+    print(f'\n=== resume mode: skipping BC pretrain (policy already '
+          f'has BC + {agent.num_timesteps:,} steps of RL applied) ===')
+    demo_obs = np.zeros((0, 0), dtype=np.float32)
+    demo_acts = np.zeros((0, 0), dtype=np.float32)
+    n_success, n_demos = 0, 0
+elif extra_args.bc_demo_path:
     print(f'\n=== BC pretrain: loading manual demos from '
           f'{extra_args.bc_demo_path} ===')
     demo_obs, demo_acts, n_success, n_demos = _load_manual_demos(
@@ -613,9 +759,24 @@ elif extra_args.bc_demo_path or extra_args.bc_episodes > 0:
 
 # ---------------------------------------------------------------------------
 # Train.
+#
+# `--total_env_steps` is interpreted as the *target total*, not the
+# remainder. With reset_num_timesteps=False on resume, SAC continues from
+# its loaded num_timesteps until that target is reached. So if you
+# launched the original run with `--total_env_steps 500000`, killed at
+# step 100k, and now want to keep going to 500k, just pass
+# `--total_env_steps 500000` again. To extend further (e.g. 800k after
+# resume), pass that bigger number.
 # ---------------------------------------------------------------------------
-print('Start SAC privileged training ...')
-agent.learn(total_timesteps=extra_args.total_env_steps, callback=cb)
+print('Start SAC privileged training '
+      f'({"resuming" if _resuming else "fresh"}; '
+      f'num_timesteps starts at {agent.num_timesteps:,}; '
+      f'target {extra_args.total_env_steps:,}) ...')
+if _resuming and agent.num_timesteps >= extra_args.total_env_steps:
+    print(f'[resume] num_timesteps already >= target; nothing to do. '
+          f'Pass a higher --total_env_steps to extend training.')
+agent.learn(total_timesteps=extra_args.total_env_steps, callback=cb,
+            reset_num_timesteps=not _resuming)
 
 ckpt_path = os.path.join(dedo_args.logdir, 'agent.zip')
 agent.save(ckpt_path)

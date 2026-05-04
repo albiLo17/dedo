@@ -2,20 +2,23 @@ Here's a complete chart guide based on what's actually being logged.
 
 ---
 
-## The 6 charts that matter most
+## The 7 charts that matter most
 
 If you're glancing at wandb every hour, these are the ones to check first, in this order:
 
 | # | Chart | Plain-English meaning |
 |---|---|---|
 | 1 | `eval/success_rate` | The headline. Deterministic 10-episode eval success rate. **This is the number that goes in your paper.** |
-| 2 | `rollout/success_rate_100` | Live success rate from training rollouts (100-ep moving avg). Noisier than eval but updates every episode. |
-| 3 | `rwd_diag/task/adaptive_dist` | Mean hole-centroid → goal distance at episode end (in meters). **Leading indicator** — drops well before success rate climbs. |
-| 4 | `train/critic_loss` | SAC critic stability. Should stabilize to a finite value. **Explosion = kill the run.** |
-| 5 | `train/ent_coef` | SAC's auto-tuned exploration noise. Should converge to ~0.05–0.5. **Drops to 0 too fast = premature commitment.** |
-| 6 | `eval/video` (panel, not chart) | The mp4 grid. Watch one every couple of hours; tells you *why* the metrics look the way they do. |
+| 2 | `train/cumulative_successes` | **Monotone tally of all successful episodes since run start.** Each step UP = one specific episode succeeded. Reads exactly like "how many times has the agent solved it so far?" — no rolling-average smearing. Use this whenever you want "did *that* episode succeed?". |
+| 3 | `last_episode/success` | Raw 0/1 spike per episode (1 = success, 0 = fail). Lets you visually count individual successes and see the gaps between them. Sparse and spiky on purpose. |
+| 4 | `rwd_diag/task/adaptive_dist` *or* `last_episode/dist` | Mean hole-centroid → goal distance at episode end (m). **Leading indicator** — drops well before success rate climbs. Use the `rwd_diag/...` rolling version for trend; use `last_episode/dist` for per-episode "near-misses". |
+| 5 | `train/critic_loss` | SAC critic stability. Should stabilize to a finite value. **Explosion = kill the run.** |
+| 6 | `train/ent_coef` | SAC's auto-tuned exploration noise. Should converge to ~0.05–0.5. **Drops below 0.01 = premature commitment, run is collapsing.** Pin entropy with `--ent_coef 0.2` if it keeps happening (see "Known failure modes" below). |
+| 7 | `eval/video` (panel, not chart) | The mp4 grid. Watch one every couple of hours; tells you *why* the metrics look the way they do. |
 
-Pin these 6 to the top of the wandb panel using ⋯ → "Move to top" so they're above the fold every time you open the run page.
+Pin these 7 to the top of the wandb panel using ⋯ → "Move to top" so they're above the fold every time you open the run page.
+
+**Recommended X-axis for charts 2–4**: `train/episodes_total` (set globally via workspace settings ⚙️ → X-axis). For SAC-internals (charts 5–6), keep `Step`. See the X-axis section below for why `time/episodes` from SB3 is *not* available.
 
 ---
 
@@ -86,6 +89,28 @@ These are emitted by `PrivilegedObsWrapper._emit_episode_diagnostics` and rollin
 | `time/fps` | Env steps per wall-clock second | **Watch this for thermal throttling.** On the M4 you should see ~10 sps starting, may degrade ~20–30% over time. Sustained drops below 5 sps = something's wrong (FileProvider, swap, etc.). |
 | `time/episodes` | Total episodes (= ~steps/200) | — |
 
+### `last_episode/*` — raw per-episode values (no averaging)
+
+Logged by `RewardDiagnosticsCallback._log_per_episode_to_wandb` directly via `wandb.log` (bypasses the SB3 logger to avoid record-overwrite-before-dump losses). One data point per episode end. Use these whenever you want individual-episode resolution that the rolling-mean charts can't give you.
+
+| Chart | What it is |
+|---|---|
+| `last_episode/success` | 0 or 1, the *active* success criterion for the just-finished episode. Sparse spike train. |
+| `last_episode/success_adaptive` | 0/1 of the wrapper's adaptive criterion (`dist < success_factor × hole_radius`). |
+| `last_episode/success_base` | 0/1 of dedo's strict `\|final_reward\| < 2.5` criterion. Will be ≤ adaptive. |
+| `last_episode/dist` | Final hole-centroid → goal distance in meters for the just-ended episode. Pair with `task/adaptive_thresh` reference line. |
+| `last_episode/episode_total` | Total reward (incl. shaping) for the just-ended episode. Quick way to see "did terminal_shaping fire". |
+| `last_episode/episode_length` | Step count of the just-ended episode. Drops below 200 = early-termination via out-of-workspace clip. |
+
+### `train/*` (custom) — episode counters for x-axis
+
+Logged from the same callback path as `last_episode/*`. These exist *specifically* to give you a useful x-axis (SB3's `time/episodes` is `exclude="tensorboard"` so it never reaches wandb — see X-axis section).
+
+| Chart | What it is |
+|---|---|
+| `train/episodes_total` | Cumulative episode counter. Use as the global wandb X-axis for everything except `bc/*`. |
+| `train/cumulative_successes` | Cumulative count of successful episodes. **Each step up = one specific episode succeeded** — the cleanest way to count successes in a run. |
+
 ### `bc/*` — BC pretrain (only if `--bc_episodes > 0`)
 
 These have **`bc/epoch` as their natural x-axis**, not step. They live in step 0 (since BC runs before `agent.learn()`).
@@ -132,12 +157,17 @@ Top right of any chart → "Edit panel" → "Edit X-axis" (or change globally vi
 
 | For these charts | Use x-axis | Why |
 |---|---|---|
-| Everything **except** `bc/*` | `Step` (default — = `global_step` = env steps) | Cross-run comparable; same scale across PPO and SAC. |
+| **Default for everything except `bc/*` and `train/*` SAC-internals** | `train/episodes_total` | Reads as "completed deployments". Step 8000 = episode ~50 vs. "8k of 1.5M" reads cleaner as "50 of ~7500". Logged per-episode by `RewardDiagnosticsCallback`. |
 | `bc/mse`, `bc/epoch_loss` | `bc/epoch` | The natural x-axis for BC; otherwise all 30 points stack at step 0. |
+| `train/critic_loss`, `train/actor_loss`, `train/ent_coef` | `train/n_updates` | Honest x-axis for SAC internals — nothing happens before `learning_starts`, and `n_updates` only ticks during gradient updates. |
 | Performance debugging (M4 throttling, FileProvider stalls) | `_runtime` (wall-clock seconds) | If `time/fps` looks fine vs Step but the run takes forever in `_runtime`, something is making each step expensive in wall-clock. |
-| Cross-run baselining (multiple seeds) | `Step` with a 100-pt smoothing | Helps you eyeball "is this seed the lucky one or are all seeds rising?" |
+| Cross-algo baselining (PPO vs SAC) | `Step` (= env steps) | Cross-algo comparable since both use the same env-step axis. |
 
-Set the **smoothing slider** to ~0.7 globally for the noisy episode-level charts (`rollout/*`, `rwd_diag/*`). For the per-update `train/*` charts, lower smoothing is fine since they're already aggregated by SB3. SAC logs every gradient update so they're dense.
+### Why we don't use `time/episodes`
+
+SB3 1.2.0's SAC internally logs `time/episodes` and `time/total timesteps` with `exclude="tensorboard"`, which means they never reach the TB events file and (because wandb syncs from TB) they never reach wandb either. So those metrics simply don't exist on the wandb side, even though they show up nicely formatted in your stdout dump tables. Our `train/episodes_total` is the workaround — same content, but logged via `wandb.log` directly so it's actually selectable as an x-axis.
+
+Set the **smoothing slider** to ~0.7 globally for the noisy episode-level charts (`rollout/*`, `rwd_diag/*`). For the per-update `train/*` charts, lower smoothing is fine since they're already aggregated by SB3. SAC logs every gradient update so they're dense. **Set smoothing to 0** on `last_episode/*` and `train/cumulative_successes` — those are exactly the charts where you want to see individual episode events sharply.
 
 ---
 
@@ -161,6 +191,7 @@ This is where the run is most likely to silently fail.
 | `train/ent_coef` hits 0.01 by step 20k | Reward magnitudes too big, actor over-confident | Kill, retry with `--ent_coef 0.2` (fixed, no auto) |
 | `rollout/ep_len_mean` drops below 150 | Out-of-workspace clipping → many early terminations | Symptom of cloth flying away. Kill, retry with `--vel_penalty 1.0` |
 | `time/fps` halves over 20k steps | Thermal throttle or FileProvider | Move logdir off Drive (you did), check thermal |
+| First success at step 1–2k (BC), then `last_episode/success` flatlines at 0 for thousands of episodes after `ent_coef` falls below 0.01 | The "ent_coef collapse" — auto-entropy commits to whatever the BC seed pointed at and stops exploring. Confirmed seen in privileged hole_centroid SAC at ~step 240k. | Kill. Re-run with `--ent_coef 0.2 --log_std_init -2`. Pinning entropy prevents the collapse; lower log_std init makes BC immediately useful. |
 
 What you want to see:
 - `rwd_diag/task/adaptive_dist` starting to drop (this is the very first sign of learning, before success_rate moves)
@@ -190,8 +221,83 @@ If at 300k your `adaptive_dist` is flat AND `eval/success_rate` is stuck at <5%,
 
 In the wandb run page, click the ⚙️ next to the workspace name and create three sections:
 
-1. **Headline** — drag in `eval/success_rate`, `rollout/success_rate_100`, `rwd_diag/task/adaptive_dist`, `eval/video`. This is the only section you need to look at most of the time.
-2. **Health** — drag in `train/critic_loss`, `train/ent_coef`, `train/actor_loss`, `time/fps`. Glance once an hour.
-3. **Decomposition** — drag in `rwd_diag/reward/*` charts. Look at this only when something looks weird in **Headline**.
+1. **Headline** — drag in `eval/success_rate`, `train/cumulative_successes`, `last_episode/success`, `rwd_diag/task/adaptive_dist`, `eval/video`. This is the only section you need to look at most of the time. Set workspace X-axis to `train/episodes_total`. Set smoothing to 0 for `last_episode/*` and `train/cumulative_successes`; ~0.7 for the rest.
+2. **Health** — drag in `train/critic_loss`, `train/ent_coef`, `train/actor_loss`, `time/fps`. Glance once an hour. **`train/ent_coef` is the canary** — if it drops below 0.01 the run is collapsing, kill it.
+3. **Decomposition** — drag in `rwd_diag/reward/*` charts plus `last_episode/dist`, `last_episode/episode_length`. Look at this only when something looks weird in **Headline**.
 
 The default wandb panel layout dumps everything alphabetically and is genuinely hard to read on small screens. The 3-section setup pays for itself within the first run.
+
+---
+
+## Resuming a SAC run (`--load_checkpoint`)
+
+`train_privileged_sac.py` supports proper resume from any saved checkpoint. The `_video_callback.py` checkpoint cadence (every `log_save_interval × 500` env steps) writes everything needed:
+
+- `agent.zip` — policy + value + log_std + Adam state + `num_timesteps`
+- `replay_buffer.pkl` — SAC's off-policy buffer (critical; without it SAC's first updates after resume run on an empty buffer and the policy drifts fast)
+- `vec_normalize.pkl` — obs/reward running stats (without it the loaded policy sees obs at a slightly different scale and quietly degrades)
+- `args.pkl` — original dedo args
+
+To resume:
+
+```bash
+caffeinate -dimsu python experiments/hang_obs_exp/scripts/train_privileged_sac.py \
+    --logdir_root "$LOGDIR_ROOT" \
+    --obs_mode hole_centroid \
+    --total_env_steps 500000 \
+    --load_checkpoint hole_centroid_sac/SAC_<orig_timestamp>_HangProcCloth-v1 \
+    --use_wandb
+```
+
+What happens:
+
+1. The script reads `agent.zip` / `replay_buffer.pkl` / `vec_normalize.pkl` from the checkpoint dir.
+2. **BC pretrain is skipped** (the saved policy already encodes BC + however many steps of RL). Re-applying BC would clobber RL progress.
+3. **`--log_std_init` is skipped** (whatever value it had during the original run is in the saved weights; SAC has been moving it via gradient steps since then).
+4. `--total_env_steps` is interpreted as the *target total*, not the remainder. To run from step 100k → step 500k, pass `--total_env_steps 500000` again.
+5. CLI hyperparams that shadow saved ones (`--lr`, `--ent_coef`) **override** the saved values via SB3's `custom_objects`. This lets you change LR or pin entropy mid-run if you need to.
+6. A NEW wandb run is created (see "wandb resume semantics" below for why) with tags `resumed_from=<orig_name>` and `resume_step=<num_timesteps_at_load>`.
+
+### wandb resume semantics: always a NEW run
+
+I deliberately *don't* use `wandb.init(resume="must", id=...)`. Three reasons it's brittle for SAC checkpoint resume:
+
+1. **Step monotonicity.** Wandb requires logged `step` to be ≥ the last logged step in the run. SB3's checkpoint cadence means resume rolls back to `step ≈ last_save - log_save_interval × 500`, which is *less* than the original wandb run's last step. Wandb either drops the new logs or interleaves duplicates with the original, both confusing.
+2. **Sync-tensorboard makes it worse.** Our wandb integration goes through TB sync. New TB events at "lower" step numbers than the original can corrupt the chart in ways that depend on wandb client version.
+3. **The compare-runs UI handles linked runs natively.** Group-by-tag (`resumed_from=...`) in the wandb workspace gives you a clean overlay of original + resume on the same chart, with distinct colors per resume. That's *more* readable than one mashed-together run, especially across multiple bike-commute resume cycles.
+
+Operationally: in your wandb run page, group by tag `resumed_from`, and pick `train/episodes_total` as the X-axis. The chart will look like one continuous run.
+
+### Bike-commute workflow with tmux
+
+```bash
+# Before bike: gracefully stop, let it save final ckpt
+tmux send-keys -t sac C-c
+sleep 30                    # let it save replay_buffer.pkl etc.
+tmux kill-session -t sac
+
+# After bike: resume into a NEW tmux session
+ORIG=hole_centroid_sac/SAC_<orig_timestamp>_HangProcCloth-v1
+tmux new -s sac
+caffeinate -dimsu python experiments/hang_obs_exp/scripts/train_privileged_sac.py \
+    --logdir_root "$LOGDIR_ROOT" \
+    --obs_mode hole_centroid \
+    --total_env_steps 500000 \
+    --load_checkpoint "$ORIG" \
+    --use_wandb
+# Ctrl-b d to detach
+```
+
+You'll lose at most `log_save_interval × 500 = 10000` env steps of training (the un-checkpointed tail before kill), which is ~2 minutes of compute on the M4. Negligible.
+
+---
+
+## SAC + BC interaction notes (stuff that bit us)
+
+Three subtle behaviors that cost real debugging time, recorded here so they don't bite again:
+
+1. **SB3 SAC's `policy_kwargs={'log_std_init': ...}` is silently ignored** when `use_sde=False` (the default). The non-SDE code path builds `log_std = nn.Linear(...)` with vanilla torch init, so the actual initial output std is ~1.0 in pre-tanh space. BC trains `mu` to ~0.15 magnitude on demo actions, so the deployed sampled action `tanh(mu + N(0, ~1)) ≈ tanh-noise` overwhelms BC's signal at deploy. **Fix in `train_privileged_sac.py`**: `--log_std_init -2.0` patches the actor's `log_std.bias` to a constant after construction, giving std ≈ 0.135 ≈ demo |action|. BC bias becomes immediately visible.
+
+2. **Auto-entropy collapses under large terminal rewards.** With `success_bonus=200` and `FINAL_REWARD_MULT=400` your terminal reward is ±300+, while non-terminal rewards live in ±0.5 — a 1000× scale gap. SAC's auto-tuned `ent_coef` interprets this as "already very confident, drive entropy down" and decays to <0.01 within 100–200k steps, killing exploration. PPO doesn't have this knob and is unaffected. **Fix**: `--ent_coef 0.2` (fixed, no auto) in any run with `success_bonus > 50`.
+
+3. **`ep_len_mean` is *not* always `max_episode_len`.** Out-of-workspace early termination clips episodes (often to 60–80 steps) when the policy fails badly. This shifts the meaning of "100-ep moving average" charts (e.g. `rollout/success_rate_100`) — at step 8k with `ep_len_mean ≈ 80`, the 100-ep window has saturated; with `ep_len_mean ≈ 200`, only 40 episodes have happened. Translation between Step and "episodes seen" requires knowing the live mean. The `train/episodes_total` x-axis sidesteps this entirely.

@@ -126,12 +126,35 @@ class HangVideoCallback(BaseCallback):
         if self._steps_since_save < self._num_steps_between_save:
             return True
 
-        # Save checkpoint.
+        # Save checkpoint. We persist *everything* needed to resume the
+        # run via --load_checkpoint:
+        #   agent.zip          - policy + value + log_std + optimizer state
+        #   args.pkl           - dedo args used at launch
+        #   replay_buffer.pkl  - SAC's off-policy buffer (PPO doesn't have one)
+        #   vec_normalize.pkl  - obs / reward running stats from VecNormalize
+        # Without the latter two, a resumed SAC run would have a fresh
+        # buffer + reset normalization stats and behave like a freshly-
+        # initialized agent that just happens to have a pre-trained policy.
         if self._logdir is not None:
             self.model.save(os.path.join(self._logdir, 'agent'))
             pickle.dump(self._my_args,
                         open(os.path.join(self._logdir, 'args.pkl'), 'wb'),
                         protocol=pickle.HIGHEST_PROTOCOL)
+            # SAC has a replay_buffer; PPO doesn't. Be lenient.
+            if hasattr(self.model, 'save_replay_buffer'):
+                try:
+                    self.model.save_replay_buffer(
+                        os.path.join(self._logdir, 'replay_buffer.pkl'))
+                except Exception as e:
+                    print(f'[ckpt] warn: save_replay_buffer failed: {e!r}')
+            # VecNormalize is a wrapper around the underlying VecEnv; if
+            # it's there, it has a `.save` method.
+            try:
+                venv = self.model.get_env()
+                if venv is not None and hasattr(venv, 'save'):
+                    venv.save(os.path.join(self._logdir, 'vec_normalize.pkl'))
+            except Exception as e:
+                print(f'[ckpt] warn: vec_normalize save failed: {e!r}')
         self._steps_since_save = 0
         self._eval_count += 1
 
