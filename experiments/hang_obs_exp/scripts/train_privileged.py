@@ -63,8 +63,36 @@ parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true',
                     help='Log metrics to wandb')
-parser.add_argument('--n_final_eval_episodes', type=int, default=20,
-                    help='Number of deterministic eval episodes at end of training')
+parser.add_argument('--n_final_eval_episodes', type=int, default=50,
+                    help='Number of deterministic eval episodes at end '
+                         'of training. SE shrinks as 1/sqrt(n); n=50 '
+                         'gives SE≈0.07 at p=0.5 — a reliable summary '
+                         'number for cross-run comparison. Cheap '
+                         '(end-of-run only).')
+parser.add_argument('--n_eval_episodes_during_training', type=int, default=30,
+                    help='Number of deterministic eval episodes per '
+                         'in-training eval pass. Drives the standard '
+                         'error of eval/success_rate: n=30 → SE≈0.09 '
+                         'at p=0.5 (vs the legacy n=10 → SE≈0.16, '
+                         'which is most of the chart noise). Each '
+                         'episode is ~max_episode_len env steps.')
+parser.add_argument('--eval_seed_lock', dest='eval_seed_lock',
+                    action='store_true', default=True,
+                    help='Default. Re-seed the eval env to '
+                         '`seed + 9999` at the start of every eval '
+                         'pass so the same N procedural cloths are '
+                         'evaluated every checkpoint. Eval-rate trace '
+                         'then reflects only policy change, not env '
+                         'resampling — much cleaner for cross-run '
+                         'comparison. Generalization signal still '
+                         'comes from the final eval (different seed '
+                         'offset, --n_final_eval_episodes). Pass '
+                         '--no_eval_seed_lock to disable.')
+parser.add_argument('--no_eval_seed_lock', dest='eval_seed_lock',
+                    action='store_false',
+                    help='Disable eval seed locking; eval env RNG '
+                         'state advances naturally between eval '
+                         'passes (legacy behavior).')
 parser.add_argument('--log_save_interval', type=int, default=50,
                     help='Controls checkpoint / eval / video cadence. '
                          'Checkpoint every (log_save_interval * 10 * 50) '
@@ -392,7 +420,10 @@ _video_basename += f'_seed{extra_args.seed}'
 video_cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                              num_steps_between_save=num_steps_between_save,
                              viz=False, debug=False,
-                             video_basename=_video_basename)
+                             video_basename=_video_basename,
+                             n_eval_episodes=extra_args.n_eval_episodes_during_training,
+                             eval_seed_lock=extra_args.eval_seed_lock,
+                             eval_seed=dedo_args.seed + 9999)
 diag_cb = RewardDiagnosticsCallback(window=100)
 cb = CallbackList([video_cb, diag_cb])
 

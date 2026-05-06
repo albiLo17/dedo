@@ -81,7 +81,25 @@ class HangVideoCallback(BaseCallback):
 
     def __init__(self, eval_env, logdir, num_train_envs, args,
                  num_steps_between_save=10000, viz=False, debug=False,
-                 video_basename='eval', render_size=300, video_fps=30):
+                 video_basename='eval', render_size=300, video_fps=30,
+                 n_eval_episodes=30, eval_seed_lock=True, eval_seed=None):
+        """
+        n_eval_episodes:
+            How many deterministic eval episodes to roll out per eval
+            pass. Drives the standard error of `eval/success_rate`:
+            SE = sqrt(p*(1-p)/n), so n=30 → SE≈0.09 at p=0.5 (vs n=10 →
+            SE≈0.16). Bumping further halves SE with each 4× of n.
+
+        eval_seed_lock / eval_seed:
+            When eval_seed_lock=True and eval_seed is not None, the eval
+            env is re-seeded to `eval_seed` at the start of every eval
+            pass so the *same* N procedural cloths are evaluated every
+            checkpoint. Effect: the eval-rate trace reflects only policy
+            improvement, not env resampling — much cleaner cross-run
+            comparison. Cost: the in-training eval no longer reflects
+            generalization variance; rely on the (separate) final-eval
+            pass for that signal.
+        """
         super().__init__(debug)
         self._eval_env = eval_env
         self._logdir = logdir
@@ -98,6 +116,9 @@ class HangVideoCallback(BaseCallback):
         self._render_size = render_size
         self._video_fps = video_fps
         self._deform = _find_deform_env(eval_env)
+        self._n_eval_episodes = int(n_eval_episodes)
+        self._eval_seed_lock = bool(eval_seed_lock)
+        self._eval_seed = eval_seed
 
     def _on_training_start(self) -> None:
         self.logger.record('args', object_to_str(self._my_args))
@@ -217,18 +238,49 @@ class HangVideoCallback(BaseCallback):
             screens.extend(ep_buffer)
             ep_buffer.clear()
 
+        # Re-seed the eval env so the same N procedural cloths are
+        # evaluated every checkpoint when eval_seed_lock is on. gym's
+        # seed() is consumed by the next reset() and persists across
+        # subsequent resets via the env's RNG state, so calling it once
+        # here is sufficient for the whole evaluate_policy pass.
+        if self._eval_seed_lock and self._eval_seed is not None:
+            try:
+                self._eval_env.seed(int(self._eval_seed))
+            except Exception as e:
+                print(f'[eval] warn: could not seed eval env '
+                      f'(eval_seed_lock requested): {e!r}')
+
         try:
-            evaluate_policy(
+            episode_rewards, episode_lengths = evaluate_policy(
                 self.model, self._eval_env, callback=grab_screens,
-                n_eval_episodes=10, deterministic=True)
+                n_eval_episodes=self._n_eval_episodes,
+                deterministic=True, return_episode_rewards=True)
         finally:
             if log_video and self._deform is not None:
                 self._deform._record_settle_frames = False
 
+        # Log eval metrics with confidence info so single-point noise is
+        # visible at a glance. Standard error of a binomial proportion
+        # is sqrt(p(1-p)/n); for reward/length we use sample SE
+        # (std/sqrt(n)). All metrics share the eval/ prefix so they
+        # group cleanly in wandb.
         if eval_successes:
-            self.logger.record(
-                'eval/success_rate',
-                sum(eval_successes) / len(eval_successes))
+            n_s = len(eval_successes)
+            p = sum(eval_successes) / n_s
+            se_p = (p * (1.0 - p) / n_s) ** 0.5
+            self.logger.record('eval/success_rate', float(p))
+            self.logger.record('eval/success_rate_se', float(se_p))
+            self.logger.record('eval/n_episodes', float(n_s))
+        if episode_rewards:
+            n_r = len(episode_rewards)
+            mean_r = float(np.mean(episode_rewards))
+            std_r = float(np.std(episode_rewards, ddof=1)) if n_r > 1 else 0.0
+            se_r = std_r / (n_r ** 0.5) if n_r > 0 else 0.0
+            self.logger.record('eval/episode_reward_mean', mean_r)
+            self.logger.record('eval/episode_reward_se', float(se_r))
+        if episode_lengths:
+            self.logger.record('eval/episode_length_mean',
+                               float(np.mean(episode_lengths)))
 
         if not screens:
             return True
