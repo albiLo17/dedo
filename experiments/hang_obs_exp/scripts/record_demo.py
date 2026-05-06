@@ -59,7 +59,8 @@ from experiments.hang_obs_exp.envs.privileged_env import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import RetryResetEnv  # noqa: E402
 
-ALL_MODES = ('hole_centroid', 'hole_vertices', 'full_mesh')
+ALL_MODES = ('hole_centroid', 'hole_centroid_corners',
+             'hole_vertices', 'full_mesh')
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +163,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--demos_dir', type=str, required=True,
                     help='Where to save demo_NNN.pkl files')
 parser.add_argument('--obs_mode', type=str, default='hole_centroid',
-                    choices=['hole_centroid', 'hole_vertices', 'full_mesh'],
+                    choices=['hole_centroid', 'hole_centroid_corners',
+                             'hole_vertices', 'full_mesh'],
                     help='Mode used to STEP the env during recording. The '
                          'pkl always saves all three modes.')
 parser.add_argument('--seed', type=int, default=42)
@@ -236,7 +238,9 @@ def next_demo_id():
 
 def _capture_all_obs():
     return {
-        m: build_privileged_obs(underlying, m, env._hole_vertex_indices)
+        m: build_privileged_obs(
+            underlying, m, env._hole_vertex_indices,
+            corner_indices=env._corner_indices)
         for m in ALL_MODES
     }
 

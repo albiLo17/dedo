@@ -1,14 +1,16 @@
 """
 Train PPO on HangProcCloth-v1 with privileged ground-truth cloth observations.
 
-Three conditions launched from this script (select via --obs_mode):
+Four conditions launched from this script (select via --obs_mode):
 
-  hole_centroid  — 18-dim: gripper + hole centroid + hanger goal   [fastest]
-  hole_vertices  — 132-dim: gripper + all hole-boundary vertices
-  full_mesh      — ~762-dim: gripper + all cloth vertex positions
+  hole_centroid          — 18-dim: gripper + hole centroid + hanger goal   [fastest]
+  hole_centroid_corners  — 30-dim: gripper + centroid + 4 cloth corners + goal
+  hole_vertices          — 132-dim: gripper + all hole-boundary vertices
+  full_mesh              — ~762-dim: gripper + all cloth vertex positions
 
 Usage (from repo root):
   python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode hole_centroid
+  python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode hole_centroid_corners
   python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode hole_vertices
   python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode full_mesh
 
@@ -51,7 +53,8 @@ from experiments.hang_obs_exp.envs.privileged_env import PrivilegedObsWrapper
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument('--obs_mode', type=str, default='hole_centroid',
-                    choices=['hole_centroid', 'hole_vertices', 'full_mesh'])
+                    choices=['hole_centroid', 'hole_centroid_corners',
+                             'hole_vertices', 'full_mesh'])
 parser.add_argument('--total_env_steps', type=int, default=3_000_000)
 parser.add_argument('--num_envs', type=int, default=4)
 parser.add_argument('--lr', type=float, default=3e-4)
@@ -124,6 +127,41 @@ parser.add_argument('--vel_penalty', type=float, default=0.0,
                          'Use to slow down whippy trajectories. Only '
                          'applied during the policy phase. 0 = off; try '
                          '1-10 for a meaningful effect.')
+parser.add_argument('--boundary_penalty', type=float, default=0.0,
+                    help='Terminal penalty applied when an episode ends '
+                         'via dedo workspace-bound exit (gripper past '
+                         'gripper_lims) rather than natural max-steps '
+                         'timeout. Closes the "lift the cloth high to '
+                         'cut the episode short" reward-hacking exit: '
+                         'without this, PPO can trigger the workspace '
+                         'bound to skip the per-step distance penalty '
+                         'over the remaining steps, parking the hole '
+                         'above the peg without ever threading. The '
+                         'penalty must dominate the marginal benefit of '
+                         'cutting ~150 dithering steps at ~-0.25/step; '
+                         '0 = off (default). Suggested 100-400. Applied '
+                         'identically to training, eval, and BC scripted-'
+                         'demo collection envs so all three see the '
+                         'same reward.')
+parser.add_argument('--z_overshoot_penalty', type=float, default=0.0,
+                    help='Per-step penalty proportional to the cloth\'s '
+                         'hole-centroid z above (peg_z + z_overshoot_slack). '
+                         'Targets the orientation-blind reward landscape: '
+                         'dedo\'s base reward only measures full-3D '
+                         'centroid-to-goal distance, so hovering the hole '
+                         'high above the peg minimizes it just as well as '
+                         'threading. boundary_penalty alone does not fix '
+                         'this — the policy can still lift below '
+                         'gripper_lims. 0 = off (default). Suggested 1-5. '
+                         'Applied training/eval/BC envs identically.')
+parser.add_argument('--z_overshoot_slack', type=float, default=1.0,
+                    help='Meters above peg z that count as the "free zone" '
+                         'with no overshoot penalty. The cloth starts '
+                         'above the peg and approaches from above, so '
+                         'a non-trivial slack avoids penalizing the '
+                         'natural threading approach. Default 1.0 m. '
+                         'Tighten to 0.3-0.5 for more aggressive shaping; '
+                         'loosen to 2-3 for longer cloths.')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU even if CUDA is available. Often faster '
                          'for the small MLP over privileged obs since GPU '
@@ -211,7 +249,10 @@ def make_wrapped_env(args, obs_mode_str, monitor_dir=None):
                                     success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    boundary_penalty=extra_args.boundary_penalty,
+                                    z_overshoot_penalty=extra_args.z_overshoot_penalty,
+                                    z_overshoot_slack=extra_args.z_overshoot_slack)
         # Monitor records ep rewards/lengths so SB3 logs rollout/ep_rew_mean.
         env = Monitor(env, filename=monitor_dir)
         return env
@@ -242,7 +283,10 @@ eval_env_raw = PrivilegedObsWrapper(eval_env_raw, obs_mode=obs_mode,
                                      success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    boundary_penalty=extra_args.boundary_penalty,
+                                    z_overshoot_penalty=extra_args.z_overshoot_penalty,
+                                    z_overshoot_slack=extra_args.z_overshoot_slack)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -287,17 +331,25 @@ if dedo_args.use_wandb:
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
         vp = extra_args.vel_penalty
+        bp = extra_args.boundary_penalty
+        zp = extra_args.z_overshoot_penalty
+        zs = extra_args.z_overshoot_slack
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
         vp_tag = f'_vp{vp:g}' if vp else ''
+        bp_tag = f'_bp{bp:g}' if bp else ''
+        zp_tag = f'_zp{zp:g}s{zs:g}' if zp else ''
         wandb.run.name = (
-            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}')
+            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}{bp_tag}{zp_tag}')
         wandb.run.tags = list(wandb.run.tags or []) + [
             f'success_factor={sf if sf is not None else "default"}',
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
             f'vel_penalty={vp}',
+            f'boundary_penalty={bp}',
+            f'z_overshoot_penalty={zp}',
+            f'z_overshoot_slack={zs}',
             f'obs_mode={obs_mode}',
         ]
 
@@ -331,6 +383,11 @@ if extra_args.fail_penalty:
     _video_basename += f'_fp{extra_args.fail_penalty:g}'
 if extra_args.vel_penalty:
     _video_basename += f'_vp{extra_args.vel_penalty:g}'
+if extra_args.boundary_penalty:
+    _video_basename += f'_bp{extra_args.boundary_penalty:g}'
+if extra_args.z_overshoot_penalty:
+    _video_basename += (f'_zp{extra_args.z_overshoot_penalty:g}'
+                        f's{extra_args.z_overshoot_slack:g}')
 _video_basename += f'_seed{extra_args.seed}'
 video_cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                              num_steps_between_save=num_steps_between_save,
@@ -385,7 +442,10 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
                                 success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    boundary_penalty=extra_args.boundary_penalty,
+                                    z_overshoot_penalty=extra_args.z_overshoot_penalty,
+                                    z_overshoot_slack=extra_args.z_overshoot_slack)
     raw.seed(args.seed + 1000)
 
     if save_dir is not None:

@@ -61,7 +61,8 @@ from experiments.hang_obs_exp.envs.privileged_env import PrivilegedObsWrapper
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument('--obs_mode', type=str, default='hole_centroid',
-                    choices=['hole_centroid', 'hole_vertices', 'full_mesh'])
+                    choices=['hole_centroid', 'hole_centroid_corners',
+                             'hole_vertices', 'full_mesh'])
 parser.add_argument('--total_env_steps', type=int, default=1_000_000,
                     help='SAC is more sample-efficient than PPO; 1M is '
                          'usually enough.')

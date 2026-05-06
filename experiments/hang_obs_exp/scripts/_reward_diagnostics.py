@@ -134,11 +134,16 @@ class RewardDiagnosticsCallback(BaseCallback):
             if episode_ended:
                 self._n_episodes += 1
                 # success/active_rate is the criterion the agent actually
-                # trained against; fall back to adaptive then base. 0/1.
-                ep_success = (ep_metrics.get('success/active_rate')
-                              or ep_metrics.get('success/adaptive_rate')
-                              or ep_metrics.get('success/base_rate')
-                              or 0.0)
+                # trained against; fall back to adaptive then base. Use
+                # explicit None checks — `0 or adaptive` would wrongly ignore
+                # a legitimate active=0 failure.
+                ep_success = ep_metrics.get('success/active_rate')
+                if ep_success is None:
+                    ep_success = ep_metrics.get('success/adaptive_rate')
+                if ep_success is None:
+                    ep_success = ep_metrics.get('success/base_rate')
+                if ep_success is None:
+                    ep_success = 0.0
                 if ep_success > 0.5:
                     self._n_successes += 1
                 self._log_per_episode_to_wandb(ep_metrics, ep_success)
@@ -155,6 +160,18 @@ class RewardDiagnosticsCallback(BaseCallback):
             self.logger.record('rwd_diag_meta/window_size',
                                len(next(iter(self._buffers.values())))
                                if self._buffers else 0)
+
+        # Mirror episode counters to TensorBoard on *every* env step (constant
+        # between episode ends, jumps when a new episode completes). Why:
+        # `train/episodes_total` was previously only sent through wandb.log at
+        # episode-end timesteps; TB/W&B metrics like `train/critic_loss` arrive
+        # on almost every step. Wandb's workspace "X-axis = train/episodes_total"
+        # joins scalars by global step — if a step has no train/episodes_total
+        # key, the chart shows "no data". Flooding TB with the current counters
+        # every step makes episode-count X-axis work for all series.
+        self.logger.record('train/episodes_total', float(self._n_episodes))
+        self.logger.record('train/cumulative_successes',
+                           float(self._n_successes))
         return True
 
     def _log_per_episode_to_wandb(self, ep_metrics: Dict[str, float],
@@ -243,6 +260,9 @@ def _reward_def_summary(extra_args) -> Dict[str, Any]:
         'success_bonus': getattr(extra_args, 'success_bonus', 0.0),
         'fail_penalty': getattr(extra_args, 'fail_penalty', 0.0),
         'vel_penalty': getattr(extra_args, 'vel_penalty', 0.0),
+        'boundary_penalty': getattr(extra_args, 'boundary_penalty', 0.0),
+        'z_overshoot_penalty': getattr(extra_args, 'z_overshoot_penalty', 0.0),
+        'z_overshoot_slack': getattr(extra_args, 'z_overshoot_slack', 1.0),
         'obs_mode': getattr(extra_args, 'obs_mode', None),
         # DEDO-side constants (so we can spot if the repo changed them).
         'dedo_base_success_threshold': DeformEnv.SUCESS_REWARD_TRESHOLD,
@@ -319,7 +339,8 @@ def _print_config_banner(cfg: Dict[str, Any], path: str) -> None:
     rd = cfg.get('reward_def', {})
     print('  reward_def:')
     for k in ('uses_adaptive_success', 'success_factor', 'success_bonus',
-             'fail_penalty', 'vel_penalty', 'obs_mode',
+             'fail_penalty', 'vel_penalty', 'boundary_penalty',
+             'z_overshoot_penalty', 'z_overshoot_slack', 'obs_mode',
              'dedo_base_success_threshold', 'dedo_final_reward_mult'):
         if k in rd:
             print(f'    {k:34s} = {rd[k]}')

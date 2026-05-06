@@ -42,13 +42,19 @@ parser.add_argument('--num_episodes', type=int, default=3)
 parser.add_argument('--viz', action='store_true',
                     help='Open the live pybullet GUI window')
 parser.add_argument('--cam_resolution', type=int, default=400,
-                    help='mp4 frame size (set 0 to disable mp4)')
+                    help='mp4 / rgb_array render size only. DeformEnv is always '
+                         'forced to --cam_resolution=0 internally so '
+                         'PrivilegedObsWrapper matches a vector obs space; '
+                         'otherwise gym.make builds a (H,W,3) observation_space '
+                         'and reset() crashes when get_obs returns grip_obs (12). '
+                         'Set 0 to skip writing mp4.')
 parser.add_argument('--logdir', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp' /
                                 'demo_view'))
 parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--obs_mode', type=str, default='hole_centroid',
-                    choices=['hole_centroid', 'hole_vertices', 'full_mesh'])
+                    choices=['hole_centroid', 'hole_centroid_corners',
+                             'hole_vertices', 'full_mesh'])
 parser.add_argument('--success_factor', type=float, default=1.2,
                     help='Adaptive success: dist < success_factor*hole_radius. '
                          'Matches the default used by train_privileged.py / '
@@ -57,11 +63,16 @@ parser.add_argument('--success_factor', type=float, default=1.2,
 extra = parser.parse_args()
 sf = None if extra.success_factor < 0 else float(extra.success_factor)
 
-# Build dedo args.
+# Build dedo args.  MUST keep cam_resolution=0 here: PrivilegedObsWrapper
+# overwrites args.cam_resolution to 0 after gym.make, which switches get_obs()
+# to grip_obs (12-d). If we had passed cam_resolution>0 to gym.make, the env's
+# observation_space would still be an (H,W,3) Box — get_obs bound-check then
+# raises ValueError: broadcast (12,) vs (400,400,3).  MP4/GUI resolution is
+# extra.cam_resolution + underlying.render(...), not DeformEnv pixel obs.
 sys.argv = [
     'view_demo',
     '--env=HangProcCloth-v1',
-    '--cam_resolution', str(extra.cam_resolution),
+    '--cam_resolution', '0',
     '--num_envs=0',
     '--total_env_steps=0',
     '--seed', str(extra.seed),
