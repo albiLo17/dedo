@@ -18,11 +18,34 @@ cd "$REPO_ROOT"
 
 CONDA_ENV="dedo38"
 
-# tmux command wrapper: spawn a login shell, set thread caps, activate
-# the conda env, cd to repo root, run the given python invocation.
-# `bash -lc` ensures conda's init in ~/.bashrc is sourced — without it
-# `conda activate` errors with "command not found" because tmux's child
-# shell hasn't loaded the conda hook.
+# Locate conda's profile script. `bash -lc` runs a non-interactive login
+# shell; conda's init in ~/.bashrc is usually guarded by `[ -z "$PS1" ]
+# && return` so it never runs in non-interactive shells. We have to
+# source conda.sh explicitly. Try a few common install locations.
+detect_conda_sh() {
+  local p
+  if command -v conda >/dev/null 2>&1; then
+    p="$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh"
+    [ -f "$p" ] && { echo "$p"; return; }
+  fi
+  for p in "$HOME/miniconda3/etc/profile.d/conda.sh" \
+           "$HOME/anaconda3/etc/profile.d/conda.sh" \
+           "$HOME/miniforge3/etc/profile.d/conda.sh" \
+           "/opt/miniconda3/etc/profile.d/conda.sh" \
+           "/opt/conda/etc/profile.d/conda.sh"; do
+    [ -f "$p" ] && { echo "$p"; return; }
+  done
+  echo ""
+}
+CONDA_SH="$(detect_conda_sh)"
+if [ -z "$CONDA_SH" ]; then
+  echo "ERROR: could not locate conda.sh. Edit launch_l4.sh and set CONDA_SH manually."
+  exit 1
+fi
+echo "[init] using conda profile: $CONDA_SH"
+
+# tmux command wrapper: spawn a login shell, source conda.sh, activate
+# the env, set thread caps, cd to repo root, run the given python.
 start() {
   local name="$1"; shift
   local cmd="$*"
@@ -30,7 +53,7 @@ start() {
     echo "[skip] tmux session '$name' already exists — kill with 'tmux kill-session -t $name' first if you want to restart"
     return 0
   fi
-  tmux new-session -d -s "$name" "bash -lc 'export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 && cd \"$REPO_ROOT\" && conda activate $CONDA_ENV && $cmd; echo; echo \"[$name] python exited; press enter to close session\"; read'"
+  tmux new-session -d -s "$name" "bash -lc 'source \"$CONDA_SH\" && conda activate $CONDA_ENV && export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 && cd \"$REPO_ROOT\" && $cmd; echo; echo \"[$name] python exited; press enter to close session\"; read'"
   echo "[ok] launched tmux session '$name'"
 }
 

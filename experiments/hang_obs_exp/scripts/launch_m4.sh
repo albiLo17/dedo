@@ -18,10 +18,36 @@ cd "$REPO_ROOT"
 
 CONDA_ENV="dedo"
 
-# tmux command wrapper: spawn a login shell, set thread caps, activate
-# conda env, cd to repo root, wrap the python invocation in caffeinate
-# (macOS-only; prevents sleep). `bash -lc` ensures conda's init in
-# ~/.bashrc / ~/.zshrc is sourced.
+# Locate conda's profile script. `bash -lc` runs a non-interactive login
+# shell; conda's init in ~/.bashrc/.zshrc is typically guarded by
+# `[ -z "$PS1" ] && return` so it never runs in non-interactive shells.
+# We have to source conda.sh explicitly. Try a few common locations.
+detect_conda_sh() {
+  local p
+  if command -v conda >/dev/null 2>&1; then
+    p="$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh"
+    [ -f "$p" ] && { echo "$p"; return; }
+  fi
+  for p in "$HOME/miniconda3/etc/profile.d/conda.sh" \
+           "$HOME/anaconda3/etc/profile.d/conda.sh" \
+           "$HOME/miniforge3/etc/profile.d/conda.sh" \
+           "/opt/miniconda3/etc/profile.d/conda.sh" \
+           "/opt/homebrew/Caskroom/miniconda/base/etc/profile.d/conda.sh" \
+           "/opt/anaconda3/etc/profile.d/conda.sh"; do
+    [ -f "$p" ] && { echo "$p"; return; }
+  done
+  echo ""
+}
+CONDA_SH="$(detect_conda_sh)"
+if [ -z "$CONDA_SH" ]; then
+  echo "ERROR: could not locate conda.sh. Edit launch_m4.sh and set CONDA_SH manually."
+  exit 1
+fi
+echo "[init] using conda profile: $CONDA_SH"
+
+# tmux command wrapper: spawn a login shell, source conda.sh, activate
+# the env, set thread caps, cd to repo root, wrap python in caffeinate
+# (macOS-only; prevents sleep) and run.
 start() {
   local name="$1"; shift
   local cmd="$*"
@@ -29,7 +55,7 @@ start() {
     echo "[skip] tmux session '$name' already exists — kill with 'tmux kill-session -t $name' first if you want to restart"
     return 0
   fi
-  tmux new-session -d -s "$name" "bash -lc 'export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 && cd \"$REPO_ROOT\" && conda activate $CONDA_ENV && caffeinate -dimsu $cmd; echo; echo \"[$name] python exited; press enter to close session\"; read'"
+  tmux new-session -d -s "$name" "bash -lc 'source \"$CONDA_SH\" && conda activate $CONDA_ENV && export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 && cd \"$REPO_ROOT\" && caffeinate -dimsu $cmd; echo; echo \"[$name] python exited; press enter to close session\"; read'"
   echo "[ok] launched tmux session '$name'"
 }
 
