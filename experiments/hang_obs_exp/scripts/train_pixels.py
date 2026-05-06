@@ -176,6 +176,17 @@ parser.add_argument('--bc_demos_only_success', action='store_true',
                          'cost of fewer (obs, act) pairs. Strongly '
                          'recommended unless --bc_episodes is small '
                          '(<20) and the scripted success rate is low.')
+parser.add_argument('--log_std_init', type=float, default=None,
+                    help='Initial log_std for the PPO actor head. SB3 '
+                         'default is 0.0 (std=1.0 in pre-clip space). '
+                         'Scripted demos here have |action| ≈ 0.03 in '
+                         'normalized [-1, 1] space (waypoint vels ~0.3 '
+                         'm/s ÷ MAX_ACT_VEL=10), so default noise std=1.0 '
+                         'completely drowns out BC-trained mu at rollout '
+                         'time. Set to -3.5 (std≈0.030) to match demo '
+                         'magnitude so BC is visible from step 0; -3.0 '
+                         '(std≈0.050) for slightly more exploration. None '
+                         '(default) keeps SB3 default. Skipped on resume.')
 # PPO knobs.
 parser.add_argument('--n_steps', type=int, default=2048,
                     help='Rollout buffer per env. Smaller than the '
@@ -188,6 +199,13 @@ parser.add_argument('--max_episode_len', type=int, default=200)
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU. Vision PPO usually wants GPU; this is '
                          'an escape hatch.')
+parser.add_argument('--load_checkpoint', type=str, default=None,
+                    help='Path to a previous run logdir (containing '
+                         'agent.zip and vec_normalize.pkl) to resume '
+                         'training from. Skips BC pretrain (already baked '
+                         'into the saved policy). --total_env_steps is '
+                         'the TARGET total. A NEW wandb run is started, '
+                         'tagged `resumed_from=<orig>` for grouping in UI.')
 extra_args, remaining = parser.parse_known_args()
 
 if extra_args.no_adaptive_success:
@@ -385,6 +403,12 @@ if dedo_args.use_wandb:
 # ---------------------------------------------------------------------------
 policy_name = 'MultiInputPolicy' if not extra_args.no_grip else 'CnnPolicy'
 policy_kwargs = dict(net_arch=[256, 256])
+if extra_args.log_std_init is not None:
+    # PPO's DiagGaussianDistribution uses log_std as an nn.Parameter
+    # initialized to log_std_init. Lowering it below 0 is essential here:
+    # demo |action| ≈ 0.03, so default std=1.0 makes noise overwhelm BC's
+    # mu by ~30x and rollouts revert to ~uniform.
+    policy_kwargs['log_std_init'] = float(extra_args.log_std_init)
 rl_kwargs = dict(
     learning_rate=dedo_args.lr,
     device=dedo_args.device,
@@ -396,7 +420,56 @@ rl_kwargs = dict(
     n_epochs=extra_args.n_epochs,
     gae_lambda=0.95, gamma=0.99,
 )
-agent = PPO(policy_name, vec_env, **rl_kwargs)
+_resuming = bool(extra_args.load_checkpoint)
+if _resuming:
+    ckpt_dir = extra_args.load_checkpoint
+    if not os.path.isdir(ckpt_dir):
+        raise FileNotFoundError(
+            f'--load_checkpoint dir does not exist: {ckpt_dir}')
+    agent_path = os.path.join(ckpt_dir, 'agent.zip')
+    vn_path = os.path.join(ckpt_dir, 'vec_normalize.pkl')
+    if not os.path.exists(agent_path):
+        raise FileNotFoundError(f'no agent.zip in {ckpt_dir}')
+    # VecNormalize wraps a VecTransposeImage here, but the .load(...) call
+    # restores running stats onto whatever venv is passed; we use vec_env
+    # itself since norm_obs=False (no obs_rms to overwrite, only ret_rms).
+    if os.path.exists(vn_path):
+        _loaded_vn = VecNormalize.load(vn_path, vec_env.venv)
+        vec_env.obs_rms = _loaded_vn.obs_rms
+        vec_env.ret_rms = _loaded_vn.ret_rms
+        vec_env.training = True
+        print(f'[resume] loaded VecNormalize stats from {vn_path}')
+    else:
+        print(f'[resume] WARN: no vec_normalize.pkl at {vn_path}; '
+              f'reward normalization will drift from origin run')
+    agent = PPO.load(
+        agent_path, env=vec_env, device=dedo_args.device,
+        tensorboard_log=dedo_args.logdir,
+        custom_objects={
+            'learning_rate': dedo_args.lr,
+            'lr_schedule': lambda _progress: dedo_args.lr,
+        })
+    agent._last_obs = None
+    print(f'[resume] loaded PPO policy from {agent_path}; '
+          f'num_timesteps={agent.num_timesteps:,}')
+    if dedo_args.use_wandb:
+        try:
+            import wandb
+            if wandb.run is not None:
+                _orig_name = os.path.basename(ckpt_dir.rstrip('/'))
+                wandb.run.tags = list(wandb.run.tags or []) + [
+                    f'resumed_from={_orig_name}',
+                    f'resume_step={agent.num_timesteps}',
+                ]
+        except Exception:
+            pass
+else:
+    agent = PPO(policy_name, vec_env, **rl_kwargs)
+    if extra_args.log_std_init is not None:
+        _init_std = float(np.exp(extra_args.log_std_init))
+        print(f'[init] PPO log_std_init = {extra_args.log_std_init} '
+              f'(std ≈ {_init_std:.3f}); BC mean ≈ 0.03 will be visible '
+              f'at deploy.')
 
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
 _sf = extra_args.success_factor
@@ -728,7 +801,11 @@ def _bc_pretrain(agent, demo_obs, demo_acts, epochs, batch_size, lr):
             wandb.log({'bc/mse': avg, 'bc/epoch': epoch + 1})
 
 
-if extra_args.bc_demo_path:
+if _resuming:
+    demo_obs, demo_acts, n_success, n_demos = (
+        None, np.zeros((0, 0), dtype=np.float32), 0, 0)
+    print('[resume] skipping BC pretrain (policy already trained)')
+elif extra_args.bc_demo_path:
     print(f'\n=== BC pretrain: loading manual pixel demos from '
           f'{extra_args.bc_demo_path} ===')
     demo_obs, demo_acts, n_success, n_demos = _load_manual_pixel_demos(
@@ -775,8 +852,12 @@ elif extra_args.bc_demo_path or extra_args.bc_episodes > 0:
     print('[BC] no usable demos — skipping BC pretrain')
 
 
-print('Start pixel RL training ...')
-agent.learn(total_timesteps=extra_args.total_env_steps, callback=cb)
+print(f'Start pixel RL training '
+      f'({"resuming" if _resuming else "fresh"}; '
+      f'num_timesteps={agent.num_timesteps:,}; '
+      f'target {extra_args.total_env_steps:,}) ...')
+agent.learn(total_timesteps=extra_args.total_env_steps, callback=cb,
+            reset_num_timesteps=not _resuming)
 
 ckpt_path = os.path.join(dedo_args.logdir, 'agent.zip')
 agent.save(ckpt_path)

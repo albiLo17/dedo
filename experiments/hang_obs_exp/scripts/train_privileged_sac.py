@@ -130,11 +130,16 @@ parser.add_argument('--log_std_init', type=float, default=None,
                          'default leaves log_std as a freshly-initialized '
                          'nn.Linear whose output ≈ N(0, ~1), so initial '
                          'exploration noise std ≈ 1 in pre-tanh space. '
-                         'Demo actions are ~0.15, so the BC-trained mu '
-                         'signal is mostly drowned out at deploy. Set to '
-                         '-2 (std≈0.135) when BC is on, so the BC mean '
-                         'is visible from step 0. Pass None to leave '
-                         'log_std at its random init.')
+                         'Scripted demo actions are ~0.03 in normalized '
+                         '[-1, 1] space (waypoint vels ~0.3 m/s ÷ '
+                         'MAX_ACT_VEL=10), so the BC-trained mu signal is '
+                         'completely drowned out at deploy (SNR ~0.03; '
+                         'tanh squashing makes it worse). Set to -3.5 '
+                         '(std≈0.030) when BC is on, matching demo '
+                         'magnitude so the BC mean is visible from step 0; '
+                         'or -3.0 (std≈0.050) for slightly more '
+                         'exploration. Pass None to leave log_std at its '
+                         'random init.')
 # Adaptive success + shaping (same defaults as train_privileged.py).
 parser.add_argument('--success_factor', type=float, default=1.2)
 parser.add_argument('--no_adaptive_success', action='store_true',
@@ -481,13 +486,14 @@ else:
     # ...}` is silently ignored in this code path (it's only consumed by
     # the SDE branch). The resulting initial std is ~1.0 in pre-tanh space,
     # so tanh-squashed actions average |a| ≈ 0.55 before any learning —
-    # overwhelming the ~0.15 magnitude of BC-trained mu. Patching the bias
-    # to a constant (and zeroing the weight) pins log_std to that constant
-    # at initialization; SAC's gradient updates then move it as needed.
+    # overwhelming the ~0.03 magnitude of BC-trained mu (demo actions are
+    # waypoint vels ~0.3 m/s ÷ MAX_ACT_VEL=10 ≈ 0.03 normalized). Patching
+    # the bias to a constant (and zeroing the weight) pins log_std to that
+    # constant at initialization; SAC's gradient updates move it from there.
     #
-    # Effect with --log_std_init -2: std ≈ 0.135, comparable to demo
-    # |action|, so BC pretrain is immediately visible at deploy. Not
-    # setting this knob preserves SB3 default behavior.
+    # Effect with --log_std_init -3.5: std ≈ 0.030, matching demo |action|
+    # so BC pretrain is immediately visible at deploy. Not setting this
+    # knob preserves SB3 default behavior.
     # -----------------------------------------------------------------------
     if extra_args.log_std_init is not None:
         with torch.no_grad():
