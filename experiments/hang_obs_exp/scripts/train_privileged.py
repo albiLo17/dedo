@@ -1,14 +1,18 @@
 """
 Train PPO on HangProcCloth-v1 with privileged ground-truth cloth observations.
 
-Three conditions launched from this script (select via --obs_mode):
+Four conditions launched from this script (select via --obs_mode):
 
   hole_centroid  — 18-dim: gripper + hole centroid + hanger goal   [fastest]
+  enriched       — 40-dim: gripper + hole geom (centroid/normal/radius/
+                   eccentricity) + cloth geom (bbox/centroid) + task-relative
+                   vectors + time progress  [most informative compact obs]
   hole_vertices  — 132-dim: gripper + all hole-boundary vertices
   full_mesh      — ~762-dim: gripper + all cloth vertex positions
 
 Usage (from repo root):
   python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode hole_centroid
+  python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode enriched
   python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode hole_vertices
   python experiments/hang_obs_exp/scripts/train_privileged.py --obs_mode full_mesh
 
@@ -47,7 +51,8 @@ from experiments.hang_obs_exp.envs.privileged_env import PrivilegedObsWrapper
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument('--obs_mode', type=str, default='hole_centroid',
-                    choices=['hole_centroid', 'hole_vertices', 'full_mesh'])
+                    choices=['hole_centroid', 'hole_vertices', 'full_mesh',
+                             'enriched'])
 parser.add_argument('--total_env_steps', type=int, default=3_000_000)
 parser.add_argument('--num_envs', type=int, default=4)
 parser.add_argument('--lr', type=float, default=3e-4)
@@ -94,6 +99,22 @@ parser.add_argument('--vel_penalty', type=float, default=0.0,
                          'Use to slow down whippy trajectories. Only '
                          'applied during the policy phase. 0 = off; try '
                          '1-10 for a meaningful effect.')
+parser.add_argument('--action_penalty', type=float, default=0.0,
+                    help='Per-step penalty on action magnitude. '
+                         'reward -= action_penalty * mean(action**2). '
+                         'Action is in [-1, 1]^6 so mean(a**2) is in '
+                         '[0, 1]; coefs ~0.1-2 give per-step penalties '
+                         'comparable to vel_penalty. Discourages bang-'
+                         'bang/flailing control. 0 = off.')
+parser.add_argument('--pre_settle_coef', type=float, default=0.0,
+                    help='Linear penalty on hole-to-goal distance (m) at '
+                         'policy handoff, BEFORE the gravity settle. '
+                         'reward -= pre_settle_coef * pre_settle_dist_m. '
+                         'Counters the "lift cloth high, let it drop onto '
+                         'the hanger" exploit: post-settle reward has '
+                         'effective coef ~20/m, so a coef of 20 equal-'
+                         'weights threading-by-control vs ballistic drop. '
+                         '0 = off; start at 20.')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU even if CUDA is available. Often faster '
                          'for the small MLP over privileged obs since GPU '
@@ -103,6 +124,21 @@ parser.add_argument('--max_episode_len', type=int, default=200,
                          'dedo default is 200; lower (e.g. 100) cuts '
                          'wall-clock and avoids dithering after the cloth '
                          'has already reached the pole region.')
+parser.add_argument('--resume_from', type=str, default=None,
+                    help='Path to a previous run directory (one that '
+                         'contains agent.zip and vec_normalize.pkl). When '
+                         'set, load those weights + VecNormalize stats and '
+                         'continue training. BC pretrain is auto-skipped. '
+                         'Step counter continues from the checkpoint '
+                         '(use --total_env_steps for ADDITIONAL steps).')
+parser.add_argument('--wandb_resume_id', type=str, default=None,
+                    help='wandb run ID to resume INTO. When set, the '
+                         'training metrics continue logging to the same '
+                         'wandb run instead of creating a new one. Find '
+                         'the ID in the wandb run URL '
+                         '(.../runs/<ID>/...) or in the original run\'s '
+                         'wandb/run-*-<ID>/ directory on disk. Requires '
+                         '--use_wandb.')
 extra_args, remaining = parser.parse_known_args()
 
 # Build dedo args with cam_resolution=0 (wrapper takes care of geometry obs)
@@ -161,7 +197,9 @@ def make_wrapped_env(args, obs_mode_str, monitor_dir=None):
                                     success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    pre_settle_coef=extra_args.pre_settle_coef,
+                                    action_penalty=extra_args.action_penalty)
         # Monitor records ep rewards/lengths so SB3 logs rollout/ep_rew_mean.
         env = Monitor(env, filename=monitor_dir)
         return env
@@ -178,7 +216,14 @@ vec_env.seed(dedo_args.seed)
 # VecNormalize: running obs mean/std + reward normalization. Big PPO unlock
 # when reward magnitudes are far from 0 (HangProcCloth: ~-300) and obs
 # components have very different scales.
-vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+if extra_args.resume_from:
+    vn_path = os.path.join(extra_args.resume_from, 'vec_normalize.pkl')
+    if not os.path.isfile(vn_path):
+        raise FileNotFoundError(f'No vec_normalize.pkl at {vn_path}')
+    vec_env = VecNormalize.load(vn_path, vec_env)
+    print(f'[resume] loaded VecNormalize from {vn_path}')
+else:
+    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
 # Eval env: keep cam_resolution=0 so the underlying obs is gripper-only
 # (matches PrivilegedObsWrapper's expectations), but set cam_viewmat to the
@@ -192,7 +237,9 @@ eval_env_raw = PrivilegedObsWrapper(eval_env_raw, obs_mode=obs_mode,
                                      success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    pre_settle_coef=extra_args.pre_settle_coef,
+                                    action_penalty=extra_args.action_penalty)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -223,7 +270,8 @@ print(f'{"="*60}\n')
 # ---------------------------------------------------------------------------
 # Init run dir and train
 # ---------------------------------------------------------------------------
-dedo_args.logdir, dedo_args.device = init_train('PPO', dedo_args)
+dedo_args.logdir, dedo_args.device = init_train(
+    'PPO', dedo_args, wandb_resume_id=extra_args.wandb_resume_id)
 if extra_args.cpu:
     dedo_args.device = 'cpu'
     print(f'[device] forced CPU via --cpu flag '
@@ -237,20 +285,40 @@ if dedo_args.use_wandb:
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
         vp = extra_args.vel_penalty
+        psc = extra_args.pre_settle_coef
+        ap = extra_args.action_penalty
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
         vp_tag = f'_vp{vp:g}' if vp else ''
+        psc_tag = f'_psc{psc:g}' if psc else ''
+        ap_tag = f'_ap{ap:g}' if ap else ''
         wandb.run.name = (
-            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}')
+            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}'
+            f'{psc_tag}{ap_tag}')
         wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             f'success_factor={sf if sf is not None else "default"}',
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
             f'vel_penalty={vp}',
+            f'pre_settle_coef={psc}',
+            f'action_penalty={ap}',
             f'obs_mode={obs_mode}',
         ]
+        # Promote shaping coefs to top-level config keys so they're
+        # visible in the wandb Runs table / Config panel and easy to
+        # filter on. dedo_args was logged at init_train but doesn't
+        # include extra_args.
+        wandb.config.update({
+            'shaping_success_factor': sf,
+            'shaping_success_bonus': sb,
+            'shaping_fail_penalty': fp,
+            'shaping_vel_penalty': vp,
+            'shaping_pre_settle_coef': psc,
+            'shaping_action_penalty': ap,
+            'obs_mode': obs_mode,
+        }, allow_val_change=True)
 
 rl_kwargs = {
     'learning_rate': dedo_args.lr,
@@ -267,7 +335,33 @@ rl_kwargs = {
     'gae_lambda': 0.95,
     'gamma': 0.99,
 }
-agent = PPO('MlpPolicy', vec_env, **rl_kwargs)
+if extra_args.resume_from:
+    ckpt_load = os.path.join(extra_args.resume_from, 'agent.zip')
+    if not os.path.isfile(ckpt_load):
+        raise FileNotFoundError(f'No agent.zip at {ckpt_load}')
+    # custom_objects lets us override values that were pickled at save time
+    # (e.g. lr schedule, tb dir) so the resumed run uses fresh settings.
+    agent = PPO.load(
+        ckpt_load,
+        env=vec_env,
+        device=dedo_args.device,
+        tensorboard_log=dedo_args.logdir,
+        custom_objects={
+            'learning_rate': dedo_args.lr,
+            'lr_schedule': lambda _: dedo_args.lr,
+            'tensorboard_log': dedo_args.logdir,
+        },
+    )
+    # The saved checkpoint includes a stale `_last_obs` from the previous
+    # process. SB3's _setup_learn will skip env.reset() when _last_obs is
+    # non-None AND reset_num_timesteps=False, which leaves Monitor in
+    # "needs reset" state and crashes on the first step. Clear it here so
+    # SB3 resets the freshly-built vec_env on entry to learn().
+    agent._last_obs = None
+    print(f'[resume] loaded PPO weights from {ckpt_load} '
+          f'(num_timesteps={agent.num_timesteps:,})')
+else:
+    agent = PPO('MlpPolicy', vec_env, **rl_kwargs)
 
 # Match run_rl_sb3.py PPO cadence: log_save_interval * 10 * 50.
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
@@ -280,6 +374,10 @@ if extra_args.fail_penalty:
     _video_basename += f'_fp{extra_args.fail_penalty:g}'
 if extra_args.vel_penalty:
     _video_basename += f'_vp{extra_args.vel_penalty:g}'
+if extra_args.pre_settle_coef:
+    _video_basename += f'_psc{extra_args.pre_settle_coef:g}'
+if extra_args.action_penalty:
+    _video_basename += f'_ap{extra_args.action_penalty:g}'
 _video_basename += f'_seed{extra_args.seed}'
 cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                        num_steps_between_save=num_steps_between_save,
@@ -303,7 +401,9 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
                                 success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    pre_settle_coef=extra_args.pre_settle_coef,
+                                    action_penalty=extra_args.action_penalty)
     raw.seed(args.seed + 1000)
 
     obs_buf, act_buf = [], []
@@ -450,7 +550,14 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
             n_success_demos, n_files)
 
 
-if extra_args.bc_demo_path:
+if extra_args.resume_from:
+    # Resuming an existing run — the policy already saw BC + however many
+    # PPO steps were logged. Re-running BC would clobber learned weights.
+    demo_obs = np.zeros((0, 0), dtype=np.float32)
+    demo_acts = np.zeros((0, 0), dtype=np.float32)
+    n_success, n_demos = 0, 0
+    print('[resume] skipping BC pretrain')
+elif extra_args.bc_demo_path:
     print(f'\n=== BC pretrain: loading manual demos from '
           f'{extra_args.bc_demo_path} ===')
     demo_obs, demo_acts, n_success, n_demos = _load_manual_demos(
@@ -485,7 +592,8 @@ elif extra_args.bc_demo_path or extra_args.bc_episodes > 0:
     print('[BC] no usable demos found — skipping BC pretrain')
 
 print('Start privileged RL training ...')
-agent.learn(total_timesteps=extra_args.total_env_steps, callback=cb)
+agent.learn(total_timesteps=extra_args.total_env_steps, callback=cb,
+            reset_num_timesteps=not bool(extra_args.resume_from))
 
 ckpt_path = os.path.join(dedo_args.logdir, 'agent.zip')
 agent.save(ckpt_path)

@@ -93,6 +93,13 @@ class HangVideoCallback(BaseCallback):
         self._steps_since_save = num_steps_between_save  # save right away
         self._episode_count = 0
         self._success_window = deque(maxlen=100)
+        # Rolling per-step shaping windows. ~2000 samples ≈ 500 steps × 4
+        # envs, so the logged mean tracks the last few rollouts and
+        # responds quickly when the policy changes.
+        self._action_penalty_window = deque(maxlen=2000)
+        self._action_cost_window = deque(maxlen=2000)
+        self._vel_penalty_window = deque(maxlen=2000)
+        self._cloth_speed_window = deque(maxlen=2000)
         self._eval_count = 0
         self._video_basename = video_basename
         self._render_size = render_size
@@ -121,14 +128,53 @@ class HangVideoCallback(BaseCallback):
                     'rollout/success_rate_100',
                     sum(self._success_window) / len(self._success_window))
                 self.logger.record('rollout/episodes', self._episode_count)
+            # Rolling per-step shaping stats. Recording every step is cheap
+            # — SB3 only flushes to disk/wandb at log_interval.
+            if 'action_penalty' in info:
+                self._action_penalty_window.append(info['action_penalty'])
+                self._action_cost_window.append(info['action_cost'])
+            if 'vel_penalty' in info:
+                self._vel_penalty_window.append(info['vel_penalty'])
+                self._cloth_speed_window.append(info['cloth_mean_speed'])
+
+        if self._action_penalty_window:
+            self.logger.record(
+                'shaping/action_penalty_mean',
+                float(np.mean(self._action_penalty_window)))
+            self.logger.record(
+                'shaping/action_cost_mean',
+                float(np.mean(self._action_cost_window)))
+        if self._vel_penalty_window:
+            self.logger.record(
+                'shaping/vel_penalty_mean',
+                float(np.mean(self._vel_penalty_window)))
+            self.logger.record(
+                'shaping/cloth_speed_mean',
+                float(np.mean(self._cloth_speed_window)))
 
         self._steps_since_save += self._num_train_envs
         if self._steps_since_save < self._num_steps_between_save:
             return True
 
-        # Save checkpoint.
+        # Save checkpoint. VecNormalize stats are saved alongside the
+        # policy weights so resume_from works mid-training, not just at
+        # the end of a completed run.
         if self._logdir is not None:
             self.model.save(os.path.join(self._logdir, 'agent'))
+            vn = self.model.get_vec_normalize_env()
+            if vn is not None:
+                vn.save(os.path.join(self._logdir, 'vec_normalize.pkl'))
+            # Versioned per-step checkpoints. Pairs 1:1 with the
+            # eval_*_step{N}.mp4 filenames so a recorded video and the
+            # policy that produced it can be matched. Local-only: these
+            # files live in the run logdir and are never uploaded to
+            # wandb (no wandb.save / wandb.Artifact call references them).
+            step_tag = f'{self.num_timesteps:08d}'
+            self.model.save(os.path.join(
+                self._logdir, f'agent_step{step_tag}'))
+            if vn is not None:
+                vn.save(os.path.join(
+                    self._logdir, f'vec_normalize_step{step_tag}.pkl'))
             pickle.dump(self._my_args,
                         open(os.path.join(self._logdir, 'args.pkl'), 'wb'),
                         protocol=pickle.HIGHEST_PROTOCOL)

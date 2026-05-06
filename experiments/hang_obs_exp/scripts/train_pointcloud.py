@@ -66,6 +66,21 @@ parser.add_argument('--cam_resolution_pcd', type=int, default=128,
 parser.add_argument('--success_factor', type=float, default=1.2)
 parser.add_argument('--success_bonus', type=float, default=200.0)
 parser.add_argument('--fail_penalty', type=float, default=0.0)
+parser.add_argument('--vel_penalty', type=float, default=0.0,
+                    help='Per-step penalty proportional to cloth mean '
+                         'vertex displacement. reward -= vel_penalty * '
+                         'mean_per_vertex_disp. Discourages whippy '
+                         'trajectories. 0 = off; try 1-10.')
+parser.add_argument('--pre_settle_coef', type=float, default=0.0,
+                    help='Linear penalty on hole-to-goal distance (m) at '
+                         'policy handoff, BEFORE make_final_steps. '
+                         'reward -= pre_settle_coef * pre_settle_dist_m. '
+                         'Counters the "lift high, drop straight down" '
+                         'exploit. 0 = off; start at 20.')
+parser.add_argument('--action_penalty', type=float, default=0.0,
+                    help='Per-step penalty on action magnitude. '
+                         'reward -= action_penalty * mean(action**2). '
+                         'Discourages bang-bang control. 0 = off.')
 # BC pretrain (scripted hole-aware demos in PCD obs space).
 parser.add_argument('--bc_episodes', type=int, default=0,
                     help='If >0 AND --bc_demo_path not set: collect this '
@@ -160,7 +175,10 @@ def make_wrapped_env(args, monitor_dir=None):
             cam_resolution=extra_args.cam_resolution_pcd,
             success_factor=extra_args.success_factor,
             success_bonus=extra_args.success_bonus,
-            fail_penalty=extra_args.fail_penalty)
+            fail_penalty=extra_args.fail_penalty,
+            vel_penalty=extra_args.vel_penalty,
+            pre_settle_coef=extra_args.pre_settle_coef,
+            action_penalty=extra_args.action_penalty)
         env = Monitor(env, filename=monitor_dir)
         return env
     return _init
@@ -192,7 +210,10 @@ eval_env_raw = PointCloudObsWrapper(
     cam_resolution=extra_args.cam_resolution_pcd,
     success_factor=extra_args.success_factor,
     success_bonus=extra_args.success_bonus,
-    fail_penalty=extra_args.fail_penalty)
+    fail_penalty=extra_args.fail_penalty,
+    vel_penalty=extra_args.vel_penalty,
+    pre_settle_coef=extra_args.pre_settle_coef,
+    action_penalty=extra_args.action_penalty)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -233,12 +254,19 @@ if dedo_args.use_wandb:
         sf = extra_args.success_factor
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
+        vp = extra_args.vel_penalty
+        psc = extra_args.pre_settle_coef
+        ap = extra_args.action_penalty
         bc_tag = '_bc' if _use_bc else ''
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
+        vp_tag = f'_vp{vp:g}' if vp else ''
+        psc_tag = f'_psc{psc:g}' if psc else ''
+        ap_tag = f'_ap{ap:g}' if ap else ''
         wandb.run.name = (f'{wandb.run.name}_pcd{extra_args.n_points}'
-                          f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}')
+                          f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}'
+                          f'{vp_tag}{psc_tag}{ap_tag}')
         wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pointcloud',
@@ -246,11 +274,27 @@ if dedo_args.use_wandb:
             f'success_factor={sf}',
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
+            f'vel_penalty={vp}',
+            f'pre_settle_coef={psc}',
+            f'action_penalty={ap}',
             f'n_points={extra_args.n_points}',
             f'policy={extra_args.policy}',
         ]
         wandb.run.name = wandb.run.name + f'_{extra_args.policy}'
         wandb.run.save()
+        # Promote shaping coefs to top-level config keys (filterable in
+        # the wandb runs table; not auto-included from extra_args).
+        wandb.config.update({
+            'shaping_success_factor': sf,
+            'shaping_success_bonus': sb,
+            'shaping_fail_penalty': fp,
+            'shaping_vel_penalty': vp,
+            'shaping_pre_settle_coef': psc,
+            'shaping_action_penalty': ap,
+            'n_points': extra_args.n_points,
+            'cam_resolution_pcd': extra_args.cam_resolution_pcd,
+            'policy': extra_args.policy,
+        }, allow_val_change=True)
 
 
 # ---------------------------------------------------------------------------

@@ -59,7 +59,7 @@ from experiments.hang_obs_exp.envs.privileged_env import (
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import RetryResetEnv  # noqa: E402
 
-ALL_MODES = ('hole_centroid', 'hole_vertices', 'full_mesh')
+ALL_MODES = ('hole_centroid', 'hole_vertices', 'full_mesh', 'enriched')
 
 
 # ---------------------------------------------------------------------------

@@ -367,6 +367,10 @@ class DeformEnv(gym.Env):
         # Get next obs, reward, done.
         next_obs, done = self.get_obs()
         reward = self.get_reward()
+        # Snapshot the per-step (un-multiplied) reward at the terminal frame,
+        # so wrappers can shape on the policy-handoff pose BEFORE the gravity
+        # settle in make_final_steps mutates the cloth.
+        pre_settle_reward = reward
         if done:  # if terminating early use reward from current step for rest
             reward *= (self.max_episode_len - self.stepnum)
         done = (done or self.stepnum >= self.max_episode_len)
@@ -375,6 +379,9 @@ class DeformEnv(gym.Env):
         if done:
             # Compute final reward by releasing anchors to let the object fall.
             info = self.make_final_steps()
+            info['pre_settle_reward'] = pre_settle_reward
+            info['pre_settle_dist_m'] = (
+                -pre_settle_reward * DeformEnv.WORKSPACE_BOX_SIZE)
             last_rwd = self.get_reward() * DeformEnv.FINAL_REWARD_MULT
             info['is_success'] = np.abs(last_rwd) < self.SUCESS_REWARD_TRESHOLD
             reward += last_rwd

@@ -28,7 +28,7 @@ def object_to_str(obj):
     return text_str
 
 
-def init_train(algo, args, tags=None):
+def init_train(algo, args, tags=None, wandb_resume_id=None):
     np.set_printoptions(precision=4, linewidth=150, suppress=True)
     if platform.system() == 'Linux':
         os.environ['IMAGEIO_FFMPEG_EXE'] = '/usr/bin/ffmpeg'
@@ -39,8 +39,18 @@ def init_train(algo, args, tags=None):
         subdir = '_'.join(lst)
         logdir = os.path.join(os.path.expanduser(args.logdir), subdir)
         if args.use_wandb:
-            wandb.init(config=vars(args), project='dedo',
-                       name=logdir, tags=tags, sync_tensorboard=True)
+            wandb_kwargs = dict(config=vars(args), project='dedo',
+                                name=logdir, tags=tags,
+                                sync_tensorboard=True)
+            if wandb_resume_id:
+                # Continue the same wandb run instead of starting a fresh
+                # one. wandb keeps the original run name; `name=logdir` is
+                # ignored. resume="must" raises if the ID doesn't exist,
+                # which is the safer behavior — silent fall-through to a
+                # new run would defeat the purpose.
+                wandb_kwargs['id'] = wandb_resume_id
+                wandb_kwargs['resume'] = 'must'
+            wandb.init(**wandb_kwargs)
             try:  # patch only once, if more than one run, ignore error
                 wandb.tensorboard.patch()
             except Exception:

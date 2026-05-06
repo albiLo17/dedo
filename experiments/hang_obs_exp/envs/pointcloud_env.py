@@ -41,7 +41,10 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
                  cam_resolution: int = 128,
                  success_factor: float = None,
                  success_bonus: float = 0.0,
-                 fail_penalty: float = 0.0):
+                 fail_penalty: float = 0.0,
+                 vel_penalty: float = 0.0,
+                 pre_settle_coef: float = 0.0,
+                 action_penalty: float = 0.0):
         # PCD wrapper requires a working camera — force cam_resolution.
         env.args.cam_resolution = cam_resolution
         super().__init__(env)
@@ -51,10 +54,14 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._success_factor = success_factor
         self._success_bonus = float(success_bonus)
         self._fail_penalty = float(fail_penalty)
+        self._vel_penalty = float(vel_penalty)
+        self._pre_settle_coef = float(pre_settle_coef)
+        self._action_penalty = float(action_penalty)
 
         self._hole_vertex_indices = []
         self._goal_pos = None
         self._hole_radius = None
+        self._prev_verts = None
         self._last_pcd_world = None  # cached for overlay viz
 
         # Resolve the actual DeformEnv once. Anything wrapped between us
@@ -171,6 +178,11 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._hole_vertex_indices = self._get_hole_indices()
         self._goal_pos = self._deform.goal_pos.copy()
         self._hole_radius = self._measure_hole_radius()
+        if self._vel_penalty > 0.0:
+            _, verts = get_mesh_data(self._deform.sim, self._deform.deform_id)
+            self._prev_verts = np.asarray(verts, dtype=np.float32)
+        else:
+            self._prev_verts = None
         return self._build_obs()
 
     def observation(self, obs):
@@ -179,6 +191,47 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
     def step(self, action):
         _, reward, done, info = self.env.step(action)
         obs = self._build_obs()
+
+        # Action-magnitude penalty: discourages bang-bang/flailing control.
+        # Applied every step, including terminal — the action was chosen
+        # by the policy and is well-defined regardless of settle phase.
+        if self._action_penalty > 0.0:
+            a = np.asarray(action, dtype=np.float32)
+            act_cost = float(np.mean(a * a))
+            pen = self._action_penalty * act_cost
+            reward = float(reward) - pen
+            info['action_penalty'] = pen
+            info['action_cost'] = act_cost
+
+        # Cloth-velocity penalty: discourages whippy trajectories. Only
+        # active during the policy phase — the terminal step ran
+        # make_final_steps which mixes policy motion with gravity-driven
+        # settle, so the verts delta there isn't policy-controllable.
+        if self._vel_penalty > 0.0 and not done:
+            _, verts_now = get_mesh_data(
+                self._deform.sim, self._deform.deform_id)
+            verts_now = np.asarray(verts_now, dtype=np.float32)
+            if self._prev_verts is not None and \
+                    self._prev_verts.shape == verts_now.shape:
+                disp = np.linalg.norm(verts_now - self._prev_verts, axis=1)
+                disp = disp[~np.isnan(disp)]
+                if len(disp) > 0:
+                    mean_speed = float(disp.mean())
+                    pen = self._vel_penalty * mean_speed
+                    reward = float(reward) - pen
+                    info['vel_penalty'] = pen
+                    info['cloth_mean_speed'] = mean_speed
+            self._prev_verts = verts_now
+
+        # Pre-settle distance penalty: linear shaping on hole-to-goal
+        # distance at policy handoff (BEFORE make_final_steps drops the
+        # cloth under gravity). Counters "lift high, drop straight down".
+        if (done and self._pre_settle_coef > 0.0
+                and 'pre_settle_dist_m' in info):
+            pre_dist = float(info['pre_settle_dist_m'])
+            pen = self._pre_settle_coef * pre_dist
+            reward = float(reward) - pen
+            info['pre_settle_penalty'] = pen
 
         # Adaptive success + reward shaping (same logic as PrivilegedObsWrapper).
         if (done and 'is_success' in info
