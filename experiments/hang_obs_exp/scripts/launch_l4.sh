@@ -7,8 +7,10 @@
 #   - 1 NEW PPO pixels run with the consolidated recipe       (GPU)
 #   - Run A privileged: BC-preservation hypothesis            (CPU)
 #   - Run E privileged: kitchen-sink best-guess               (CPU)
+#   - Run F privileged: slow-drift / tight-PPO hypothesis     (CPU)
 #
-# Total CPU pressure with OMP_NUM_THREADS=2: ~12 cores. Fits g2-standard-12.
+# Total CPU pressure with OMP_NUM_THREADS=2: ~12 cores. At edge of
+# g2-standard-12 — minor scheduling slowdown possible.
 #
 # Run from repo root:  bash experiments/hang_obs_exp/scripts/launch_l4.sh
 set -euo pipefail
@@ -92,6 +94,25 @@ start ppo_hc_E \
     --pre_settle_coef 40 --vel_penalty 8 \
     --bc_episodes 300 --bc_demos_only_success --bc_epochs 60 \
     --net_arch 512,512 \
+    --total_env_steps 3000000 --seed 42 --cpu --use_wandb"
+
+# === Run F privileged: slow-drift / tight-PPO hypothesis =============
+# D's bigger-net recipe (lr=5e-5, warmup=2, sf=1.2, sb=100, psc=20,
+# 512x512) — chosen because D had the highest post-BC eval success
+# (~0.77) and the strongest retention of the A-E sweep — plus tight
+# per-rollout PPO drift caps. Tests whether throttling clip_range /
+# n_epochs / target_kl can lift D's mid-band recovery into sustained
+# high success.
+start ppo_hc_F \
+"python experiments/hang_obs_exp/scripts/train_privileged.py \
+    --obs_mode hole_centroid \
+    --max_act_vel 4.1 --log_std_init -2.7 \
+    --lr 5e-5 --critic_warmup_rollouts 2 \
+    --success_factor 1.2 --success_bonus 100 \
+    --pre_settle_coef 20 --vel_penalty 8 \
+    --bc_episodes 300 --bc_demos_only_success --bc_epochs 60 \
+    --net_arch 512,512 \
+    --ppo_clip_range 0.05 --ppo_epochs 3 --ppo_target_kl 0.02 \
     --total_env_steps 3000000 --seed 42 --cpu --use_wandb"
 
 echo

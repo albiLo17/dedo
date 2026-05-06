@@ -174,6 +174,38 @@ parser.add_argument('--ppo_target_kl', type=float, default=None,
                          'actor more than ~target_kl away. Soft '
                          'complement to clip_range; recommended 0.01-0.03 '
                          'when BC is on. None disables.')
+parser.add_argument('--bc_anchor_batches', type=int, default=0,
+                    help='Number of MSE gradient batches against the BC '
+                         'demo dataset to take after each PPO rollout. '
+                         'Counters the BC-erasure pattern by anchoring '
+                         'the actor toward the demos throughout PPO '
+                         'training (not just at warmstart). 0 disables. '
+                         'Try 4-8 when post-BC eval success drops below '
+                         'the BC-pretrain level. No extra env interaction '
+                         '— reuses the in-memory demos.')
+parser.add_argument('--bc_anchor_batch_size', type=int, default=256,
+                    help='Batch size for BC anchor gradient steps.')
+parser.add_argument('--bc_anchor_lr', type=float, default=1e-4,
+                    help='Learning rate for BC anchor gradient steps. '
+                         'Smaller than --bc_lr (BC pretrain default 1e-3) '
+                         'because anchor updates run continuously through '
+                         'PPO and should not overpower the policy gradient.')
+parser.add_argument('--critic_warmup_demo_epochs', type=int, default=0,
+                    help='Pretrain V(s) on Monte Carlo returns from BC '
+                         'demos for N epochs after BC pretrain, before '
+                         'PPO starts. Targets the structural cause of '
+                         '"PPO erases BC": with a random V at PPO start, '
+                         'A=Q-V is noise and the actor is pushed off the '
+                         'BC manifold. Seeding V with demo MC returns '
+                         'aligns the critic with BC-visited states from '
+                         'step 0. 0 disables; try 50-100. Requires demos '
+                         'with per-step rewards (collect fresh via '
+                         '--bc_episodes, or use a demo dir whose pkls '
+                         'contain the `rewards` field).')
+parser.add_argument('--critic_warmup_demo_lr', type=float, default=3e-4,
+                    help='Learning rate for demo-based critic warmup.')
+parser.add_argument('--critic_warmup_demo_batch_size', type=int, default=256,
+                    help='Batch size for demo-based critic warmup.')
 parser.add_argument('--log_std_init', type=float, default=None,
                     help='Initial log_std for the PPO actor head. SB3 '
                          'default is 0.0 (std=1.0 in pre-clip space). '
@@ -619,7 +651,8 @@ _cbs = [video_cb, diag_cb]
 if not _resuming and extra_args.critic_warmup_rollouts > 0:
     _cbs.append(PPOCriticWarmupCallback(
         n_warmup_rollouts=extra_args.critic_warmup_rollouts))
-cb = CallbackList(_cbs)
+# CallbackList is built AFTER BC pretrain below, so the BC anchor
+# callback can be appended to _cbs once demo data is in scope.
 
 # Persist a self-describing config.json + push to wandb.config so future
 # debugging never has to guess what reward this run optimized.
@@ -676,6 +709,7 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
         os.makedirs(save_dir, exist_ok=True)
 
     obs_buf, act_buf = [], []
+    rewards_per_ep = []  # one np.ndarray per kept demo (per-step raw rewards)
     succeeded = 0
     n_kept, n_dropped = 0, 0
     target_kept = num_episodes
@@ -723,7 +757,7 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
                   f'MAX_ACT_VEL = {_mav:.3f} m/s{_flag}')
 
         last_action = np.zeros_like(traj[0])
-        ep_obs, ep_act = [], []
+        ep_obs, ep_act, ep_rewards = [], [], []
         step, ep_rwd, ep_success = 0, 0.0, 0
         while True:
             act_unscaled = traj[step] if step < len(traj) else last_action
@@ -732,6 +766,7 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
             ep_obs.append(np.asarray(obs, dtype=np.float32))
             ep_act.append(np.asarray(normalized, dtype=np.float32))
             obs, rwd, done, info = raw.step(normalized.astype(np.float32))
+            ep_rewards.append(float(rwd))
             ep_rwd += float(rwd)
             if 'is_success' in info:
                 ep_success = max(ep_success, int(info['is_success']))
@@ -746,6 +781,7 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
             continue
         obs_buf.extend(ep_obs)
         act_buf.extend(ep_act)
+        rewards_per_ep.append(np.asarray(ep_rewards, dtype=np.float32))
         succeeded += ep_success
         n_kept += 1
 
@@ -759,6 +795,10 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
             payload = {
                 'obs': {obs_mode_str: np.asarray(ep_obs, dtype=np.float32)},
                 'acts': np.asarray(ep_act, dtype=np.float32),
+                # Per-step rewards (added so demo-based critic warmup
+                # can compute MC returns). 'reward' (scalar episode
+                # total) kept for backward compat with record_demo.py.
+                'rewards': np.asarray(ep_rewards, dtype=np.float32),
                 'reward': float(ep_rwd),
                 'success': int(ep_success),
                 'obs_modes': [obs_mode_str],
@@ -786,6 +826,7 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
               f'~{n_kept/max(attempts,1):.0%} scripted success rate)')
     return (np.array(obs_buf, dtype=np.float32),
             np.array(act_buf, dtype=np.float32),
+            rewards_per_ep,
             succeeded)
 
 
@@ -839,7 +880,9 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
     any mismatch; legacy pkls without a stored `success_factor` only get
     a soft 'unknown' note."""
     obs_buf, act_buf = [], []
+    rewards_per_ep = []  # filled if pkls have 'rewards' field
     n_files, n_success_demos = 0, 0
+    n_pkls_missing_rewards = 0
     sf_train = extra_args.success_factor
     sf_mismatches, sf_unknown = 0, 0
     for fname in sorted(os.listdir(demo_dir)):
@@ -880,6 +923,14 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
         n_success_demos += int(d.get('success', 0))
         obs_buf.append(obs_arr)
         act_buf.append(d['acts'])
+        # Per-step rewards: present in pkls written by the updated
+        # _collect_demo_rollouts; absent in pre-update pkls and in
+        # legacy record_demo.py output. Critic-warmup-on-demos
+        # requires this field.
+        if 'rewards' in d:
+            rewards_per_ep.append(np.asarray(d['rewards'], dtype=np.float32))
+        else:
+            n_pkls_missing_rewards += 1
         print(f'[BC] loaded {fname}  len={d.get("len", len(d["acts"]))}  '
               f'rwd={d.get("reward", 0):.2f}  '
               f'success={d.get("success", 0)}')
@@ -892,13 +943,25 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
               f'flags may not reflect the training criterion — '
               f'--bc_demos_only_success could keep/drop the wrong demos. '
               f'Re-record with the current --success_factor to align.')
+    if n_pkls_missing_rewards > 0:
+        print(f'[BC] NOTE: {n_pkls_missing_rewards} demo pkl(s) lack a '
+              f'per-step `rewards` field. Demo-based critic warmup '
+              f'(--critic_warmup_demo_epochs) cannot be used with these '
+              f'demos; re-collect to enable.')
+
+    # If any pkls were missing the rewards field, drop the partial list
+    # (caller treats empty list as "rewards unavailable") so we don't
+    # silently train V on a rewards subset that misaligns with obs/acts.
+    if n_pkls_missing_rewards > 0:
+        rewards_per_ep = []
 
     if not obs_buf:
         return (np.zeros((0, 0), dtype=np.float32),
                 np.zeros((0, 0), dtype=np.float32),
-                0, 0)
+                [], 0, 0)
     return (np.concatenate(obs_buf, axis=0).astype(np.float32),
             np.concatenate(act_buf, axis=0).astype(np.float32),
+            rewards_per_ep,
             n_success_demos, n_files)
 
 
@@ -908,12 +971,14 @@ if _resuming:
     # learned weights.
     demo_obs = np.zeros((0, 0), dtype=np.float32)
     demo_acts = np.zeros((0, 0), dtype=np.float32)
+    demo_rewards_per_ep = []
     n_success, n_demos = 0, 0
     print('[resume] skipping BC pretrain (policy already trained)')
 elif extra_args.bc_demo_path:
     print(f'\n=== BC pretrain: loading manual demos from '
           f'{extra_args.bc_demo_path} ===')
-    demo_obs, demo_acts, n_success, n_demos = _load_manual_demos(
+    (demo_obs, demo_acts, demo_rewards_per_ep,
+     n_success, n_demos) = _load_manual_demos(
         extra_args.bc_demo_path, obs_mode,
         only_success=extra_args.bc_demos_only_success)
     print(f'[BC] loaded {len(demo_obs)} (obs,act) pairs from '
@@ -929,16 +994,18 @@ elif extra_args.bc_episodes > 0:
           f'scripted demo rollouts '
           f'(only_success={extra_args.bc_demos_only_success}) ===')
     print(f'[BC] saving scripted demos to {_scripted_demos_dir}')
-    demo_obs, demo_acts, n_success = _collect_demo_rollouts(
-        dedo_args, obs_mode, extra_args.bc_episodes,
-        only_success=extra_args.bc_demos_only_success,
-        save_dir=_scripted_demos_dir)
+    demo_obs, demo_acts, demo_rewards_per_ep, n_success = (
+        _collect_demo_rollouts(
+            dedo_args, obs_mode, extra_args.bc_episodes,
+            only_success=extra_args.bc_demos_only_success,
+            save_dir=_scripted_demos_dir))
     n_demos = extra_args.bc_episodes
     print(f'[BC] collected {len(demo_obs)} (obs,act) pairs from '
           f'{n_demos} demos ({n_success} succeeded)')
 else:
     demo_obs = np.zeros((0, 0), dtype=np.float32)
     demo_acts = np.zeros((0, 0), dtype=np.float32)
+    demo_rewards_per_ep = []
     n_success, n_demos = 0, 0
 
 if len(demo_obs) > 0:
@@ -953,6 +1020,52 @@ if len(demo_obs) > 0:
                    'bc/n_demos': n_demos})
 elif extra_args.bc_demo_path or extra_args.bc_episodes > 0:
     print('[BC] no usable demos found — skipping BC pretrain')
+
+# Demo-based critic warmup: pretrain V(s) on Monte Carlo returns from
+# the BC demos before PPO starts. Targets the root cause of post-BC
+# erasure (random V => noisy advantages => actor pushed off BC).
+if (not _resuming and extra_args.critic_warmup_demo_epochs > 0
+        and len(demo_obs) > 0):
+    if not demo_rewards_per_ep:
+        print('[critic-warmup] SKIPPED: per-step rewards unavailable. '
+              'Either re-collect demos via --bc_episodes (saves rewards '
+              'in the new pkl format) or use a demo dir whose pkls '
+              'contain the `rewards` field.')
+    else:
+        from _critic_warmup_demos import critic_warmup_on_demos
+        _cw_stats = critic_warmup_on_demos(
+            agent, demo_obs, demo_rewards_per_ep, vec_env,
+            gamma=rl_kwargs['gamma'],
+            epochs=extra_args.critic_warmup_demo_epochs,
+            batch_size=extra_args.critic_warmup_demo_batch_size,
+            lr=extra_args.critic_warmup_demo_lr,
+            use_wandb=dedo_args.use_wandb)
+        if dedo_args.use_wandb:
+            import wandb
+            wandb.log({'critic_warmup/final_mse': _cw_stats['final_mse'],
+                       'critic_warmup/target_mean': _cw_stats['target_mean'],
+                       'critic_warmup/target_std': _cw_stats['target_std'],
+                       'critic_warmup/ret_rms_var': _cw_stats['ret_rms_var']})
+
+# BC anchor: continuously pull the actor toward the BC demos during
+# PPO. Only meaningful when we have demos in memory (skipped on
+# resume since demos aren't reloaded there). See _bc_anchor.py.
+if (not _resuming and extra_args.bc_anchor_batches > 0
+        and len(demo_obs) > 0):
+    from _bc_anchor import BCAnchorCallback
+    _cbs.append(BCAnchorCallback(
+        demo_obs=demo_obs,
+        demo_acts=demo_acts,
+        vec_normalize=vec_env,
+        n_batches=extra_args.bc_anchor_batches,
+        batch_size=extra_args.bc_anchor_batch_size,
+        lr=extra_args.bc_anchor_lr,
+        verbose=1))
+    print(f'[bc-anchor] enabled: {extra_args.bc_anchor_batches} '
+          f'batches/rollout, batch_size={extra_args.bc_anchor_batch_size}, '
+          f'lr={extra_args.bc_anchor_lr}')
+
+cb = CallbackList(_cbs)
 
 print(f'Start privileged RL training '
       f'({"resuming" if _resuming else "fresh"}; '
