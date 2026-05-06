@@ -191,9 +191,8 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                  success_bonus: float = 0.0,
                  fail_penalty: float = 0.0,
                  vel_penalty: float = 0.0,
-                 boundary_penalty: float = 0.0,
-                 z_overshoot_penalty: float = 0.0,
-                 z_overshoot_slack: float = 1.0):
+                 action_penalty: float = 0.0,
+                 pre_settle_coef: float = 0.0):
         """
         success_factor: if not None, override the env's fixed success
         threshold (0.125 m) with an ADAPTIVE one — success requires
@@ -224,48 +223,24 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         so coefs ~1–10 yield per-step penalties of ~-0.1 to -5, comparable
         to dedo's per-step distance reward magnitude.
 
-        z_overshoot_penalty: per-step penalty proportional to how far
-        the cloth's hole centroid is ABOVE the peg's z-coordinate
-        (= goal_pos[0][2]), beyond a slack zone. 0 = off (default).
-        Why this exists: dedo's base reward measures full-3D distance
-        ||hole_centroid - goal_pos|| but is orientation-blind — it
-        rewards getting the centroid coordinate near the peg from any
-        direction, including straight above. Together with the
-        anchor-release final reward where gravity sometimes drops the
-        cloth onto the peg, this creates a "park the hole high above
-        the peg" local minimum that the boundary_penalty doesn't fix
-        (the policy can lift just below gripper_lims and still over-
-        shoot the peg by several meters). This shaping kills the lift
-        directly: per-step `reward -= z_overshoot_penalty *
-        max(0, hole_z - (peg_z + z_overshoot_slack))`. Suggested 1-5.
+        action_penalty: per-step penalty on the magnitude of the policy's
+        action vector. reward -= action_penalty * mean(action**2). Action
+        is in [-1, 1]^6 (PPO normalized), so mean(a**2) is in [0, 1] —
+        coefs ~0.1-2 yield per-step penalties of ~-0.05 to -2, comparable
+        to vel_penalty's range. Mirrors mujoco-style action-cost shaping;
+        used to discourage flailing/bang-bang control. Applied every step
+        including terminal (action is well-defined). 0 = off.
 
-        z_overshoot_slack: meters above the peg z that count as the
-        "free zone" with no overshoot penalty. The cloth starts hanging
-        from the grippers a few meters above the peg, and threading
-        approaches the peg from above, so a non-trivial slack avoids
-        penalizing the natural approach. Default 1.0 m. Tighten to
-        0.3-0.5 if you want more aggressive shaping; loosen to 2-3 if
-        the cloth is noticeably long.
-
-        boundary_penalty: terminal penalty applied IFF the episode ended
-        via dedo's workspace-bound exit (gripper position past
-        gripper_lims) rather than natural max_episode_len timeout. 0 = off.
-        Why this exists: dedo's `step()` sets done=True both for natural
-        timeout AND for workspace-bound exit, then amplifies the
-        terminal-step reward by `(max_episode_len - stepnum)` only on
-        the boundary path. PPO can exploit this by learning a
-        "lift the cloth high" policy that triggers the workspace exit,
-        cutting the episode short and avoiding the per-step distance
-        penalty that would accumulate over the remaining steps. The
-        cloth never actually threads — it just gets parked above the
-        peg. Adding a fixed penalty on the boundary-exit terminal makes
-        that strategy strictly worse than running to natural timeout.
-        Suggested 100-400; the magnitude must dominate the marginal
-        benefit of cutting short ~150 dithering steps at ~-0.25/step.
-        Detected post-hoc via the underlying env's stepnum: any done
-        with `stepnum <= max_episode_len` after step() returns is the
-        boundary exit (natural timeout exits with stepnum =
-        max_episode_len + 1).
+        pre_settle_coef: linear penalty on the hole-to-goal distance (in
+        meters) at the terminal step, BEFORE make_final_steps runs.
+        reward -= pre_settle_coef * pre_settle_dist_m. Counters the
+        "lift cloth high, let gravity drop it onto the hanger" exploit:
+        the post-settle reward currently rewards a ballistic alignment
+        equally to a threaded one, but this term only rewards being
+        close to the goal at policy-handoff. 0 = off. The post-settle
+        reward has effective coef FINAL_REWARD_MULT/WORKSPACE_BOX_SIZE
+        = 400/20 = 20 per meter, so coef ~10–30 is a meaningful
+        equal-or-greater counterweight; start at 20.
         """
         assert obs_mode in self.MODES, f'obs_mode must be one of {self.MODES}'
         env.args.cam_resolution = 0
@@ -279,18 +254,16 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._success_bonus = float(success_bonus)
         self._fail_penalty = float(fail_penalty)
         self._vel_penalty = float(vel_penalty)
-        self._boundary_penalty = float(boundary_penalty)
-        self._z_overshoot_penalty = float(z_overshoot_penalty)
-        self._z_overshoot_slack = float(z_overshoot_slack)
+        self._action_penalty = float(action_penalty)
+        self._pre_settle_coef = float(pre_settle_coef)
         self._prev_verts = None
         self._hole_radius = None
 
         # Per-episode reward bookkeeping for the diagnostics callback.
         self._ep_step_count = 0
         self._ep_base_reward_sum = 0.0
-        self._ep_vel_penalty_sum = 0.0  # accumulates magnitude (>= 0)
-        self._ep_z_overshoot_pen_sum = 0.0  # accumulates magnitude (>= 0)
-        self._ep_z_overshoot_sum = 0.0      # accumulates raw overshoot in m
+        self._ep_vel_penalty_sum = 0.0      # accumulates magnitude (>= 0)
+        self._ep_action_penalty_sum = 0.0   # accumulates magnitude (>= 0)
 
         grip_dim = 12
 
@@ -355,8 +328,7 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._ep_step_count = 0
         self._ep_base_reward_sum = 0.0
         self._ep_vel_penalty_sum = 0.0
-        self._ep_z_overshoot_pen_sum = 0.0
-        self._ep_z_overshoot_sum = 0.0
+        self._ep_action_penalty_sum = 0.0
         return self._build_obs()
 
     def observation(self, obs):
@@ -372,7 +344,22 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         base_is_success = info.get('is_success', None)
 
         # ------------------------------------------------------------------
-        # (1) Cloth-velocity penalty (non-terminal only).
+        # (1) Action-magnitude penalty (every step, including terminal).
+        #     The action was chosen by the policy and is well-defined
+        #     regardless of the settle phase. mean(a**2) in [0, 1] for
+        #     a in [-1, 1]^6.
+        # ------------------------------------------------------------------
+        act_pen = 0.0
+        if self._action_penalty > 0.0:
+            a = np.asarray(action, dtype=np.float32)
+            act_cost = float(np.mean(a * a))
+            act_pen = self._action_penalty * act_cost
+            reward = float(reward) - act_pen
+            info['action_penalty'] = act_pen
+            info['action_cost'] = act_cost
+
+        # ------------------------------------------------------------------
+        # (2) Cloth-velocity penalty (non-terminal only).
         #     The terminal step's verts delta would mix policy motion with
         #     gravity-driven settle motion the policy can't control, so we
         #     skip it there.
@@ -388,45 +375,28 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                 if len(disp) > 0:
                     mean_speed = float(disp.mean())
                     vel_pen = self._vel_penalty * mean_speed
-                    reward = base_reward - vel_pen
+                    reward = float(reward) - vel_pen
                     info['vel_penalty'] = vel_pen
                     info['cloth_mean_speed'] = mean_speed
             self._prev_verts = verts_now
 
         # ------------------------------------------------------------------
-        # (1b) Cloth-z overshoot penalty (non-terminal only).
-        #      Targets the orientation-blind reward landscape: dedo's base
-        #      reward only measures ||hole_centroid - goal_pos||, which is
-        #      minimized just as well by hovering the hole high above the
-        #      peg as by threading. The boundary penalty closes the
-        #      workspace-exit hack but doesn't touch sub-boundary lifts.
-        #      This term penalizes the lift directly: per-step loss
-        #      proportional to (hole_centroid_z - peg_z) above a slack
-        #      zone. Skipped on terminal step so it doesn't double-count
-        #      against the dedo settle that has already been integrated
-        #      into the terminal reward.
+        # (3) Pre-settle distance penalty (terminal only).
+        #     Linear shaping on the hole-to-goal distance at policy
+        #     handoff (BEFORE make_final_steps drops the cloth under
+        #     gravity). Counters the "lift high, drop straight down"
+        #     exploit by rewarding only positions reached via control.
         # ------------------------------------------------------------------
-        z_pen = 0.0
-        z_overshoot = 0.0
-        if self._z_overshoot_penalty > 0.0 and not done:
-            _, verts_z = get_mesh_data(self.env.sim, self.env.deform_id)
-            verts_z = np.asarray(verts_z, dtype=np.float32)
-            if self._hole_vertex_indices:
-                hv_z = verts_z[self._hole_vertex_indices]
-                hv_z = hv_z[~np.isnan(hv_z).any(axis=1)]
-                if len(hv_z) > 0:
-                    hole_z = float(hv_z[:, 2].mean())
-                    goal_z = float(self.env.goal_pos[0][2])
-                    z_overshoot = max(
-                        0.0, hole_z - (goal_z + self._z_overshoot_slack))
-                    if z_overshoot > 0.0:
-                        z_pen = self._z_overshoot_penalty * z_overshoot
-                        reward = float(reward) - z_pen
-                        info['z_overshoot'] = z_overshoot
-                        info['z_overshoot_penalty'] = z_pen
+        pre_settle_pen = 0.0
+        if (done and self._pre_settle_coef > 0.0
+                and 'pre_settle_dist_m' in info):
+            pre_dist = float(info['pre_settle_dist_m'])
+            pre_settle_pen = self._pre_settle_coef * pre_dist
+            reward = float(reward) - pre_settle_pen
+            info['pre_settle_penalty'] = pre_settle_pen
 
         # ------------------------------------------------------------------
-        # (2) Adaptive success override + terminal shaping.
+        # (4) Adaptive success override + terminal shaping.
         # ------------------------------------------------------------------
         adaptive_dist = None
         adaptive_thresh = None
@@ -463,41 +433,12 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                     info['shaping_added'] = terminal_shaping
 
         # ------------------------------------------------------------------
-        # (3) Workspace-exit early-termination penalty.
-        #     dedo's `step()` sets done=True both for natural timeout
-        #     (stepnum >= max_episode_len) AND for workspace-bound
-        #     violation (gripper past gripper_lims). Without
-        #     intervention, the latter is exploitable: a "lift the cloth
-        #     high" policy triggers the bound, ending the episode early
-        #     and skipping the per-step distance penalty that would
-        #     accumulate over the remaining ~150 dithering steps.
-        #
-        #     Detection: dedo increments stepnum at the END of step(),
-        #     so after the call returns, natural timeout exits with
-        #     stepnum = max_episode_len + 1 while a boundary exit at
-        #     internal step k exits with stepnum = k + 1
-        #     (<= max_episode_len). Boundary exits are tagged regardless
-        #     of self._boundary_penalty so the violation rate is
-        #     observable in diagnostics even with the penalty disabled.
-        # ------------------------------------------------------------------
-        boundary_violation = False
-        boundary_pen_applied = 0.0
-        if done and self.env.stepnum <= self.env.max_episode_len:
-            boundary_violation = True
-            info['boundary_violation'] = True
-            if self._boundary_penalty != 0.0:
-                boundary_pen_applied = self._boundary_penalty
-                reward = float(reward) - boundary_pen_applied
-                info['boundary_penalty'] = boundary_pen_applied
-
-        # ------------------------------------------------------------------
-        # (4) Update per-episode accumulators and emit diagnostics on done.
+        # (5) Update per-episode accumulators and emit diagnostics on done.
         # ------------------------------------------------------------------
         self._ep_step_count += 1
         self._ep_base_reward_sum += base_reward
         self._ep_vel_penalty_sum += vel_pen
-        self._ep_z_overshoot_pen_sum += z_pen
-        self._ep_z_overshoot_sum += z_overshoot
+        self._ep_action_penalty_sum += act_pen
 
         if done:
             self._emit_episode_diagnostics(
@@ -509,8 +450,7 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                 adaptive_is_success=adaptive_is_success,
                 adaptive_dist=adaptive_dist,
                 adaptive_thresh=adaptive_thresh,
-                boundary_violation=boundary_violation,
-                boundary_pen_applied=boundary_pen_applied,
+                pre_settle_pen=pre_settle_pen,
             )
 
         return obs, reward, done, info
@@ -525,32 +465,23 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                                   total_reward,
                                   base_is_success, adaptive_is_success,
                                   adaptive_dist, adaptive_thresh,
-                                  boundary_violation=False,
-                                  boundary_pen_applied=0.0):
+                                  pre_settle_pen=0.0):
         info['rwd_diag/reward/episode_total'] = float(
             self._ep_base_reward_sum
             - self._ep_vel_penalty_sum
-            - self._ep_z_overshoot_pen_sum
+            - self._ep_action_penalty_sum
             + terminal_shaping
-            - boundary_pen_applied
+            - pre_settle_pen
         )
         info['rwd_diag/reward/base_sum'] = float(self._ep_base_reward_sum)
         info['rwd_diag/reward/vel_penalty_sum'] = float(
             self._ep_vel_penalty_sum)
-        info['rwd_diag/reward/z_overshoot_penalty_sum'] = float(
-            self._ep_z_overshoot_pen_sum)
+        info['rwd_diag/reward/action_penalty_sum'] = float(
+            self._ep_action_penalty_sum)
         info['rwd_diag/reward/terminal_base'] = float(terminal_base)
         info['rwd_diag/reward/terminal_shaping'] = float(terminal_shaping)
-        info['rwd_diag/reward/boundary_penalty'] = float(boundary_pen_applied)
+        info['rwd_diag/reward/pre_settle_penalty'] = float(pre_settle_pen)
         info['rwd_diag/reward/episode_length'] = int(self._ep_step_count)
-        # 0/1 per-episode flag → rolling mean = workspace-exit rate.
-        info['rwd_diag/boundary/violation_rate'] = int(bool(boundary_violation))
-        # Mean per-step raw overshoot in meters: a behavior signal that
-        # works even when penalty=0 (so users can decide whether to turn
-        # the knob on by inspecting an unshaped baseline).
-        ep_len = max(self._ep_step_count, 1)
-        info['rwd_diag/task/z_overshoot_mean'] = float(
-            self._ep_z_overshoot_sum / ep_len)
 
         # Successes: which definition each run uses, and disagreement rate.
         if base_is_success is not None:

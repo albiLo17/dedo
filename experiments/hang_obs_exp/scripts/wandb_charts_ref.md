@@ -11,7 +11,7 @@ If you're glancing at wandb every hour, these are the ones to check first, in th
 | 1 | `eval/success_rate` | The headline. Deterministic 10-episode eval success rate. **This is the number that goes in your paper.** |
 | 2 | `train/cumulative_successes` | **Monotone tally of all successful episodes since run start.** Each step UP = one specific episode succeeded. Reads exactly like "how many times has the agent solved it so far?" — no rolling-average smearing. Use this whenever you want "did *that* episode succeed?". |
 | 3 | `last_episode/success` | Raw 0/1 spike per episode (1 = success, 0 = fail). Lets you visually count individual successes and see the gaps between them. Sparse and spiky on purpose. |
-| 4 | `rwd_diag/task/adaptive_dist` *or* `last_episode/dist` | Mean hole-centroid → goal distance at episode end (m). **Leading indicator** — drops well before success rate climbs. Use the `rwd_diag/...` rolling version for trend; use `last_episode/dist` for per-episode "near-misses". |
+| 4 | `task/adaptive_dist` *or* `last_episode/dist` | Mean hole-centroid → goal distance at episode end (m). **Leading indicator** — drops well before success rate climbs. Use the rolling `task/...` version for trend; use `last_episode/dist` for per-episode "near-misses". |
 | 5 | `train/critic_loss` | SAC critic stability. Should stabilize to a finite value. **Explosion = kill the run.** |
 | 6 | `train/ent_coef` | SAC's auto-tuned exploration noise. Should converge to ~0.05–0.5. **Drops below 0.01 = premature commitment, run is collapsing.** Pin entropy with `--ent_coef 0.2` if it keeps happening (see "Known failure modes" below). |
 | 7 | `eval/video` (panel, not chart) | The mp4 grid. Watch one every couple of hours; tells you *why* the metrics look the way they do. |
@@ -19,6 +19,8 @@ If you're glancing at wandb every hour, these are the ones to check first, in th
 Pin these 7 to the top of the wandb panel using ⋯ → "Move to top" so they're above the fold every time you open the run page.
 
 **Recommended X-axis for charts 2–4**: `train/episodes_total` (set globally via workspace settings ⚙️ → X-axis). For SAC-internals (charts 5–6), keep `Step`. See the X-axis section below for why `time/episodes` from SB3 is *not* available.
+
+> **Naming note (post 2026-05-05):** the `RewardDiagnosticsCallback` strips the `rwd_diag/` prefix before logging to TensorBoard, so the actual wandb keys are `reward/*`, `success/*`, `task/*` (not `rwd_diag/reward/*`). Old runs and old screenshots may show the longer prefix; the new tables below use the actual key names.
 
 ---
 
@@ -40,35 +42,44 @@ Pin these 7 to the top of the wandb panel using ⋯ → "Move to top" so they're
 | `eval/success_rate` | Success rate over 10 deterministic eval episodes | **Cleaner than `rollout/success_rate_100`** because deterministic. Updates every 2nd checkpoint (every 20k steps with `--log_save_interval 20`). Only ~10 episodes per data point so individual values jitter ±10–20 %; trend line is what matters. |
 | `eval/video` | mp4 panel | One mp4 every 4th checkpoint (every 40k steps with `--log_save_interval 20`). Each video shows 10 deterministic episodes back-to-back, with SUCCESS/FAIL badges drawn per episode and the post-policy "settle" frames spliced in chronologically. |
 
-### `rwd_diag/reward/*` — reward decomposition (per-episode 100-ep moving avg)
+### `reward/*` — reward decomposition (per-episode 100-ep moving avg)
 
-These are emitted by `PrivilegedObsWrapper._emit_episode_diagnostics` and rolling-averaged by `RewardDiagnosticsCallback`. They tell you what shaping terms are actually firing.
-
-| Chart | What it is |
-|---|---|
-| `rwd_diag/reward/episode_total` | True total reward per episode (after vel_penalty + terminal shaping). The "real" objective. |
-| `rwd_diag/reward/base_sum` | Sum of dedo's per-step distance reward over the whole episode. Always negative. |
-| `rwd_diag/reward/vel_penalty_sum` | Sum of velocity penalty over the episode (≥ 0). 0 when `vel_penalty=0`. |
-| `rwd_diag/reward/terminal_base` | The single-step base reward at the terminal step (driven by `FINAL_REWARD_MULT=400`, dominates `base_sum` magnitude). |
-| `rwd_diag/reward/terminal_shaping` | Terminal `+success_bonus` or `-fail_penalty` actually applied. Tells you the success-bonus is firing — should be increasingly nonzero as success rate climbs. |
-| `rwd_diag/reward/episode_length` | Per-episode step count. Mostly 200; if it drops, episodes are terminating early (out-of-workspace). |
-
-### `rwd_diag/success/*` — what counts as success (per-episode 100-ep avg)
+Emitted by `PrivilegedObsWrapper._emit_episode_diagnostics` (or `PixelObsWrapper`'s equivalent) under the `rwd_diag/reward/*` info-key namespace, then logged by `RewardDiagnosticsCallback` with the prefix stripped. They tell you what shaping terms are actually firing.
 
 | Chart | What it is |
 |---|---|
-| `rwd_diag/success/active_rate` | The success criterion the agent **actually trained against**. Equal to `adaptive_rate` since you set `success_factor=1.2`. **This is the same series as `rollout/success_rate_100`**; they're redundant on purpose for cross-checking. |
-| `rwd_diag/success/adaptive_rate` | Your adaptive criterion: `dist < 1.2 × hole_radius`. |
-| `rwd_diag/success/base_rate` | Dedo's strict criterion: `\|final_reward\| < 2.5` (≈ `dist < 0.125 m`). Will be lower than `adaptive_rate` because it's stricter. Useful to know how many "almost successes" your runs have under the dedo definition. |
-| `rwd_diag/success/disagree_rate` | Fraction of episodes where the two criteria disagree. Tells you how soft your adaptive criterion is vs dedo's strict one. |
+| `reward/episode_total` | True total reward per episode after all shaping (`base_sum − vel_penalty_sum − action_penalty_sum + terminal_shaping − pre_settle_penalty`). The "real" objective. |
+| `reward/base_sum` | Sum of dedo's per-step distance reward over the whole episode. Always negative. |
+| `reward/vel_penalty_sum` | Sum of velocity penalty over the episode (≥ 0). 0 when `vel_penalty=0`. |
+| `reward/action_penalty_sum` | Sum of action-magnitude penalty over the episode (≥ 0). 0 when `action_penalty=0`. **Logged on every terminal step (incl. terminal action), unlike `vel_penalty_sum` which is non-terminal-only.** |
+| `reward/pre_settle_penalty` | Single-step pre-settle distance penalty applied at terminal (`pre_settle_coef × pre_settle_dist_m`). Magnitude ≥ 0 when knob is on; 0 otherwise. Per-episode 100-ep mean of this single-step value. |
+| `reward/terminal_base` | The single-step base reward at the terminal step (driven by `FINAL_REWARD_MULT=400`, dominates `base_sum` magnitude). |
+| `reward/terminal_shaping` | Terminal `+success_bonus` or `-fail_penalty` actually applied. Tells you the success-bonus is firing — should be increasingly nonzero as success rate climbs. |
+| `reward/episode_length` | Per-episode step count. Mostly 200; if it drops, episodes are terminating early (out-of-workspace). |
 
-### `rwd_diag/task/*` — geometric state (per-episode 100-ep avg)
+### `success/*` — what counts as success (per-episode 100-ep avg)
+
+| Chart | What it is |
+|---|---|
+| `success/active_rate` | The success criterion the agent **actually trained against**. Equal to `adaptive_rate` when `success_factor` is set, else equal to `base_rate`. **This is the same series as `rollout/success_rate_100`**; they're redundant on purpose for cross-checking. |
+| `success/adaptive_rate` | Your adaptive criterion: `dist < success_factor × hole_radius` (default `1.2 × hole_radius`). |
+| `success/base_rate` | Dedo's strict criterion: `\|final_reward\| < 2.5` (≈ `dist < 0.125 m`). Will be lower than `adaptive_rate` because it's stricter. Useful to know how many "almost successes" your runs have under the dedo definition. |
+| `success/disagree_rate` | Fraction of episodes where the two criteria disagree. Tells you how soft your adaptive criterion is vs dedo's strict one. |
+
+### `task/*` — geometric state (per-episode 100-ep avg)
 
 | Chart | What it is | Expected behavior |
 |---|---|---|
-| `rwd_diag/task/adaptive_dist` | Mean hole-centroid → goal distance at episode end (m) | **Most important leading indicator.** Should monotonically decrease as policy improves. Stalls before success rate climbs. |
-| `rwd_diag/task/adaptive_thresh` | The adaptive threshold value (= `success_factor × hole_radius`) | Roughly constant per cloth distribution (~0.5–0.7 m). Mostly useful as a horizontal reference line vs `adaptive_dist`. |
-| `rwd_diag/task/hole_radius` | Mean hole radius across recent episodes (m) | Should be ~constant; sudden changes mean the cloth distribution shifted. |
+| `task/adaptive_dist` | Mean hole-centroid → goal distance at episode end (m) | **Most important leading indicator.** Should monotonically decrease as policy improves. Stalls before success rate climbs. |
+| `task/adaptive_thresh` | The adaptive threshold value (= `success_factor × hole_radius`) | Roughly constant per cloth distribution (~0.5–0.7 m). Mostly useful as a horizontal reference line vs `adaptive_dist`. |
+| `task/hole_radius` | Mean hole radius across recent episodes (m) | Should be ~constant; sudden changes mean the cloth distribution shifted. |
+
+### `rwd_diag_meta/*` — diagnostics-callback bookkeeping
+
+| Chart | What it is |
+|---|---|
+| `rwd_diag_meta/episodes_seen` | Cumulative count of finished episodes the diagnostics callback has consumed. Sanity-check that wrappers are emitting `rwd_diag/*` keys at all. |
+| `rwd_diag_meta/window_size` | Current depth of the 100-ep rolling buffer. Will be < 100 for the first ~100 episodes, then constant at 100. Use to gauge whether `reward/*` / `success/*` rolling means are at full window yet. |
 
 ### `train/*` — SAC internals (every gradient update)
 
@@ -123,19 +134,22 @@ These have **`bc/epoch` as their natural x-axis**, not step. They live in step 0
 | `bc/n_demos` | Number of demos collected | — |
 | `bc/n_success_demos` | Successful demos in dataset | If this is 0 with `--bc_demos_only_success` not set, your BC dataset is purely failed demos (the Anti-BC). |
 
-### `final_eval/*` — once at end of training (20-episode deterministic eval)
+### `final_eval/*` — once at end of training (deterministic eval)
 
-Logged after `agent.learn()` finishes. Single data point per run.
+Logged after `agent.learn()` finishes by `make_final_eval_collector` + `log_final_eval_metrics` from `_reward_diagnostics.py`. Single data point per run. Episode count is `--n_final_eval_episodes` (default **50** for newer scripts; older runs default to 20).
+
+For every `rwd_diag/*` metric the wrapper emits, the collector logs **two keys**: the mean (`final_eval/<metric>`) and the std (`final_eval/<metric>__std`). The std is what tells you if a policy is bimodal — averaging a 50% success rate looks identical for "always 50% confident" vs "0% on half the episodes, 100% on the other half", but the std distinguishes them.
 
 | Chart | What it is |
 |---|---|
-| `final_eval/success_rate` | The **paper number**: 20-episode deterministic success rate. |
-| `final_eval/mean_reward` | Mean episode return over those 20 eps |
+| `final_eval/success_rate` | The **paper number**: deterministic success rate over the eval set. |
+| `final_eval/mean_reward` | Mean episode return over the eval set. |
 | `final_eval/std_reward` | Stddev — if huge, the policy is bimodal (sometimes solves it, sometimes whiffs catastrophically). |
-| `final_eval/n_episodes` | Always = `--n_final_eval_episodes` (default 20). |
-| `final_eval/task/adaptive_dist` | Mean final distance over the 20 eval eps. |
-| `final_eval/success/{base,adaptive,disagree,active}_rate` | Same fields as `rwd_diag/success/*`, but specifically over the 20 final-eval episodes. |
-| `final_eval/reward/*` | Same as `rwd_diag/reward/*` but over final-eval. |
+| `final_eval/n_episodes` | Always = `--n_final_eval_episodes`. |
+| `final_eval/task/adaptive_dist` and `..._dist__std` | Mean & stddev of final hole→goal distance over the eval set. |
+| `final_eval/task/{adaptive_thresh,hole_radius}` (+ `__std`) | Eval-set means of geometric state. |
+| `final_eval/success/{base,adaptive,disagree,active}_rate` (+ `__std`) | Same fields as `success/*`, but specifically over the eval set. |
+| `final_eval/reward/{episode_total, base_sum, vel_penalty_sum, action_penalty_sum, pre_settle_penalty, terminal_base, terminal_shaping, episode_length}` (+ `__std`) | Same fields as `reward/*` but over the eval set. |
 
 ### `args` — config dump (no chart, sidebar only)
 
@@ -167,7 +181,7 @@ Top right of any chart → "Edit panel" → "Edit X-axis" (or change globally vi
 
 SB3 1.2.0's SAC internally logs `time/episodes` and `time/total timesteps` with `exclude="tensorboard"`, which means they never reach the TB events file and (because wandb syncs from TB) they never reach wandb either. So those metrics simply don't exist on the wandb side, even though they show up nicely formatted in your stdout dump tables. Our `train/episodes_total` is the workaround — same content, logged **on every env step** via `RewardDiagnosticsCallback` → TensorBoard → wandb sync so it appears on the same global-step rows as `train/critic_loss` etc. Without that per-step mirror, wandb could only see `train/episodes_total` on episode-completion steps if we used `wandb.log` alone, and choosing it as the chart X-axis would show **no data** for dense metrics (nothing to join). If you still see "no data", refresh the run page after ~1 episode (~200 steps post-reset) and confirm `train/episodes_total` appears under the run's **Scalars** / metric search.
 
-Set the **smoothing slider** to ~0.7 globally for the noisy episode-level charts (`rollout/*`, `rwd_diag/*`). For the per-update `train/*` charts, lower smoothing is fine since they're already aggregated by SB3. SAC logs every gradient update so they're dense. **Set smoothing to 0** on `last_episode/*` and `train/cumulative_successes` — those are exactly the charts where you want to see individual episode events sharply.
+Set the **smoothing slider** to ~0.7 globally for the noisy episode-level charts (`rollout/*`, `reward/*`, `success/*`, `task/*`). For the per-update `train/*` charts, lower smoothing is fine since they're already aggregated by SB3. SAC logs every gradient update so they're dense. **Set smoothing to 0** on `last_episode/*` and `train/cumulative_successes` — those are exactly the charts where you want to see individual episode events sharply.
 
 ---
 
@@ -194,7 +208,7 @@ This is where the run is most likely to silently fail.
 | First success at step 1–2k (BC), then `last_episode/success` flatlines at 0 for thousands of episodes after `ent_coef` falls below 0.01 | The "ent_coef collapse" — auto-entropy commits to whatever the BC seed pointed at and stops exploring. Confirmed seen in privileged hole_centroid SAC at ~step 240k. | Kill. Re-run with `--ent_coef 0.2 --log_std_init -2`. Pinning entropy prevents the collapse; lower log_std init makes BC immediately useful. |
 
 What you want to see:
-- `rwd_diag/task/adaptive_dist` starting to drop (this is the very first sign of learning, before success_rate moves)
+- `task/adaptive_dist` starting to drop (this is the very first sign of learning, before success_rate moves)
 - `train/critic_loss` rising then leveling off (typical: ramps to 50–200 by step 50k, then flat)
 - `train/ent_coef` slowly decaying (0.5 → 0.2 over 50k steps)
 
@@ -202,7 +216,7 @@ What you want to see:
 
 You should be seeing the success rate climb in this window. Specifically:
 
-- By step **200k**: `eval/success_rate` should be at least 5–10%, `rwd_diag/task/adaptive_dist` clearly below `adaptive_thresh`
+- By step **200k**: `eval/success_rate` should be at least 5–10%, `task/adaptive_dist` clearly below `task/adaptive_thresh`
 - By step **500k**: `eval/success_rate` ≥ 30% if the run is going to converge
 
 If at 300k your `adaptive_dist` is flat AND `eval/success_rate` is stuck at <5%, the run is stuck in a local minimum and won't recover — kill it.
@@ -221,9 +235,9 @@ If at 300k your `adaptive_dist` is flat AND `eval/success_rate` is stuck at <5%,
 
 In the wandb run page, click the ⚙️ next to the workspace name and create three sections:
 
-1. **Headline** — drag in `eval/success_rate`, `train/cumulative_successes`, `last_episode/success`, `rwd_diag/task/adaptive_dist`, `eval/video`. This is the only section you need to look at most of the time. Set workspace X-axis to `train/episodes_total`. Set smoothing to 0 for `last_episode/*` and `train/cumulative_successes`; ~0.7 for the rest.
+1. **Headline** — drag in `eval/success_rate`, `train/cumulative_successes`, `last_episode/success`, `task/adaptive_dist`, `eval/video`. This is the only section you need to look at most of the time. Set workspace X-axis to `train/episodes_total`. Set smoothing to 0 for `last_episode/*` and `train/cumulative_successes`; ~0.7 for the rest.
 2. **Health** — drag in `train/critic_loss`, `train/ent_coef`, `train/actor_loss`, `time/fps`. Glance once an hour. **`train/ent_coef` is the canary** — if it drops below 0.01 the run is collapsing, kill it.
-3. **Decomposition** — drag in `rwd_diag/reward/*` charts plus `last_episode/dist`, `last_episode/episode_length`. Look at this only when something looks weird in **Headline**.
+3. **Decomposition** — drag in `reward/*` charts (`episode_total`, `base_sum`, `vel_penalty_sum`, `action_penalty_sum`, `pre_settle_penalty`, `terminal_base`, `terminal_shaping`) plus `last_episode/dist`, `last_episode/episode_length`. Look at this only when something looks weird in **Headline**, or when you turn on a new shaping knob and want to confirm it's actually firing at the magnitude you expected.
 
 The default wandb panel layout dumps everything alphabetically and is genuinely hard to read on small screens. The 3-section setup pays for itself within the first run.
 

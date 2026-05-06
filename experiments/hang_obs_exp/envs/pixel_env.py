@@ -52,7 +52,9 @@ class PixelObsWrapper(gym.Wrapper):
                  success_factor: float = None,
                  success_bonus: float = 0.0,
                  fail_penalty: float = 0.0,
-                 vel_penalty: float = 0.0):
+                 vel_penalty: float = 0.0,
+                 action_penalty: float = 0.0,
+                 pre_settle_coef: float = 0.0):
         # Force the camera + uint8 pixel mode dedo expects for SB3 CnnPolicy.
         env.args.cam_resolution = cam_resolution
         env.args.uint8_pixels = True
@@ -67,6 +69,8 @@ class PixelObsWrapper(gym.Wrapper):
         self._success_bonus = float(success_bonus)
         self._fail_penalty = float(fail_penalty)
         self._vel_penalty = float(vel_penalty)
+        self._action_penalty = float(action_penalty)
+        self._pre_settle_coef = float(pre_settle_coef)
         self._prev_verts = None
 
         self._hole_vertex_indices = []
@@ -76,7 +80,8 @@ class PixelObsWrapper(gym.Wrapper):
         # Per-episode reward bookkeeping for the diagnostics callback.
         self._ep_step_count = 0
         self._ep_base_reward_sum = 0.0
-        self._ep_vel_penalty_sum = 0.0  # accumulates magnitude (>= 0)
+        self._ep_vel_penalty_sum = 0.0      # accumulates magnitude (>= 0)
+        self._ep_action_penalty_sum = 0.0   # accumulates magnitude (>= 0)
 
         # Resolve the actual DeformEnv once for sim/mesh access. Anything
         # wrapped between us and DeformEnv (e.g. RetryResetEnv) blocks
@@ -159,6 +164,7 @@ class PixelObsWrapper(gym.Wrapper):
         self._ep_step_count = 0
         self._ep_base_reward_sum = 0.0
         self._ep_vel_penalty_sum = 0.0
+        self._ep_action_penalty_sum = 0.0
         return self._wrap_obs(raw_obs)
 
     def step(self, action):
@@ -167,6 +173,20 @@ class PixelObsWrapper(gym.Wrapper):
 
         base_reward = float(reward)
         base_is_success = info.get('is_success', None)
+
+        # ------------------------------------------------------------------
+        # Action-magnitude penalty (every step including terminal). Mirrors
+        # PrivilegedObsWrapper so the same coef means the same thing across
+        # obs modes.
+        # ------------------------------------------------------------------
+        act_pen = 0.0
+        if self._action_penalty > 0.0:
+            a = np.asarray(action, dtype=np.float32)
+            act_cost = float(np.mean(a * a))
+            act_pen = self._action_penalty * act_cost
+            reward = float(reward) - act_pen
+            info['action_penalty'] = act_pen
+            info['action_cost'] = act_cost
 
         # ------------------------------------------------------------------
         # Cloth-velocity penalty (non-terminal only). Mirrors
@@ -185,10 +205,23 @@ class PixelObsWrapper(gym.Wrapper):
                 if len(disp) > 0:
                     mean_speed = float(disp.mean())
                     vel_pen = self._vel_penalty * mean_speed
-                    reward = base_reward - vel_pen
+                    reward = float(reward) - vel_pen
                     info['vel_penalty'] = vel_pen
                     info['cloth_mean_speed'] = mean_speed
             self._prev_verts = verts_now
+
+        # ------------------------------------------------------------------
+        # Pre-settle distance penalty (terminal only). Counters the
+        # "lift high, drop straight down" exploit by rewarding only
+        # positions reached via control.
+        # ------------------------------------------------------------------
+        pre_settle_pen = 0.0
+        if (done and self._pre_settle_coef > 0.0
+                and 'pre_settle_dist_m' in info):
+            pre_dist = float(info['pre_settle_dist_m'])
+            pre_settle_pen = self._pre_settle_coef * pre_dist
+            reward = float(reward) - pre_settle_pen
+            info['pre_settle_penalty'] = pre_settle_pen
 
         # ------------------------------------------------------------------
         # Adaptive success override + terminal shaping (identical logic to
@@ -234,6 +267,7 @@ class PixelObsWrapper(gym.Wrapper):
         self._ep_step_count += 1
         self._ep_base_reward_sum += base_reward
         self._ep_vel_penalty_sum += vel_pen
+        self._ep_action_penalty_sum += act_pen
 
         if done:
             self._emit_episode_diagnostics(
@@ -245,6 +279,7 @@ class PixelObsWrapper(gym.Wrapper):
                 adaptive_is_success=adaptive_is_success,
                 adaptive_dist=adaptive_dist,
                 adaptive_thresh=adaptive_thresh,
+                pre_settle_pen=pre_settle_pen,
             )
 
         return obs, reward, done, info
@@ -256,17 +291,23 @@ class PixelObsWrapper(gym.Wrapper):
                                   terminal_base, terminal_shaping,
                                   total_reward,
                                   base_is_success, adaptive_is_success,
-                                  adaptive_dist, adaptive_thresh):
+                                  adaptive_dist, adaptive_thresh,
+                                  pre_settle_pen=0.0):
         info['rwd_diag/reward/episode_total'] = float(
             self._ep_base_reward_sum
             - self._ep_vel_penalty_sum
+            - self._ep_action_penalty_sum
             + terminal_shaping
+            - pre_settle_pen
         )
         info['rwd_diag/reward/base_sum'] = float(self._ep_base_reward_sum)
         info['rwd_diag/reward/vel_penalty_sum'] = float(
             self._ep_vel_penalty_sum)
+        info['rwd_diag/reward/action_penalty_sum'] = float(
+            self._ep_action_penalty_sum)
         info['rwd_diag/reward/terminal_base'] = float(terminal_base)
         info['rwd_diag/reward/terminal_shaping'] = float(terminal_shaping)
+        info['rwd_diag/reward/pre_settle_penalty'] = float(pre_settle_pen)
         info['rwd_diag/reward/episode_length'] = int(self._ep_step_count)
 
         if base_is_success is not None:

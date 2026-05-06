@@ -150,6 +150,20 @@ parser.add_argument('--vel_penalty', type=float, default=0.0,
                          'Same knob and meaning as train_privileged.py '
                          '(PPO) so SAC and PPO runs can be compared on '
                          'identical reward functions. 0 = off.')
+parser.add_argument('--action_penalty', type=float, default=0.0,
+                    help='Per-step penalty on action magnitude. '
+                         'reward -= action_penalty * mean(action**2). '
+                         'Action is in [-1, 1]^6 so mean(a**2) is in '
+                         '[0, 1]; coefs ~0.1-2 give per-step penalties '
+                         'comparable to vel_penalty. Discourages bang-'
+                         'bang/flailing control. 0 = off.')
+parser.add_argument('--pre_settle_coef', type=float, default=0.0,
+                    help='Linear penalty on hole-to-goal distance (m) at '
+                         'policy handoff, BEFORE the gravity settle. '
+                         'reward -= pre_settle_coef * pre_settle_dist_m. '
+                         'Counters the "lift cloth high, let gravity drop '
+                         'it onto the hanger" exploit. 0 = off; start '
+                         'at 20.')
 # BC pretrain.
 parser.add_argument('--bc_episodes', type=int, default=0,
                     help='If >0 and --bc_demo_path not set: target '
@@ -255,7 +269,9 @@ def make_wrapped_env(args, obs_mode_str, monitor_dir=None):
                                     success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
-                                    vel_penalty=extra_args.vel_penalty)
+                                    vel_penalty=extra_args.vel_penalty,
+                                    action_penalty=extra_args.action_penalty,
+                                    pre_settle_coef=extra_args.pre_settle_coef)
         env = Monitor(env, filename=monitor_dir)
         return env
     return _init
@@ -279,7 +295,9 @@ eval_env_raw = PrivilegedObsWrapper(eval_env_raw, obs_mode=obs_mode,
                                      success_factor=extra_args.success_factor,
                                      success_bonus=extra_args.success_bonus,
                                      fail_penalty=extra_args.fail_penalty,
-                                     vel_penalty=extra_args.vel_penalty)
+                                     vel_penalty=extra_args.vel_penalty,
+                                     action_penalty=extra_args.action_penalty,
+                                     pre_settle_coef=extra_args.pre_settle_coef)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -320,14 +338,19 @@ if dedo_args.use_wandb:
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
         vp = extra_args.vel_penalty
+        ap = extra_args.action_penalty
+        psc = extra_args.pre_settle_coef
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
         vp_tag = f'_vp{vp:g}' if vp else ''
+        ap_tag = f'_ap{ap:g}' if ap else ''
+        psc_tag = f'_psc{psc:g}' if psc else ''
         bc_tag = ('_bc' if (extra_args.bc_demo_path or
                             extra_args.bc_episodes > 0) else '')
         wandb.run.name = (f'{wandb.run.name}_sac_256x256'
-                          f'{sf_tag}{sb_tag}{fp_tag}{vp_tag}{bc_tag}')
+                          f'{sf_tag}{sb_tag}{fp_tag}{vp_tag}'
+                          f'{ap_tag}{psc_tag}{bc_tag}')
         wandb.run.tags = list(wandb.run.tags or []) + [
             'algo=sac',
             f'obs_mode={obs_mode}',
@@ -335,6 +358,8 @@ if dedo_args.use_wandb:
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
             f'vel_penalty={vp}',
+            f'action_penalty={ap}',
+            f'pre_settle_coef={psc}',
             f'bc={"yes" if bc_tag else "no"}',
         ]
 
@@ -485,6 +510,10 @@ if extra_args.fail_penalty:
     _video_basename += f'_fp{extra_args.fail_penalty:g}'
 if extra_args.vel_penalty:
     _video_basename += f'_vp{extra_args.vel_penalty:g}'
+if extra_args.action_penalty:
+    _video_basename += f'_ap{extra_args.action_penalty:g}'
+if extra_args.pre_settle_coef:
+    _video_basename += f'_psc{extra_args.pre_settle_coef:g}'
 _video_basename += f'_seed{extra_args.seed}'
 video_cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                              num_steps_between_save=num_steps_between_save,
@@ -529,7 +558,8 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
     raw = PrivilegedObsWrapper(raw, obs_mode=obs_mode_str,
                                 success_factor=extra_args.success_factor,
                                 success_bonus=0.0, fail_penalty=0.0,
-                                vel_penalty=0.0)
+                                vel_penalty=0.0,
+                                action_penalty=0.0, pre_settle_coef=0.0)
     raw.seed(args.seed + 1000)
 
     if save_dir is not None:
