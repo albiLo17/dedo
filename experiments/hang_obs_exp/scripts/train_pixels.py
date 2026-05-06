@@ -242,6 +242,10 @@ extra_args, remaining = parser.parse_known_args()
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
 
+# Parse net_arch up front so it's available when wandb.run.name is built
+# below (which happens before policy construction).
+_net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
+
 # Parse max_act_vel into None | 'auto' | float. Explicit floats patch
 # now; 'auto' defers until after dedo_args is built so we can probe via
 # real cloth resets. See train_privileged.py for full discussion.
@@ -442,8 +446,9 @@ if dedo_args.use_wandb:
         ap_tag = f'_ap{ap:g}' if ap else ''
         psc_tag = f'_psc{psc:g}' if psc else ''
         grip_tag = '_grip' if not extra_args.no_grip else '_pix'
+        net_tag = '_net' + 'x'.join(str(s) for s in _net_arch_list)
         wandb.run.name = (f'{wandb.run.name}_pixels'
-                          f'{extra_args.cam_resolution}{grip_tag}'
+                          f'{extra_args.cam_resolution}{grip_tag}{net_tag}'
                           f'{sf_tag}{sb_tag}{fp_tag}{vp_tag}{ap_tag}{psc_tag}')
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pixels',
@@ -466,7 +471,6 @@ if dedo_args.use_wandb:
 # IMPALA-CNN or similar.
 # ---------------------------------------------------------------------------
 policy_name = 'MultiInputPolicy' if not extra_args.no_grip else 'CnnPolicy'
-_net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
 policy_kwargs = dict(net_arch=_net_arch_list)
 print(f'[init] policy net_arch (post-CNN) = {_net_arch_list}')
 if extra_args.log_std_init is not None:

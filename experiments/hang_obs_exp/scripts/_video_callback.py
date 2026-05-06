@@ -285,17 +285,25 @@ class HangVideoCallback(BaseCallback):
         if not screens:
             return True
 
-        # Save mp4 to disk with a descriptive filename.
+        # Save mp4 to disk with a descriptive filename. Encode H.264 via
+        # imageio_ffmpeg's bundled static ffmpeg — cv2's mp4v fourcc
+        # produces an mpeg4-Simple-Profile stream that the wandb HTML5
+        # player (and most browsers) can't decode, which makes uploaded
+        # videos sit on "loading" forever. yuv420p + +faststart are the
+        # two extra knobs needed for browser playback to start before the
+        # whole file has downloaded.
         h, w = screens[0].shape[:2]
         video_path = os.path.join(
             self._logdir,
             f'{self._video_basename}_step{self.num_timesteps:08d}.mp4')
-        writer = cv2.VideoWriter(
-            video_path, cv2.VideoWriter_fourcc(*'mp4v'),
-            self._video_fps, (w, h))
+        import imageio
+        writer = imageio.get_writer(
+            video_path, fps=self._video_fps, codec='libx264', quality=8,
+            macro_block_size=2, pixelformat='yuv420p',
+            ffmpeg_params=['-movflags', '+faststart'])
         for frame in screens:
-            writer.write(np.ascontiguousarray(frame[..., ::-1]))  # RGB->BGR
-        writer.release()
+            writer.append_data(np.ascontiguousarray(frame))  # RGB
+        writer.close()
 
         # Prefer logging directly to wandb so the media file inherits the
         # run name and our caption. Otherwise fall back to the SB3

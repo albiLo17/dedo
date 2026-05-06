@@ -10,6 +10,9 @@
 #
 # Total CPU pressure with OMP_NUM_THREADS=2: ~9 cores. Comfortable.
 #
+# NOTE (2026-05-06): runs are being launched manually on the L4 instead;
+# this script is kept as a reference for the run definitions only.
+#
 # Run from repo root:  bash experiments/hang_obs_exp/scripts/launch_m4.sh
 set -euo pipefail
 

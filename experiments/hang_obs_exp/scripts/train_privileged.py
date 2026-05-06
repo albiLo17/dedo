@@ -147,6 +147,33 @@ parser.add_argument('--critic_warmup_rollouts', type=int, default=0,
                          'disables the warmup. With n_steps=4096 num_envs=4, '
                          'one rollout = 16384 env steps, so 2 = ~32k '
                          'frozen-actor steps.')
+parser.add_argument('--ppo_clip_range', type=float, default=0.2,
+                    help='PPO probability-ratio clip. SB3 default 0.2 '
+                         'allows up to 20%% per-step probability shift '
+                         'every gradient update, and with n_epochs=10 '
+                         'and a 16384-sample rollout that is 640 updates '
+                         'per rollout — enough to walk the actor '
+                         'arbitrarily far from BC even with low lr. Try '
+                         '0.05-0.1 when BC is on and the post-warmup '
+                         'erasure pattern (eval/success_rate falling '
+                         'from BC level to ~0) shows up.')
+parser.add_argument('--ppo_epochs', type=int, default=10,
+                    help='PPO gradient epochs per rollout. SB3 default '
+                         '10. Each epoch is a full pass over n_steps * '
+                         'num_envs samples in batches of batch_size; '
+                         'fewer epochs = fewer gradient steps per '
+                         'rollout = less per-rollout drift from the '
+                         'BC-warmstarted actor. Try 3-5 when BC erasure '
+                         'is the failure mode.')
+parser.add_argument('--ppo_target_kl', type=float, default=None,
+                    help='PPO early-stop threshold on KL-to-previous-'
+                         'policy. SB3 default None (no early stop). '
+                         'When set, PPO terminates the n_epochs gradient '
+                         'pass once the rolling-batch KL exceeds this '
+                         'value — so a single rollout cannot move the '
+                         'actor more than ~target_kl away. Soft '
+                         'complement to clip_range; recommended 0.01-0.03 '
+                         'when BC is on. None disables.')
 parser.add_argument('--log_std_init', type=float, default=None,
                     help='Initial log_std for the PPO actor head. SB3 '
                          'default is 0.0 (std=1.0 in pre-clip space). '
@@ -262,6 +289,10 @@ extra_args, remaining = parser.parse_known_args()
 # (env factory, eval env, demo collector, banner, wandb tags).
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
+
+# Parse net_arch up front so it's available when wandb.run.name is
+# built (which happens before policy construction below).
+_net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
 
 # Parse the max_act_vel knob into a tag (None | 'auto' | float). Explicit
 # floats patch DeformEnv.MAX_ACT_VEL immediately; 'auto' defers until after
@@ -462,8 +493,9 @@ if dedo_args.use_wandb:
         vp_tag = f'_vp{vp:g}' if vp else ''
         ap_tag = f'_ap{ap:g}' if ap else ''
         psc_tag = f'_psc{psc:g}' if psc else ''
+        net_tag = '_' + 'x'.join(str(s) for s in _net_arch_list)
         wandb.run.name = (
-            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}{ap_tag}{psc_tag}')
+            f'{wandb.run.name}{net_tag}{sf_tag}{sb_tag}{fp_tag}{vp_tag}{ap_tag}{psc_tag}')
         wandb.run.tags = list(wandb.run.tags or []) + [
             f'success_factor={sf if sf is not None else "default"}',
             f'success_bonus={sb}',
@@ -474,7 +506,6 @@ if dedo_args.use_wandb:
             f'obs_mode={obs_mode}',
         ]
 
-_net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
 _policy_kwargs = dict(net_arch=_net_arch_list)
 print(f'[init] policy net_arch = {_net_arch_list}')
 if extra_args.log_std_init is not None:
@@ -494,10 +525,13 @@ rl_kwargs = {
     # More samples per update for smoother gradients (4 envs * 4096 = 16384).
     'n_steps': 4096,
     'batch_size': 256,
-    'n_epochs': 10,
+    'n_epochs': int(extra_args.ppo_epochs),
     'gae_lambda': 0.95,
     'gamma': 0.99,
     'ent_coef': float(extra_args.ent_coef),
+    'clip_range': float(extra_args.ppo_clip_range),
+    'target_kl': (None if extra_args.ppo_target_kl is None
+                  else float(extra_args.ppo_target_kl)),
 }
 _resuming = bool(extra_args.load_checkpoint)
 if _resuming:
