@@ -93,6 +93,7 @@ print(f'[view_demo] success criterion: '
       f'{"adaptive (sf=" + str(sf) + " * hole_radius)" if sf is not None else "dedo fixed 0.125 m"}')
 
 n_success = 0
+peaks = []
 for ep in range(extra.num_episodes):
     obs = env.reset()
 
@@ -115,6 +116,10 @@ for ep in range(extra.num_episodes):
                           anchor_idx=1, ctrl_freq=ctrl_freq, robot=None)
     traj = merge_traj(vel_a, vel_b)
     last = np.zeros_like(traj[0])
+
+    # Peak |vel| this episode (in m/s — matches build_traj output units).
+    ep_peak = float(np.abs(traj).max())
+    peaks.append(ep_peak)
 
     vidwriter = None
     if extra.cam_resolution > 0:
@@ -149,8 +154,21 @@ for ep in range(extra.num_episodes):
     if sf is not None and env.hole_radius is not None:
         extra_info = (f'  hole_r={env.hole_radius:.3f}m  '
                       f'thresh<{env.success_threshold_m:.3f}m')
-    print(f'[ep {ep+1}] reward={ep_rwd:.2f}  success={ep_success}{extra_info}')
+    print(f'[ep {ep+1}] reward={ep_rwd:.2f}  success={ep_success}  '
+          f'peak|vel|={ep_peak:.3f} m/s{extra_info}')
 
 print(f'\nDone — {n_success}/{extra.num_episodes} demos succeeded '
       f'({100.0 * n_success / max(extra.num_episodes, 1):.1f}%).')
+if peaks:
+    _global_peak = max(peaks)
+    _suggested = float(np.ceil(_global_peak * 1.2 * 10) / 10)
+    print(f'\n[velocity-audit]')
+    print(f'  Per-episode peak |vel|: '
+          f'{[f"{p:.3f}" for p in peaks]}')
+    print(f'  Global peak across {len(peaks)} episodes: '
+          f'{_global_peak:.3f} m/s')
+    print(f'  Recommended --max_act_vel = {_suggested:.1f}  '
+          f'(global peak * 1.2 safety, rounded up to 0.1)')
+    print(f'  Pass this to train_*.py for all runs to keep MAX_ACT_VEL '
+          f'identical and demos in-range.')
 env.close()

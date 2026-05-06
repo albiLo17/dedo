@@ -137,3 +137,52 @@ def build_hole_aware_waypoints(underlying):
         [*grip_target(hole_hold, delta_b), 0.6],
     ]
     return {'a': wp_a, 'b': wp_b}
+
+
+def probe_peak_demo_vel(dedo_args, n_probes=3, max_attempts=12):
+    """Probe scripted-demo trajectories without stepping the env to find
+    the peak |velocity| the waypoint controller demands. Used to size
+    DeformEnv.MAX_ACT_VEL safely from above so the demo collector's
+    `clip(act / MAX_ACT_VEL, -1, 1)` round-trip never saturates and
+    silently breaks demos.
+
+    Returns peak m/s across up to n_probes successful build_traj calls
+    on freshly-reset cloths, or None if all probes failed.
+    """
+    from copy import deepcopy
+    from dedo.envs.deform_env import DeformEnv
+    from dedo.demo_preset import build_traj, merge_traj
+
+    args = deepcopy(dedo_args)
+    args.debug = False
+    args.viz = False
+    env = gym.make(args.env, args=args)
+    env = RetryResetEnv(env)
+    env.seed(args.seed + 7777)
+    ctrl_freq = args.sim_freq / args.sim_steps_per_action
+
+    peaks = []
+    attempts = 0
+    while len(peaks) < n_probes and attempts < max_attempts:
+        attempts += 1
+        env.reset()
+        underlying = env
+        while hasattr(underlying, 'env'):
+            underlying = underlying.env
+            if isinstance(underlying, DeformEnv):
+                break
+        wp = build_hole_aware_waypoints(underlying)
+        if wp is None:
+            continue
+        try:
+            _, va = build_traj(underlying, wp, 'a', anchor_idx=0,
+                               ctrl_freq=ctrl_freq, robot=None)
+            _, vb = build_traj(underlying, wp, 'b', anchor_idx=1,
+                               ctrl_freq=ctrl_freq, robot=None)
+            traj = merge_traj(va, vb)
+        except Exception:
+            continue
+        peaks.append(float(np.abs(traj).max()))
+
+    env.close()
+    return max(peaks) if peaks else None

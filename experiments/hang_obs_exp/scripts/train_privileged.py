@@ -35,8 +35,10 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
+from _helpers import (RetryResetEnv, build_hole_aware_waypoints,  # noqa: E402
+                      probe_peak_demo_vel)
 from _video_callback import HangVideoCallback  # noqa: E402
+from _critic_warmup import PPOCriticWarmupCallback  # noqa: E402
 from _reward_diagnostics import (  # noqa: E402
     RewardDiagnosticsCallback, dump_run_config, make_final_eval_collector,
     log_final_eval_metrics)
@@ -101,6 +103,32 @@ parser.add_argument('--log_save_interval', type=int, default=50,
                          'Default 50 → checkpoint @ 25k / eval @ 50k / '
                          'video @ 100k. Try 20 for ~2.5x faster '
                          'feedback during early training.')
+parser.add_argument('--max_act_vel', type=str, default=None,
+                    help='Override DeformEnv.MAX_ACT_VEL (m/s). Dedo '
+                         'default is 10.0, but the scripted controller '
+                         'RMS velocity is ~0.3 m/s, so demo actions '
+                         'normalized by 10 land at RMS 0.03 in [-1, 1] '
+                         '— only ~3%% of the action space is used. '
+                         'Pass "auto" to probe 3 cloths and pick MAX_ACT_VEL '
+                         '= peak * 1.2 (recommended). Or pass a float; '
+                         'CAUTION: a value below the trajectory peak '
+                         '(typically 1-3 m/s in the lift/thread phase) '
+                         'silently breaks demos because '
+                         'clip(act/MAX_ACT_VEL, -1, 1) saturates and the '
+                         'gripper can\'t keep up. Watch the [BC] traj '
+                         'peak |vel| diagnostic on attempt 1. None '
+                         '(default) leaves dedo unchanged.')
+parser.add_argument('--critic_warmup_rollouts', type=int, default=0,
+                    help='Freeze the actor (mu head + log_std + actor '
+                         'MLP trunk) for the first N PPO rollouts so '
+                         'the value head can converge on noisy initial '
+                         'returns BEFORE the actor moves. Prevents BC '
+                         'erasure: with random V(s), the first 1-2 PPO '
+                         'updates push mu in noise directions and erase '
+                         'BC. Recommended 2 when BC is on; 0 (default) '
+                         'disables the warmup. With n_steps=4096 num_envs=4, '
+                         'one rollout = 16384 env steps, so 2 = ~32k '
+                         'frozen-actor steps.')
 parser.add_argument('--log_std_init', type=float, default=None,
                     help='Initial log_std for the PPO actor head. SB3 '
                          'default is 0.0 (std=1.0 in pre-clip space). '
@@ -217,6 +245,25 @@ extra_args, remaining = parser.parse_known_args()
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
 
+# Parse the max_act_vel knob into a tag (None | 'auto' | float). Explicit
+# floats patch DeformEnv.MAX_ACT_VEL immediately; 'auto' defers until after
+# dedo_args is built so we can run a probe through real cloth resets. Reads
+# of DeformEnv.MAX_ACT_VEL are dynamic (unscale_vel and the demo collector
+# look it up per call), so a single class-attribute write propagates
+# everywhere consistently.
+_mav_arg = extra_args.max_act_vel
+if _mav_arg is None or str(_mav_arg).lower() in ('none', ''):
+    _mav_mode = None
+elif str(_mav_arg).lower() == 'auto':
+    _mav_mode = 'auto'
+else:
+    _mav_mode = float(_mav_arg)
+    from dedo.envs.deform_env import DeformEnv as _DeformEnvForPatch
+    _orig_max_act_vel = _DeformEnvForPatch.MAX_ACT_VEL
+    _DeformEnvForPatch.MAX_ACT_VEL = _mav_mode
+    print(f'[init] DeformEnv.MAX_ACT_VEL: {_orig_max_act_vel} -> '
+          f'{_DeformEnvForPatch.MAX_ACT_VEL}')
+
 # Single source of truth: `extra_args.success_factor` flows into the
 # training env, the eval env, AND the BC scripted-demo collection env
 # below — so `info['is_success']` is identical across all three. When
@@ -268,6 +315,29 @@ dedo_args.logdir = logdir_base
 
 np.random.seed(dedo_args.seed)
 torch.manual_seed(dedo_args.seed)
+
+
+# Auto-probe MAX_ACT_VEL if requested. Builds 3 cloths via the real
+# pipeline, runs build_traj on each, takes max |velocity|, then sizes
+# MAX_ACT_VEL = peak * 1.2 (rounded up to 0.1 m/s). This is the only
+# value that's both small enough to make demo |a| RMS meaningful in
+# [-1, 1] (improves BC SNR) and large enough to not clip the lift/thread
+# phase (which would silently break demos).
+if _mav_mode == 'auto':
+    print('[init] probing scripted-demo peak velocity (3 cloths)...')
+    _peak = probe_peak_demo_vel(dedo_args, n_probes=3)
+    if _peak is None:
+        print('[init] WARN: all probes failed; leaving MAX_ACT_VEL at '
+              'dedo default (10.0). BC will be noisy, but demos won\'t '
+              'saturate.')
+    else:
+        _new_mav = float(np.ceil(_peak * 1.2 * 10) / 10)
+        from dedo.envs.deform_env import DeformEnv as _DeformEnvForPatch
+        _orig = _DeformEnvForPatch.MAX_ACT_VEL
+        _DeformEnvForPatch.MAX_ACT_VEL = _new_mav
+        print(f'[init] DeformEnv.MAX_ACT_VEL: {_orig} -> {_new_mav} '
+              f'(peak demo |vel| = {_peak:.3f} m/s × 1.2 safety, '
+              f'rounded up to 0.1)')
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +527,10 @@ else:
     if extra_args.log_std_init is not None:
         _init_std = float(np.exp(extra_args.log_std_init))
         print(f'[init] PPO log_std_init = {extra_args.log_std_init} '
-              f'(std ≈ {_init_std:.3f}); BC mean ≈ 0.03 will be visible '
-              f'at deploy.')
+              f'(std ≈ {_init_std:.3f}). Pick this comparable to the '
+              f'demo |a| RMS so BC mu is visible at deploy; see the '
+              f'[BC] traj peak |vel| diagnostic during demo collection '
+              f'to estimate it (RMS ≈ peak / 5–10).')
 
 # Match run_rl_sb3.py PPO cadence: log_save_interval * 10 * 50.
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
@@ -486,7 +558,13 @@ video_cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                              eval_seed_lock=extra_args.eval_seed_lock,
                              eval_seed=dedo_args.seed + 9999)
 diag_cb = RewardDiagnosticsCallback(window=100)
-cb = CallbackList([video_cb, diag_cb])
+_cbs = [video_cb, diag_cb]
+# Critic warmup: only on a fresh run (saved checkpoints already have a
+# trained critic; warmup would needlessly freeze the actor again).
+if not _resuming and extra_args.critic_warmup_rollouts > 0:
+    _cbs.append(PPOCriticWarmupCallback(
+        n_warmup_rollouts=extra_args.critic_warmup_rollouts))
+cb = CallbackList(_cbs)
 
 # Persist a self-describing config.json + push to wandb.config so future
 # debugging never has to guess what reward this run optimized.
@@ -575,6 +653,19 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
             print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
                   f'build_traj failed ({e!r}), retrying')
             continue
+
+        # Diagnostic: peak waypoint velocity vs the active MAX_ACT_VEL.
+        # If peak > MAX_ACT_VEL, the action `np.clip(traj/MAX_ACT_VEL, -1, 1)`
+        # saturates and the gripper can't keep up with the trajectory,
+        # which silently turns "scripted demo" into "scripted demo that
+        # always fails because the lift phase moves at the cap, not the
+        # required speed". Print on first attempt only.
+        if attempts == 1:
+            _peak = float(np.abs(traj).max())
+            _mav = float(DeformEnv.MAX_ACT_VEL)
+            _flag = ' <- TOO LOW, demos will saturate' if _peak > _mav else ''
+            print(f'[BC] traj peak |vel| = {_peak:.3f} m/s; '
+                  f'MAX_ACT_VEL = {_mav:.3f} m/s{_flag}')
 
         last_action = np.zeros_like(traj[0])
         ep_obs, ep_act = [], []

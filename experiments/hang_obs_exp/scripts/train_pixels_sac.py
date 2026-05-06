@@ -44,8 +44,10 @@ from stable_baselines3.common.vec_env import VecNormalize, VecTransposeImage
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
+from _helpers import (RetryResetEnv, build_hole_aware_waypoints,  # noqa: E402
+                      probe_peak_demo_vel)
 from _video_callback import HangVideoCallback  # noqa: E402
+from _critic_warmup import SACCriticWarmupCallback  # noqa: E402
 from _reward_diagnostics import (  # noqa: E402
     RewardDiagnosticsCallback, dump_run_config, make_final_eval_collector,
     log_final_eval_metrics)
@@ -124,6 +126,24 @@ parser.add_argument('--gradient_steps', type=int, default=1,
 parser.add_argument('--ent_coef', type=str, default='auto',
                     help='SAC entropy coef. "auto" = auto-tuned, or a '
                          'float string like "0.1".')
+parser.add_argument('--max_act_vel', type=str, default=None,
+                    help='Override DeformEnv.MAX_ACT_VEL (m/s). Pass '
+                         '"auto" to probe and pick peak * 1.2. Or pass a '
+                         'float — values below the trajectory peak '
+                         '(typically 1-3 m/s) silently break demos. None '
+                         '(default) leaves dedo at 10.0. See '
+                         'train_privileged.py for full discussion.')
+parser.add_argument('--critic_warmup_steps', type=int, default=0,
+                    help='Freeze actor for N env steps after '
+                         'learning_starts so Q networks can stabilize '
+                         'before the actor moves. Prevents BC erasure: '
+                         'with random Q the actor would be pushed in '
+                         'noise directions. Recommended 10000 when BC '
+                         'is on; 0 (default) disables. SAC uses '
+                         'separate features extractors for actor/critic '
+                         '(default share_features_extractor=False), so '
+                         'freezing policy.actor cleanly isolates it '
+                         'including its CNN.')
 parser.add_argument('--log_std_init', type=float, default=None,
                     help='Initial log_std for the SAC actor head. SB3 SAC '
                          '(non-SDE) builds log_std as nn.Linear with '
@@ -206,6 +226,20 @@ extra_args, remaining = parser.parse_known_args()
 if extra_args.no_adaptive_success:
     extra_args.success_factor = None
 
+# Parse max_act_vel into None | 'auto' | float. See train_privileged.py.
+_mav_arg = extra_args.max_act_vel
+if _mav_arg is None or str(_mav_arg).lower() in ('none', ''):
+    _mav_mode = None
+elif str(_mav_arg).lower() == 'auto':
+    _mav_mode = 'auto'
+else:
+    _mav_mode = float(_mav_arg)
+    from dedo.envs.deform_env import DeformEnv as _DeformEnvForPatch
+    _orig_max_act_vel = _DeformEnvForPatch.MAX_ACT_VEL
+    _DeformEnvForPatch.MAX_ACT_VEL = _mav_mode
+    print(f'[init] DeformEnv.MAX_ACT_VEL: {_orig_max_act_vel} -> '
+          f'{_DeformEnvForPatch.MAX_ACT_VEL}')
+
 # Single source of truth: `extra_args.success_factor` flows into the
 # training env, the eval env, AND the BC scripted-demo collection env
 # below — so `info['is_success']` is identical across all three. When
@@ -260,6 +294,23 @@ dedo_args.logdir = logdir_base
 
 np.random.seed(dedo_args.seed)
 torch.manual_seed(dedo_args.seed)
+
+
+# Auto-probe MAX_ACT_VEL if requested. See train_privileged.py for rationale.
+if _mav_mode == 'auto':
+    print('[init] probing scripted-demo peak velocity (3 cloths)...')
+    _peak = probe_peak_demo_vel(dedo_args, n_probes=3)
+    if _peak is None:
+        print('[init] WARN: all probes failed; leaving MAX_ACT_VEL at '
+              'dedo default (10.0).')
+    else:
+        _new_mav = float(np.ceil(_peak * 1.2 * 10) / 10)
+        from dedo.envs.deform_env import DeformEnv as _DeformEnvForPatch
+        _orig = _DeformEnvForPatch.MAX_ACT_VEL
+        _DeformEnvForPatch.MAX_ACT_VEL = _new_mav
+        print(f'[init] DeformEnv.MAX_ACT_VEL: {_orig} -> {_new_mav} '
+              f'(peak demo |vel| = {_peak:.3f} m/s × 1.2 safety, '
+              f'rounded up to 0.1)')
 
 
 # ---------------------------------------------------------------------------
@@ -479,8 +530,9 @@ else:
             agent.policy.actor.log_std.weight.zero_()
         _init_std = float(np.exp(extra_args.log_std_init))
         print(f'[init] forced actor.log_std to constant '
-              f'{extra_args.log_std_init} (std ≈ {_init_std:.3f}); '
-              f'BC mean ≈ 0.03 will be visible at deploy.')
+              f'{extra_args.log_std_init} (std ≈ {_init_std:.3f}). Pick '
+              f'this comparable to demo |a| RMS so BC mu is visible at '
+              f'deploy.')
 
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
 _sf = extra_args.success_factor
@@ -507,7 +559,11 @@ video_cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                              eval_seed_lock=extra_args.eval_seed_lock,
                              eval_seed=dedo_args.seed + 9999)
 diag_cb = RewardDiagnosticsCallback(window=100)
-cb = CallbackList([video_cb, diag_cb])
+_cbs = [video_cb, diag_cb]
+if not _resuming and extra_args.critic_warmup_steps > 0:
+    _cbs.append(SACCriticWarmupCallback(
+        n_warmup_env_steps=extra_args.critic_warmup_steps))
+cb = CallbackList(_cbs)
 
 dump_run_config(extra_args, dedo_args, dedo_args.logdir,
                 use_wandb=dedo_args.use_wandb)
@@ -578,6 +634,15 @@ def _collect_pixel_demos(args, num_episodes, only_success=False,
             _, vel_b = build_traj(underlying, preset_wp, 'b',
                                   anchor_idx=1, ctrl_freq=ctrl_freq, robot=None)
             traj = merge_traj(vel_a, vel_b)
+            # Diagnostic on first attempt only: warn if MAX_ACT_VEL is too
+            # low for the waypoint trajectory's peak speeds.
+            if attempts == 1:
+                _peak = float(np.abs(traj).max())
+                _mav = float(DeformEnv.MAX_ACT_VEL)
+                _flag = (' <- TOO LOW, demos will saturate'
+                         if _peak > _mav else '')
+                print(f'[BC] traj peak |vel| = {_peak:.3f} m/s; '
+                      f'MAX_ACT_VEL = {_mav:.3f} m/s{_flag}')
         except Exception as e:
             print(f'[BC] attempt {attempts} (kept {n_kept}/{target_kept}): '
                   f'build_traj failed ({e!r}), retrying')
