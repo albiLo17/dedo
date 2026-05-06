@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Launch overnight runs on the M4 Pro Macbook (~12 cores).
+# Launch overnight runs on the M4 Pro Macbook (~12 cores, macOS).
+# Activates the `dedo` conda env in each tmux session and uses
+# caffeinate to prevent the laptop from sleeping.
 #
 # Slots used:
 #   - Run B privileged: success_factor hypothesis            (CPU)
 #   - Run C privileged: reward-shape hypothesis              (CPU)
 #   - Run D privileged: MLP-capacity hypothesis              (CPU)
 #
-# Total CPU pressure with OMP_NUM_THREADS=2: ~3 cores × 3 = ~9 cores.
-# Comfortable on M4 Pro.
+# Total CPU pressure with OMP_NUM_THREADS=2: ~9 cores. Comfortable.
 #
 # Run from repo root:  bash experiments/hang_obs_exp/scripts/launch_m4.sh
 set -euo pipefail
@@ -15,22 +16,26 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-export OMP_NUM_THREADS=2
-export MKL_NUM_THREADS=2
+CONDA_ENV="dedo"
 
+# tmux command wrapper: spawn a login shell, set thread caps, activate
+# conda env, cd to repo root, wrap the python invocation in caffeinate
+# (macOS-only; prevents sleep). `bash -lc` ensures conda's init in
+# ~/.bashrc / ~/.zshrc is sourced.
 start() {
   local name="$1"; shift
+  local cmd="$*"
   if tmux has-session -t "$name" 2>/dev/null; then
-    echo "[skip] tmux session '$name' already exists — kill it first if you want to restart"
+    echo "[skip] tmux session '$name' already exists — kill with 'tmux kill-session -t $name' first if you want to restart"
     return 0
   fi
-  tmux new-session -d -s "$name" "$*"
+  tmux new-session -d -s "$name" "bash -lc 'export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 && cd \"$REPO_ROOT\" && conda activate $CONDA_ENV && caffeinate -dimsu $cmd; echo; echo \"[$name] python exited; press enter to close session\"; read'"
   echo "[ok] launched tmux session '$name'"
 }
 
 # === Run B privileged: success_factor hypothesis =====================
 start ppo_hc_B \
-"caffeinate -dimsu python experiments/hang_obs_exp/scripts/train_privileged.py \
+"python experiments/hang_obs_exp/scripts/train_privileged.py \
     --obs_mode hole_centroid \
     --max_act_vel 4.1 --log_std_init -2.7 \
     --lr 2e-5 --critic_warmup_rollouts 4 \
@@ -42,7 +47,7 @@ start ppo_hc_B \
 
 # === Run C privileged: reward-shape hypothesis =======================
 start ppo_hc_C \
-"caffeinate -dimsu python experiments/hang_obs_exp/scripts/train_privileged.py \
+"python experiments/hang_obs_exp/scripts/train_privileged.py \
     --obs_mode hole_centroid \
     --max_act_vel 4.1 --log_std_init -2.7 \
     --lr 2e-5 --critic_warmup_rollouts 4 \
@@ -54,7 +59,7 @@ start ppo_hc_C \
 
 # === Run D privileged: MLP-capacity hypothesis =======================
 start ppo_hc_D \
-"caffeinate -dimsu python experiments/hang_obs_exp/scripts/train_privileged.py \
+"python experiments/hang_obs_exp/scripts/train_privileged.py \
     --obs_mode hole_centroid \
     --max_act_vel 4.1 --log_std_init -2.7 \
     --lr 5e-5 --critic_warmup_rollouts 2 \

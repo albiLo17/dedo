@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Launch overnight runs on the L4 GCP instance (12 vCPUs, 1× L4 GPU).
+# Launch overnight runs on the L4 GCP instance (12 vCPUs, 1× L4 GPU, Linux).
+# Activates the `dedo38` conda env in each tmux session.
 #
 # Slots used:
 #   - existing PPO pixels CNN run keeps running (assumed already in tmux)
@@ -7,9 +8,7 @@
 #   - Run A privileged: BC-preservation hypothesis            (CPU)
 #   - Run E privileged: kitchen-sink best-guess               (CPU)
 #
-# Total CPU pressure with OMP_NUM_THREADS=2:
-#   ~3 cores × 4 runs (CNN+vision share GPU, MLPs are pure CPU) = ~12 cores
-#   Fits g2-standard-12 with a small margin.
+# Total CPU pressure with OMP_NUM_THREADS=2: ~12 cores. Fits g2-standard-12.
 #
 # Run from repo root:  bash experiments/hang_obs_exp/scripts/launch_l4.sh
 set -euo pipefail
@@ -17,23 +16,27 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Cap PyTorch parallelism so 4 simultaneous runs don't trash each other.
-export OMP_NUM_THREADS=2
-export MKL_NUM_THREADS=2
+CONDA_ENV="dedo38"
 
+# tmux command wrapper: spawn a login shell, set thread caps, activate
+# the conda env, cd to repo root, run the given python invocation.
+# `bash -lc` ensures conda's init in ~/.bashrc is sourced — without it
+# `conda activate` errors with "command not found" because tmux's child
+# shell hasn't loaded the conda hook.
 start() {
   local name="$1"; shift
+  local cmd="$*"
   if tmux has-session -t "$name" 2>/dev/null; then
-    echo "[skip] tmux session '$name' already exists — kill it first if you want to restart"
+    echo "[skip] tmux session '$name' already exists — kill with 'tmux kill-session -t $name' first if you want to restart"
     return 0
   fi
-  tmux new-session -d -s "$name" "$*"
+  tmux new-session -d -s "$name" "bash -lc 'export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 && cd \"$REPO_ROOT\" && conda activate $CONDA_ENV && $cmd; echo; echo \"[$name] python exited; press enter to close session\"; read'"
   echo "[ok] launched tmux session '$name'"
 }
 
 # === New PPO pixels run with consolidated recipe ====================
 start ppo_pix_new \
-"caffeinate -dimsu python experiments/hang_obs_exp/scripts/train_pixels.py \
+"python experiments/hang_obs_exp/scripts/train_pixels.py \
     --max_act_vel 4.1 --log_std_init -2.7 \
     --lr 1e-5 \
     --critic_warmup_rollouts 4 \
