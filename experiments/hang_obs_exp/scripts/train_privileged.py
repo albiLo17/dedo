@@ -118,6 +118,24 @@ parser.add_argument('--max_act_vel', type=str, default=None,
                          'gripper can\'t keep up. Watch the [BC] traj '
                          'peak |vel| diagnostic on attempt 1. None '
                          '(default) leaves dedo unchanged.')
+parser.add_argument('--net_arch', type=str, default='256,256',
+                    help='Comma-separated MLP hidden sizes for the '
+                         'shared trunk (used by both actor and critic). '
+                         'Default "256,256". Try "512,512" (~4x params) '
+                         'if BC mse plateaus too high — useful for '
+                         '30-dim corners and can\'t hurt for 18-dim '
+                         'hole_centroid. With 300 demos the param/data '
+                         'ratio is ~1.2 at 256,256 vs ~5 at 512,512 — '
+                         'risk of overfitting BC, mitigated by the '
+                         'large epoch count.')
+parser.add_argument('--ent_coef', type=float, default=0.0,
+                    help='PPO entropy bonus coefficient. SB3 default is '
+                         '0.0 (no bonus), which lets log_std collapse '
+                         'toward 0 once it\'s unfrozen post-warmup. '
+                         'When BC is on with --log_std_init negative, '
+                         'set 0.005-0.02 to keep log_std from collapsing '
+                         'and exploration intact while the actor is '
+                         'being updated. 0 disables.')
 parser.add_argument('--critic_warmup_rollouts', type=int, default=0,
                     help='Freeze the actor (mu head + log_std + actor '
                          'MLP trunk) for the first N PPO rollouts so '
@@ -456,7 +474,9 @@ if dedo_args.use_wandb:
             f'obs_mode={obs_mode}',
         ]
 
-_policy_kwargs = dict(net_arch=[256, 256])
+_net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
+_policy_kwargs = dict(net_arch=_net_arch_list)
+print(f'[init] policy net_arch = {_net_arch_list}')
 if extra_args.log_std_init is not None:
     # PPO's DiagGaussianDistribution uses log_std as an nn.Parameter
     # initialized to log_std_init. Lowering it below 0 is essential here:
@@ -477,6 +497,7 @@ rl_kwargs = {
     'n_epochs': 10,
     'gae_lambda': 0.95,
     'gamma': 0.99,
+    'ent_coef': float(extra_args.ent_coef),
 }
 _resuming = bool(extra_args.load_checkpoint)
 if _resuming:

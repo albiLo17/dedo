@@ -8,7 +8,7 @@ If you're glancing at wandb every hour, these are the ones to check first, in th
 
 | # | Chart | Plain-English meaning |
 |---|---|---|
-| 1 | `eval/success_rate` | The headline. Deterministic 10-episode eval success rate. **This is the number that goes in your paper.** |
+| 1 | `eval/success_rate` (+ `eval/success_rate_se`) | The headline. Deterministic 10-episode eval success rate; the `_se` companion is the binomial standard error (`sqrt(p(1−p)/n)`), so two consecutive evals differing by less than ~`2 × se` are statistically indistinguishable. **`eval/success_rate` is the number that goes in your paper.** |
 | 2 | `train/cumulative_successes` | **Monotone tally of all successful episodes since run start.** Each step UP = one specific episode succeeded. Reads exactly like "how many times has the agent solved it so far?" — no rolling-average smearing. Use this whenever you want "did *that* episode succeed?". |
 | 3 | `last_episode/success` | Raw 0/1 spike per episode (1 = success, 0 = fail). Lets you visually count individual successes and see the gaps between them. Sparse and spiky on purpose. |
 | 4 | `task/adaptive_dist` *or* `last_episode/dist` | Mean hole-centroid → goal distance at episode end (m). **Leading indicator** — drops well before success rate climbs. Use the rolling `task/...` version for trend; use `last_episode/dist` for per-episode "near-misses". |
@@ -37,10 +37,18 @@ Pin these 7 to the top of the wandb panel using ⋯ → "Move to top" so they're
 
 ### `eval/*` — periodic deterministic eval (10 episodes per save)
 
+Emitted by `HangVideoCallback._on_step` in [_video_callback.py](_video_callback.py) when an eval pass fires. The eval pass calls `evaluate_policy(..., deterministic=True, return_episode_rewards=True)` so reward sampling noise is removed. With `--eval_seed_lock` on, the same N procedural cloths are re-evaluated every checkpoint, which makes the curve readable instead of noisy. **Cadence:** every 2nd checkpoint = every `2 × log_save_interval × 500` env steps (default `log_save_interval=20` → every 20k steps).
+
 | Chart | What it is | Expected behavior |
 |---|---|---|
-| `eval/success_rate` | Success rate over 10 deterministic eval episodes | **Cleaner than `rollout/success_rate_100`** because deterministic. Updates every 2nd checkpoint (every 20k steps with `--log_save_interval 20`). Only ~10 episodes per data point so individual values jitter ±10–20 %; trend line is what matters. |
-| `eval/video` | mp4 panel | One mp4 every 4th checkpoint (every 40k steps with `--log_save_interval 20`). Each video shows 10 deterministic episodes back-to-back, with SUCCESS/FAIL badges drawn per episode and the post-policy "settle" frames spliced in chronologically. |
+| `eval/success_rate` | Binomial proportion of successes over the eval pass: `successes / n_eval_episodes`. Same definition as `is_success` in the wrapper (= `success/active_rate`). | **Cleaner than `rollout/success_rate_100`** because deterministic. Only ~10 episodes per data point so individual values jitter ±10–20 %; trend line is what matters. Sample with `eval/success_rate_se` to read confidence. |
+| `eval/success_rate_se` | Standard error of the binomial proportion: `sqrt(p × (1−p) / n)`. With `n=10` and `p=0.5` this is **~0.16**, with `p=0.9` it's **~0.09**, with `p=1.0` it's `0.0`. | Use as ±1σ band around `eval/success_rate` to judge whether a jump is real. Two consecutive evals differing by less than `2 × se` are statistically indistinguishable at `n_eval_episodes=10`. Increase `--n_eval_episodes` if the band is too wide to resolve the trend you care about. |
+| `eval/n_episodes` | Number of episodes in the eval pass. Equal to `--n_eval_episodes` (default 10). | Constant. Sanity-check only; if it drifts something is wrong. |
+| `eval/episode_reward_mean` | Mean total episode reward (after all shaping) across the eval pass. Same units as `reward/episode_total` but deterministic and only over the eval set. | Tracks `eval/success_rate` loosely — depends on shaping magnitudes. With `success_bonus=200` and `FINAL_REWARD_MULT=400`, a successful episode is worth roughly +200 to +500, a failure ~−300 to −800. So a 50% success rate gives mean ≈ −100, 100% ≈ +300. |
+| `eval/episode_reward_se` | Sample standard error of the eval-set episode rewards: `std(rewards, ddof=1) / sqrt(n)`. | The honest "how noisy is the eval reward" answer. **Bimodal policies blow this up** — if `episode_reward_mean` looks fine but `episode_reward_se` is huge, the policy is sometimes succeeding and sometimes catastrophically failing rather than reliably middling. Cross-check with `final_eval/std_reward` at end of run. |
+| `eval/episode_length_mean` | Mean episode length over the eval pass. | Should be ≈ `max_episode_len=200`. Drops below ~150 mean = the policy is triggering out-of-workspace early termination on a meaningful fraction of eval episodes (cloth flying away, etc.). |
+| `eval/video` | mp4 panel. One mp4 every 4th checkpoint (every 40k steps with `--log_save_interval 20`). Each video shows `n_eval_episodes` deterministic episodes back-to-back, with SUCCESS/FAIL badges drawn per episode and the post-policy "settle" frames spliced in chronologically. | Watch one every couple of hours; tells you *why* the metrics look the way they do. |
+| `trajectory/video` | Fallback path used only when `--use_wandb` is off (logs through SB3 → TB Video instead of `wandb.Video`). Same content as `eval/video`. | If you're seeing this and you expected `eval/video`, your run was started without `--use_wandb`. |
 
 ### `reward/*` — reward decomposition (per-episode 100-ep moving avg)
 
@@ -83,22 +91,45 @@ Emitted by `PrivilegedObsWrapper._emit_episode_diagnostics` (or `PixelObsWrapper
 
 ### `train/*` — SAC internals (every gradient update)
 
+Logged automatically by SB3's `SAC.train()`. They appear at the *first* env step where a gradient happens (≥ `learning_starts`, default 1000) and update every `gradient_steps` thereafter. With `train_freq=1, gradient_steps=1` (defaults) that's one update per env step.
+
 | Chart | What it is | Red flag |
 |---|---|---|
-| `train/actor_loss` | Actor (policy) loss = `−Q(s, a) − α H[π]` | Should trend negative-and-stable. Wild oscillations mean LR is too high. |
-| `train/critic_loss` | Critic MSE on Bellman targets | **Hard cap your eyes here.** Should stabilize <100 typically. Above 1000 and growing → run is collapsing, kill it. |
-| `train/ent_coef` | Auto-tuned entropy temperature α | Starts at 1.0, drifts to ~0.05–0.5 for this task. **Decays to ~0 in <100k steps = bad** (premature exploitation). |
-| `train/ent_coef_loss` | Loss for the α optimizer | Hovers near 0; magnitude tells you how aggressively α is being adjusted. Mostly diagnostic. |
-| `train/learning_rate` | Constant 3e-4 unless you scheduled it | — |
-| `train/n_updates` | Total gradient updates so far | Linear in env steps × `gradient_steps`. Sanity check only. |
+| `train/actor_loss` | Actor (policy) loss = `α · log π(a\|s) − min(Q1, Q2)(s, a)`. Pushed lower (more negative) when Q rises along the policy's chosen actions. | Should trend negative-and-stable. Wild oscillations mean LR is too high. Spikes upward when entropy collapses (α → 0 makes the `log π` term vanish, leaving raw Q-values). |
+| `train/critic_loss` | Mean squared TD error on Bellman targets, averaged over both Q heads (Q1, Q2). | **Hard cap your eyes here.** Should stabilize <100 typically. Above 1000 and growing → run is collapsing, kill it. Expect a brief ramp from ~0 to peak in the first ~10k updates as the random Q networks fit returns, then a slow decay. The `SACCriticWarmupCallback` (default 10k env steps, see `_critic_warmup.py`) keeps the actor frozen during this ramp so the Q heads can converge before the actor follows their noise. |
+| `train/ent_coef` | Auto-tuned entropy temperature α (the SAC exploration knob). Starts at `--ent_coef` initial value (default `auto` = 1.0), evolves to satisfy `−H[π] ≈ target_entropy = −\|action_dim\|`. | Starts at 1.0, drifts to ~0.05–0.5 for this task. **Decays to ~0 in <100k steps = bad** (premature exploitation). Pin entropy with `--ent_coef 0.2` (fixed value, no `auto_`) when this happens. |
+| `train/ent_coef_loss` | Loss the α optimizer is minimizing: `−α · (log π + target_entropy)`. With auto-α, only this loss makes α move. | Hovers near 0; magnitude tells you how aggressively α is being adjusted. Constantly large positive → the policy is too low-entropy and α is being pushed up. Constantly large negative → too high-entropy and α is being pushed down. Mostly diagnostic. |
+| `train/learning_rate` | Optimizer LR for actor + critic. | Constant `--lr` (default 3e-4) unless you scheduled it. |
+| `train/n_updates` | Total gradient updates so far. Linear in `(env_steps − learning_starts) × gradient_steps`. | Useful as the X-axis for `train/*` (since nothing happens before `learning_starts`). |
+
+### `train/*` — PPO internals (every PPO.train() call)
+
+PPO scripts (`train_privileged.py`, `train_pixels.py`, `train_pointcloud.py`) log a different set. PPO's `train()` runs once per rollout (= `n_steps × num_envs` env steps; defaults `n_steps=4096, num_envs=4` → every 16k env steps). All metrics below are averaged over the inner SGD loop (`n_epochs × num_minibatches` iterations).
+
+| Chart | What it is | Red flag |
+|---|---|---|
+| `train/policy_gradient_loss` | Negative of the clipped surrogate objective (so lower = better). | Trends mildly negative. Sudden positive jumps = the new policy is worse than the old at the rollout's actions. |
+| `train/value_loss` | MSE between value-head predictions and the rollout returns. | Should decrease as the value head fits returns. If it grows for 100k+ steps the value head can't keep up — consider lowering `--lr` or raising `vf_coef`. |
+| `train/entropy_loss` | Negative mean policy entropy. | Becomes less negative (entropy shrinks) as the policy commits. **Approaches 0 too fast = premature commitment** — raise `ent_coef` or use `--log_std_init` to seed lower entropy from the start (see SAC + BC notes). |
+| `train/approx_kl` | Approximation of `KL(π_old \|\| π_new)` over the update. | A standard "is the update too big" gauge. SB3 default `target_kl=None`. If you see values >0.1 routinely the trust region is being violated; lower `--lr` or raise `n_minibatches`. |
+| `train/clip_fraction` | Fraction of samples whose probability ratio was clipped to `[1−ε, 1+ε]`. | Healthy range ~0.05–0.3. Above ~0.5 = updates are mostly clipped (PPO's safety net is doing all the work, learning will stall). |
+| `train/clip_range` | The current clip parameter ε. Constant (default 0.2) unless scheduled. | — |
+| `train/clip_range_vf` | Value-function clip range, if `clip_range_vf` is set. | — |
+| `train/explained_variance` | `1 − Var(returns − values) / Var(returns)`; how much variance in returns the value head explains. | **The cleanest "is the value head working" signal.** Rises from ~0 toward ~1. Negative or stuck at 0 means value predictions are no better than predicting the mean — investigate before reading the policy charts. |
+| `train/loss` | Total loss = policy + vf + entropy losses, weighted. | Mostly diagnostic; the components above are more readable. |
+| `train/std` | Per-action-dim mean std of the diagonal Gaussian (PPO with `DiagGaussianDistribution`). Reflects `log_std` parameter. | Should slowly decrease as the policy commits. Pinned by `--log_std_init` at run start (default 0.0 → std=1; we use `-3.5` → std≈0.030 to match BC scale). |
+| `train/learning_rate` | Optimizer LR. | Constant `--lr` unless scheduled. |
+| `train/n_updates` | Total inner SGD steps so far. Equal to `(rollouts × n_epochs)` for PPO. | Sanity check. |
 
 ### `time/*` — throughput / wall-clock
 
 | Chart | What it is | Expected behavior |
 |---|---|---|
-| `time/total_timesteps` | Env steps elapsed | Equal to wandb step. Linear in wall-clock if not throttled. |
-| `time/fps` | Env steps per wall-clock second | **Watch this for thermal throttling.** On the M4 you should see ~10 sps starting, may degrade ~20–30% over time. Sustained drops below 5 sps = something's wrong (FileProvider, swap, etc.). |
-| `time/episodes` | Total episodes (= ~steps/200) | — |
+| `time/total_timesteps` | Env steps elapsed. | Equal to wandb step. Linear in wall-clock if not throttled. |
+| `time/fps` | Env steps per wall-clock second, computed by SB3 over the last log dump interval. | **Watch this for thermal throttling.** On the M4 you should see ~10 sps starting, may degrade ~20–30% over time. Sustained drops below 5 sps = something's wrong (FileProvider, swap, etc.). |
+| `time/iterations` | (PPO only) Number of `PPO.train()` calls completed = number of rollouts. | Linear in `total_timesteps / (n_steps × num_envs)`. |
+| `time/episodes` | Total episodes (≈ `steps / ep_len_mean`). **Note:** SB3 marks this `exclude="tensorboard"` for SAC, so it does *not* reach wandb on SAC runs — see `train/episodes_total` instead. PPO runs may surface it. | — |
+| `time/time_elapsed` | (Some SB3 versions) wall-clock seconds since `learn()` started. | Use for cross-checking `time/fps` × `time/total_timesteps` ≈ wall time. |
 
 ### `last_episode/*` — raw per-episode values (no averaging)
 
@@ -136,20 +167,76 @@ These have **`bc/epoch` as their natural x-axis**, not step. They live in step 0
 
 ### `final_eval/*` — once at end of training (deterministic eval)
 
-Logged after `agent.learn()` finishes by `make_final_eval_collector` + `log_final_eval_metrics` from `_reward_diagnostics.py`. Single data point per run. Episode count is `--n_final_eval_episodes` (default **50** for newer scripts; older runs default to 20).
+Logged after `agent.learn()` finishes by `make_final_eval_collector` + `log_final_eval_metrics` in [_reward_diagnostics.py](_reward_diagnostics.py). Single data point per run, written via `wandb.log` at the final step. Episode count is `--n_final_eval_episodes` (default **50** for newer scripts; older runs default to 20).
 
-For every `rwd_diag/*` metric the wrapper emits, the collector logs **two keys**: the mean (`final_eval/<metric>`) and the std (`final_eval/<metric>__std`). The std is what tells you if a policy is bimodal — averaging a 50% success rate looks identical for "always 50% confident" vs "0% on half the episodes, 100% on the other half", but the std distinguishes them.
+**How it's computed:** `_FinalEvalCollector` walks every terminal `info` dict produced by `evaluate_policy`, capturing `is_success` and every `rwd_diag/*` numeric value. At the end:
+
+- `final_eval/success_rate` = `sum(successes) / n`
+- `final_eval/mean_reward`, `final_eval/std_reward` = mean & population std (`np.std` with `ddof=0`) of episode totals from `evaluate_policy`
+- `final_eval/n_episodes` = `len(successes)` = `--n_final_eval_episodes`
+- For **every** `rwd_diag/<metric>` key seen at any terminal step, two keys are emitted: `final_eval/<metric>` (= `np.mean`) and `final_eval/<metric>__std` (= `np.std`, ddof=0).
+
+The `__std` fields are the whole point of this block. They distinguish a confidently-mediocre policy from a bimodal one: a 50% success rate looks identical for "always 50% confident" vs "0% on half / 100% on the other half" if you only have the mean — but `final_eval/success/active_rate__std` will be ~0 for the first and ~0.5 for the second.
+
+#### Fixed keys (always present)
 
 | Chart | What it is |
 |---|---|
-| `final_eval/success_rate` | The **paper number**: deterministic success rate over the eval set. |
-| `final_eval/mean_reward` | Mean episode return over the eval set. |
-| `final_eval/std_reward` | Stddev — if huge, the policy is bimodal (sometimes solves it, sometimes whiffs catastrophically). |
-| `final_eval/n_episodes` | Always = `--n_final_eval_episodes`. |
-| `final_eval/task/adaptive_dist` and `..._dist__std` | Mean & stddev of final hole→goal distance over the eval set. |
-| `final_eval/task/{adaptive_thresh,hole_radius}` (+ `__std`) | Eval-set means of geometric state. |
-| `final_eval/success/{base,adaptive,disagree,active}_rate` (+ `__std`) | Same fields as `success/*`, but specifically over the eval set. |
-| `final_eval/reward/{episode_total, base_sum, vel_penalty_sum, action_penalty_sum, pre_settle_penalty, terminal_base, terminal_shaping, episode_length}` (+ `__std`) | Same fields as `reward/*` but over the eval set. |
+| `final_eval/success_rate` | The **paper number**: deterministic success rate over the eval set. Identical to `final_eval/success/active_rate` (both come from `is_success`). |
+| `final_eval/mean_reward` | Mean episode return over the eval set, computed from `evaluate_policy`'s `episode_rewards`. |
+| `final_eval/std_reward` | Population stddev of those returns — if huge, the policy is bimodal (sometimes solves it, sometimes whiffs catastrophically). Cross-check with `eval/episode_reward_se` from the last training-time eval. |
+| `final_eval/n_episodes` | Always equals `--n_final_eval_episodes`. |
+
+#### Auto-generated keys (one per `rwd_diag/*` info key, with a `__std` companion)
+
+For every metric the wrappers emit at terminal step (see "Wrapper info keys" below), you'll see both `final_eval/<metric>` and `final_eval/<metric>__std`. The full list, assuming both privileged and pixel wrappers:
+
+| Family | `final_eval/...` keys | `__std` companion |
+|---|---|---|
+| `reward/*` | `episode_total`, `base_sum`, `vel_penalty_sum`, `action_penalty_sum`, `pre_settle_penalty`, `terminal_base`, `terminal_shaping`, `episode_length` | yes (each) |
+| `success/*` | `base_rate`, `adaptive_rate`, `disagree_rate`, `active_rate` | yes (each) |
+| `task/*` | `adaptive_dist`, `adaptive_thresh`, `hole_radius` | yes (each) |
+
+Reading guide:
+
+- `final_eval/reward/episode_total__std` huge but `final_eval/success_rate` near 1.0 → success bonus dominates, value spread is mostly determined by terminal_base on the small failures. Not a worry.
+- `final_eval/success/active_rate__std` near 0.5 with `final_eval/success_rate` ≈ 0.5 → bimodal policy, *not* a "consistently 50%" policy. Investigate which cloths it's failing on (use `--eval_seed_lock` and watch the eval video).
+- `final_eval/task/adaptive_dist__std` large vs the mean → policy is inconsistent in *where* it ends up, even on episodes that "succeed" by the loose adaptive criterion. Usually correlates with `success/disagree_rate__std` being non-zero.
+- `final_eval/reward/episode_length__std` non-trivial → some episodes early-terminate (out-of-workspace), others don't. Diagnostic for "policy occasionally throws the cloth off the table".
+
+**Older scripts (`train_privileged_evan.py`)** use a simpler one-shot eval and only emit `final_eval/{success_rate, mean_reward, std_reward, n_episodes}` — none of the `__std` decomposition.
+
+### Wrapper info keys (the source of `reward/*`, `success/*`, `task/*`, and `final_eval/*`)
+
+These are not charts you read directly; they're the per-step `info` dict keys emitted by the env wrappers. The diagnostics callback collects them at terminal step, computes per-episode aggregates (sums for `reward/*_sum`, single-shot for `terminal_*` and `task/*`, etc.), and either records to TB (rolling means) or pipes through `_FinalEvalCollector` (final eval). Documented here because if you suspect a chart is missing or wrong, this is the data layer to inspect.
+
+| Info key | Emitted by | Role | Charts that consume it |
+|---|---|---|---|
+| `is_success` | All wrappers | Active success criterion (adaptive if `success_factor` set, else dedo base). | `eval/success_rate`, `final_eval/success_rate`, `last_episode/success`, `success/active_rate`, `train/cumulative_successes`, `rollout/success_rate_100` |
+| `adaptive_dist` | All wrappers (when `success_factor` set) | Hole-centroid → goal distance at this step (m). Set every step, but only the terminal value matters. | `task/adaptive_dist`, `last_episode/dist`, `final_eval/task/adaptive_dist[__std]` |
+| `adaptive_thresh` | All wrappers (when `success_factor` set) | `success_factor × hole_radius` (m). | `task/adaptive_thresh`, `final_eval/task/adaptive_thresh[__std]` |
+| `hole_radius` | All wrappers (when `success_factor` set) | Effective hole radius for the current cloth (m). | `task/hole_radius`, `final_eval/task/hole_radius[__std]` |
+| `shaping_added` | All wrappers (when shaping fires at terminal) | Per-step shaping added: `+success_bonus` on success, `−fail_penalty` on fail. | `reward/terminal_shaping`, `final_eval/reward/terminal_shaping[__std]` |
+| `pre_settle_dist_m` | All wrappers | Hole→goal distance measured **before** the post-policy gravity settle. Diagnostic only. | (used by `_video_callback` to label settle frames; logged via `reward/pre_settle_penalty` after multiplication by `pre_settle_coef`) |
+| `pre_settle_penalty` | Privileged + Pixel wrappers | Single-step penalty `pre_settle_coef × pre_settle_dist_m`, applied at terminal. | `reward/pre_settle_penalty`, `final_eval/reward/pre_settle_penalty[__std]` |
+| `vel_penalty` | All wrappers (per non-terminal step) | Per-step velocity penalty actually applied. | Summed by callback into `reward/vel_penalty_sum`. |
+| `action_penalty` | Pixel + Privileged wrappers (per step incl. terminal) | Per-step action-magnitude penalty applied. | Summed by callback into `reward/action_penalty_sum`. |
+| `cloth_mean_speed` | Pixel + PointCloud wrappers | Mean cloth-vertex speed (m/s). Diagnostic for cloth velocity. | Not currently rolled into a chart — surfaces only as a per-step info value. Useful when debugging velocity-penalty tuning. |
+| `action_cost` | Pixel + Privileged wrappers | Cumulative action penalty across the episode. Diagnostic. | Not directly charted; effectively the same series as `reward/action_penalty_sum`. |
+
+If you turn on a new shaping knob and don't see the corresponding `reward/<name>` chart move, the first thing to check is whether the wrapper is emitting the corresponding `info` key — `print(info)` in a one-step rollout is faster than reading the chart. The callback only logs what it sees.
+
+### Critic warmup callback (no chart, but shapes `train/critic_loss`)
+
+The `SACCriticWarmupCallback` (default `n_warmup_env_steps=10000`) and `PPOCriticWarmupCallback` (default `n_warmup_rollouts=2`) freeze the actor's parameters for the first chunk of training so the value/Q heads can stabilize before they start moving the actor. They emit **no metrics** (only stdout banners), but they distort the early shape of `train/critic_loss`, `train/actor_loss` (= 0 for SAC during freeze since no actor gradients flow), and `train/policy_gradient_loss` (PPO).
+
+**What you'll see in the charts because of this:**
+
+- `train/critic_loss` ramps from ~0 to its peak by ~step 10k (SAC) or after ~2 rollouts (PPO), uninterrupted by actor drift. This is *expected*, not a bug.
+- `train/actor_loss` is identically 0 (SAC) or constant (PPO) during the freeze window — also expected. The policy is unchanged through warmup.
+- The first time `train/actor_loss` starts moving is the moment of unfreeze. Cross-reference with the stdout `[critic_warmup] ... unfroze actor` banner for the exact env step.
+
+Disable with `--critic_warmup_env_steps 0` (SAC) or `--critic_warmup_rollouts 0` (PPO) if you want to read pre-warmup actor behavior directly.
 
 ### `args` — config dump (no chart, sidebar only)
 
@@ -235,9 +322,9 @@ If at 300k your `adaptive_dist` is flat AND `eval/success_rate` is stuck at <5%,
 
 In the wandb run page, click the ⚙️ next to the workspace name and create three sections:
 
-1. **Headline** — drag in `eval/success_rate`, `train/cumulative_successes`, `last_episode/success`, `task/adaptive_dist`, `eval/video`. This is the only section you need to look at most of the time. Set workspace X-axis to `train/episodes_total`. Set smoothing to 0 for `last_episode/*` and `train/cumulative_successes`; ~0.7 for the rest.
-2. **Health** — drag in `train/critic_loss`, `train/ent_coef`, `train/actor_loss`, `time/fps`. Glance once an hour. **`train/ent_coef` is the canary** — if it drops below 0.01 the run is collapsing, kill it.
-3. **Decomposition** — drag in `reward/*` charts (`episode_total`, `base_sum`, `vel_penalty_sum`, `action_penalty_sum`, `pre_settle_penalty`, `terminal_base`, `terminal_shaping`) plus `last_episode/dist`, `last_episode/episode_length`. Look at this only when something looks weird in **Headline**, or when you turn on a new shaping knob and want to confirm it's actually firing at the magnitude you expected.
+1. **Headline** — drag in `eval/success_rate` *(with `eval/success_rate_se` overlaid as a band if your wandb chart supports it)*, `train/cumulative_successes`, `last_episode/success`, `task/adaptive_dist`, `eval/video`. This is the only section you need to look at most of the time. Set workspace X-axis to `train/episodes_total`. Set smoothing to 0 for `last_episode/*` and `train/cumulative_successes`; ~0.7 for the rest.
+2. **Health** — drag in `train/critic_loss`, `train/ent_coef`, `train/actor_loss`, `time/fps`, `eval/episode_length_mean`. Glance once an hour. **`train/ent_coef` is the canary** — if it drops below 0.01 the run is collapsing, kill it. (PPO runs: swap in `train/explained_variance`, `train/clip_fraction`, `train/approx_kl` instead of the SAC-specific keys.)
+3. **Decomposition** — drag in `reward/*` charts (`episode_total`, `base_sum`, `vel_penalty_sum`, `action_penalty_sum`, `pre_settle_penalty`, `terminal_base`, `terminal_shaping`) plus `eval/episode_reward_mean`/`eval/episode_reward_se`, `last_episode/dist`, `last_episode/episode_length`. Look at this only when something looks weird in **Headline**, or when you turn on a new shaping knob and want to confirm it's actually firing at the magnitude you expected.
 
 The default wandb panel layout dumps everything alphabetically and is genuinely hard to read on small screens. The 3-section setup pays for itself within the first run.
 

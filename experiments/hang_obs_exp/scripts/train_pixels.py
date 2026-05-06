@@ -185,6 +185,17 @@ parser.add_argument('--max_act_vel', type=str, default=None,
                          'the trajectory peak (typically 1-3 m/s) silently '
                          'break demos. None (default) leaves dedo at 10.0. '
                          'See train_privileged.py for full discussion.')
+parser.add_argument('--net_arch', type=str, default='256,256',
+                    help='Comma-separated MLP hidden sizes for the head '
+                         'after the CNN feature extractor. Default '
+                         '"256,256". Try "512,512" if BC mse plateaus '
+                         'too high on the pixel task.')
+parser.add_argument('--ent_coef', type=float, default=0.0,
+                    help='PPO entropy bonus coefficient. 0.0 (default) '
+                         'lets log_std collapse post-warmup; set '
+                         '0.005-0.02 to keep exploration intact while '
+                         'actor updates. See train_privileged.py for '
+                         'rationale.')
 parser.add_argument('--critic_warmup_rollouts', type=int, default=0,
                     help='Freeze actor for first N PPO rollouts so V(s) '
                          'can converge before the actor moves. Prevents '
@@ -455,7 +466,9 @@ if dedo_args.use_wandb:
 # IMPALA-CNN or similar.
 # ---------------------------------------------------------------------------
 policy_name = 'MultiInputPolicy' if not extra_args.no_grip else 'CnnPolicy'
-policy_kwargs = dict(net_arch=[256, 256])
+_net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
+policy_kwargs = dict(net_arch=_net_arch_list)
+print(f'[init] policy net_arch (post-CNN) = {_net_arch_list}')
 if extra_args.log_std_init is not None:
     # PPO's DiagGaussianDistribution uses log_std as an nn.Parameter
     # initialized to log_std_init. Lowering it below 0 is essential here:
@@ -472,6 +485,7 @@ rl_kwargs = dict(
     batch_size=extra_args.batch_size,
     n_epochs=extra_args.n_epochs,
     gae_lambda=0.95, gamma=0.99,
+    ent_coef=float(extra_args.ent_coef),
 )
 _resuming = bool(extra_args.load_checkpoint)
 if _resuming:
