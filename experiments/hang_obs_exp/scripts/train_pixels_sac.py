@@ -45,7 +45,7 @@ from stable_baselines3.common.vec_env import VecNormalize, VecTransposeImage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import (RetryResetEnv, build_hole_aware_waypoints,  # noqa: E402
-                      probe_peak_demo_vel)
+                      build_run_name_suffix, probe_peak_demo_vel)
 from _video_callback import HangVideoCallback  # noqa: E402
 from _critic_warmup import SACCriticWarmupCallback  # noqa: E402
 from _reward_diagnostics import (  # noqa: E402
@@ -404,18 +404,11 @@ if dedo_args.use_wandb:
         vp = extra_args.vel_penalty
         ap = extra_args.action_penalty
         psc = extra_args.pre_settle_coef
-        sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
-        sb_tag = f'_sb{sb:g}' if sb else ''
-        fp_tag = f'_fp{fp:g}' if fp else ''
-        vp_tag = f'_vp{vp:g}' if vp else ''
-        ap_tag = f'_ap{ap:g}' if ap else ''
-        psc_tag = f'_psc{psc:g}' if psc else ''
-        bc_tag = '_bc' if extra_args.bc_episodes > 0 else ''
-        grip_tag = '_grip' if not extra_args.no_grip else '_pix'
-        wandb.run.name = (f'{wandb.run.name}_pixels{extra_args.cam_resolution}'
-                          f'{grip_tag}_sac'
-                          f'{sf_tag}{sb_tag}{fp_tag}{vp_tag}'
-                          f'{ap_tag}{psc_tag}{bc_tag}')
+        bc_on = extra_args.bc_episodes > 0
+        grip_tag = 'grip' if not extra_args.no_grip else 'pix'
+        obs_kind = f'pixels{extra_args.cam_resolution}_{grip_tag}_sac'
+        wandb.run.name = wandb.run.name + build_run_name_suffix(
+            extra_args, algo='SAC', obs_kind=obs_kind)
         wandb.run.tags = list(wandb.run.tags or []) + [
             'algo=sac',
             'obs=pixels',
@@ -427,7 +420,7 @@ if dedo_args.use_wandb:
             f'vel_penalty={vp}',
             f'action_penalty={ap}',
             f'pre_settle_coef={psc}',
-            f'bc={"yes" if bc_tag else "no"}',
+            f'bc={"yes" if bc_on else "no"}',
         ]
 
 

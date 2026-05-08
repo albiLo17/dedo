@@ -145,7 +145,11 @@ def critic_warmup_on_demos(agent, demo_obs, demo_rewards_per_ep,
             o = obs_t[idx]
             tgt = tgt_t[idx]
             features = policy.extract_features(o)
-            latent_vf = policy.mlp_extractor.forward_critic(features)
+            # MlpExtractor.forward returns (latent_pi, latent_vf). The
+            # split forward_critic helper was added in newer SB3; the
+            # tuple unpack works on every version since the actor/critic
+            # split was introduced.
+            _, latent_vf = policy.mlp_extractor(features)
             v = policy.value_net(latent_vf).squeeze(-1)
             loss = F.mse_loss(v, tgt)
             optimizer.zero_grad()

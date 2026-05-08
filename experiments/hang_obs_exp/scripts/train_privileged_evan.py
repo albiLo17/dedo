@@ -37,7 +37,8 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
+from _helpers import (RetryResetEnv, build_hole_aware_waypoints,  # noqa: E402
+                      build_run_name_suffix)
 from _video_callback import HangVideoCallback  # noqa: E402
 
 import dedo  # registers gym envs
@@ -277,7 +278,9 @@ if extra_args.cpu:
     print(f'[device] forced CPU via --cpu flag '
           f'(torch.cuda.is_available()={torch.cuda.is_available()})')
 
-# Append "_256x256" tag to the wandb run name to mark the bigger-net config.
+# Build the wandb run name. See build_run_name_suffix for the format
+# (encodes lr / warmup / BC anchor / demo-V warmup / PPO drift knobs /
+# reward shape so a crashed run can be identified from the name alone).
 if dedo_args.use_wandb:
     import wandb
     if wandb.run is not None:
@@ -287,15 +290,9 @@ if dedo_args.use_wandb:
         vp = extra_args.vel_penalty
         psc = extra_args.pre_settle_coef
         ap = extra_args.action_penalty
-        sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
-        sb_tag = f'_sb{sb:g}' if sb else ''
-        fp_tag = f'_fp{fp:g}' if fp else ''
-        vp_tag = f'_vp{vp:g}' if vp else ''
-        psc_tag = f'_psc{psc:g}' if psc else ''
-        ap_tag = f'_ap{ap:g}' if ap else ''
-        wandb.run.name = (
-            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}'
-            f'{psc_tag}{ap_tag}')
+        wandb.run.name = wandb.run.name + build_run_name_suffix(
+            extra_args, algo='PPO', obs_kind=obs_mode,
+            net_arch=[256, 256])
         wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             f'success_factor={sf if sf is not None else "default"}',

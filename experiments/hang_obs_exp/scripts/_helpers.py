@@ -186,3 +186,132 @@ def probe_peak_demo_vel(dedo_args, n_probes=3, max_attempts=12):
 
     env.close()
     return max(peaks) if peaks else None
+
+
+# ---------------------------------------------------------------------------
+# Wandb run-name autonaming.
+#
+# The wandb run name is the only thing visible in the runs table, in
+# screenshots, and in URLs — so it must be self-describing enough that a
+# crashed run can be identified without opening config.yaml. This builds a
+# suffix that encodes:
+#   - obs kind / arch
+#   - lr (always)
+#   - knobs that diverge from defaults (critic warmup, BC anchor,
+#     demo-V warmup, PPO clip / epochs / target_kl, log_std_init,
+#     BC budget, entropy coef)
+#   - reward shape (sf, sb, fp, vp, ap, psc)
+# Defaults are omitted so the name stays short on baselines and grows
+# only when an actual experimental dial is turned.
+# ---------------------------------------------------------------------------
+def _fmt_lr(lr):
+    """Compact lr format: 5e-05 -> 5e-5, 0.0003 -> 3e-4, 0.001 -> 1e-3."""
+    if lr is None:
+        return 'none'
+    s = f'{float(lr):.0e}'  # '5e-05'
+    mantissa, _, exp = s.partition('e')
+    sign = '-' if exp.startswith('-') else ''
+    exp_num = exp.lstrip('+-').lstrip('0') or '0'
+    return f'{mantissa}e{sign}{exp_num}'
+
+
+def build_run_name_suffix(extra_args, *, algo='PPO', obs_kind=None,
+                          net_arch=None, extra_tag=''):
+    """Build a wandb run-name suffix encoding all experimental dials.
+
+    Args:
+        extra_args: argparse Namespace with the script's `--` flags
+            (lr, success_factor, critic_warmup_rollouts, etc.). Looked
+            up by getattr; missing attributes fall back to defaults.
+        algo: 'PPO' or 'SAC'. Controls which algo-specific knobs are
+            considered.
+        obs_kind: short string like 'privileged', 'pixels64_grip',
+            'pcd1024'. Becomes the first segment.
+        net_arch: list[int] for the MLP head/trunk; emitted as
+            '_<h1>x<h2>...'.
+        extra_tag: appended at the very end (e.g. policy='pointnet2'
+            for the pcd script).
+
+    Format:
+        [_<obs>][_<arch>]_lr<lr>[_cw<n>][_bca<n>x<bs>@<lr>]
+        [_cwd<n>@<lr>][_clip<r>][_pe<n>][_tkl<kl>][_lstd<v>]
+        [_bc<eps>x<ep>][_ent<v>]_sf<sf>[_sb<sb>][_fp<fp>][_vp<vp>]
+        [_ap<ap>][_psc<psc>][_<extra_tag>]
+    """
+    a = extra_args
+    parts = []
+
+    if obs_kind:
+        parts.append(f'_{obs_kind}')
+    if net_arch:
+        parts.append('_' + 'x'.join(str(s) for s in net_arch))
+
+    # lr — always shown (top hunt-down knob)
+    if hasattr(a, 'lr') and a.lr is not None:
+        parts.append(f'_lr{_fmt_lr(a.lr)}')
+
+    # Critic warmup (rollout-based actor-freeze)
+    if getattr(a, 'critic_warmup_rollouts', 0):
+        parts.append(f'_cw{a.critic_warmup_rollouts}')
+
+    # BC anchor (DAPG-style replay) — only show if active
+    if getattr(a, 'bc_anchor_batches', 0):
+        bs = getattr(a, 'bc_anchor_batch_size', 256)
+        anc_lr = getattr(a, 'bc_anchor_lr', 1e-4)
+        parts.append(f'_bca{a.bc_anchor_batches}x{bs}@{_fmt_lr(anc_lr)}')
+
+    # Demo-V critic warmup (offline V pretrain on demos)
+    if getattr(a, 'critic_warmup_demo_epochs', 0):
+        cwd_lr = getattr(a, 'critic_warmup_demo_lr', 3e-4)
+        parts.append(f'_cwd{a.critic_warmup_demo_epochs}@{_fmt_lr(cwd_lr)}')
+
+    # PPO drift knobs (only if non-default SB3 values)
+    if algo == 'PPO':
+        clip = getattr(a, 'ppo_clip_range', None)
+        if clip is not None and abs(float(clip) - 0.2) > 1e-9:
+            parts.append(f'_clip{float(clip):g}')
+        pe = getattr(a, 'ppo_epochs', None)
+        if pe is not None and int(pe) != 10:
+            parts.append(f'_pe{int(pe)}')
+        tkl = getattr(a, 'ppo_target_kl', None)
+        if tkl is not None:
+            parts.append(f'_tkl{float(tkl):g}')
+
+    # Action distribution scale
+    log_std = getattr(a, 'log_std_init', None)
+    if log_std is not None:
+        parts.append(f'_lstd{float(log_std):g}')
+
+    # BC budget — show if BC pretrain is active
+    bc_eps = getattr(a, 'bc_episodes', 0) or 0
+    bc_demo_path = getattr(a, 'bc_demo_path', None)
+    if bc_eps > 0:
+        bc_ep = getattr(a, 'bc_epochs', 0)
+        parts.append(f'_bc{bc_eps}x{bc_ep}')
+    elif bc_demo_path:
+        bc_ep = getattr(a, 'bc_epochs', 0)
+        parts.append(f'_bcExtx{bc_ep}')
+
+    # Entropy coef
+    ent = getattr(a, 'ent_coef', None)
+    if ent is not None:
+        if isinstance(ent, str):
+            if ent != '0' and ent != '0.0':
+                parts.append(f'_ent{ent}')
+        elif float(ent) != 0:
+            parts.append(f'_ent{float(ent):g}')
+
+    # Reward shape (always; sf is the keystone)
+    sf = getattr(a, 'success_factor', None)
+    parts.append(f'_sf{float(sf):g}' if sf is not None else '_sf_default')
+    for tag, name in [('sb', 'success_bonus'), ('fp', 'fail_penalty'),
+                      ('vp', 'vel_penalty'), ('ap', 'action_penalty'),
+                      ('psc', 'pre_settle_coef')]:
+        v = getattr(a, name, 0)
+        if v:
+            parts.append(f'_{tag}{float(v):g}')
+
+    if extra_tag:
+        parts.append(f'_{extra_tag}')
+
+    return ''.join(parts)

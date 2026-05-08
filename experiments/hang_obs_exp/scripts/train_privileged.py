@@ -36,7 +36,7 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import (RetryResetEnv, build_hole_aware_waypoints,  # noqa: E402
-                      probe_peak_demo_vel)
+                      build_run_name_suffix, probe_peak_demo_vel)
 from _video_callback import HangVideoCallback  # noqa: E402
 from _critic_warmup import PPOCriticWarmupCallback  # noqa: E402
 from _reward_diagnostics import (  # noqa: E402
@@ -509,7 +509,11 @@ if extra_args.cpu:
     print(f'[device] forced CPU via --cpu flag '
           f'(torch.cuda.is_available()={torch.cuda.is_available()})')
 
-# Append "_256x256" tag to the wandb run name to mark the bigger-net config.
+# Build the wandb run name. build_run_name_suffix encodes ALL
+# experimental dials (lr, critic warmup, BC anchor, demo-V warmup, PPO
+# clip/epochs/target_kl, log_std_init, BC budget, reward shape) so a
+# crashed run can be identified from the name alone — no config.json
+# hunt required. Defaults are omitted to keep names short on baselines.
 if dedo_args.use_wandb:
     import wandb
     if wandb.run is not None:
@@ -519,15 +523,9 @@ if dedo_args.use_wandb:
         vp = extra_args.vel_penalty
         ap = extra_args.action_penalty
         psc = extra_args.pre_settle_coef
-        sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
-        sb_tag = f'_sb{sb:g}' if sb else ''
-        fp_tag = f'_fp{fp:g}' if fp else ''
-        vp_tag = f'_vp{vp:g}' if vp else ''
-        ap_tag = f'_ap{ap:g}' if ap else ''
-        psc_tag = f'_psc{psc:g}' if psc else ''
-        net_tag = '_' + 'x'.join(str(s) for s in _net_arch_list)
-        wandb.run.name = (
-            f'{wandb.run.name}{net_tag}{sf_tag}{sb_tag}{fp_tag}{vp_tag}{ap_tag}{psc_tag}')
+        wandb.run.name = wandb.run.name + build_run_name_suffix(
+            extra_args, algo='PPO', obs_kind=obs_mode,
+            net_arch=_net_arch_list)
         wandb.run.tags = list(wandb.run.tags or []) + [
             f'success_factor={sf if sf is not None else "default"}',
             f'success_bonus={sb}',

@@ -35,7 +35,8 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import VecNormalize
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
+from _helpers import (RetryResetEnv, build_hole_aware_waypoints,  # noqa: E402
+                      build_run_name_suffix)
 from _reward_diagnostics import (  # noqa: E402
     RewardDiagnosticsCallback, dump_run_config, make_final_eval_collector,
     log_final_eval_metrics)
@@ -271,13 +272,10 @@ if dedo_args.use_wandb:
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
         vp = extra_args.vel_penalty
-        bc_tag = '_bc' if _use_bc else ''
-        sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
-        sb_tag = f'_sb{sb:g}' if sb else ''
-        fp_tag = f'_fp{fp:g}' if fp else ''
-        vp_tag = f'_vp{vp:g}' if vp else ''
-        wandb.run.name = (f'{wandb.run.name}_pcd{extra_args.n_points}'
-                          f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}{vp_tag}')
+        wandb.run.name = wandb.run.name + build_run_name_suffix(
+            extra_args, algo='PPO',
+            obs_kind=f'pcd{extra_args.n_points}',
+            extra_tag=extra_args.policy)
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pointcloud',
             f'bc={"yes" if _use_bc else "no"}',
@@ -288,7 +286,6 @@ if dedo_args.use_wandb:
             f'n_points={extra_args.n_points}',
             f'policy={extra_args.policy}',
         ]
-        wandb.run.name = wandb.run.name + f'_{extra_args.policy}'
 
 
 # ---------------------------------------------------------------------------
