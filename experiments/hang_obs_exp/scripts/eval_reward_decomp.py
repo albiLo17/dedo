@@ -171,6 +171,8 @@ def parse_args():
              'override per-step threading_bonus_coef'),
             ('obs_mode', None, 'override obs mode used by the wrapper'),
             ('max_act_vel', None, 'override DeformEnv.MAX_ACT_VEL'),
+            ('final_reward_mult', None,
+             'override DeformEnv.FINAL_REWARD_MULT (default 400)'),
     ]:
         p.add_argument(f'--override_{name}', type=str, default=None,
                        help=helpstr + ' (passed as string; "none" = None).')
@@ -214,6 +216,11 @@ def load_run_config(checkpoint_dir):
         # to match the training cap exactly, pass --override_max_act_vel.
         cfg['max_episode_len'] = extra.get('max_episode_len')
         cfg['seed'] = extra.get('seed')
+        # If the training run patched FINAL_REWARD_MULT, surface it so
+        # the decomp visualization runs with the same terminal-magnitude
+        # as the training reward shape.
+        if 'final_reward_mult' in extra:
+            cfg['final_reward_mult'] = extra['final_reward_mult']
     else:
         # Fall back to args.pkl for at least max_episode_len / seed.
         args_pkl = os.path.join(checkpoint_dir, 'args.pkl')
@@ -262,7 +269,7 @@ def load_demo_config(any_demo_pkl):
 
 def apply_overrides(cfg, parsed):
     """Stamp --override_* values into the cfg in place."""
-    for k in REWARD_KEYS + ('max_act_vel',):
+    for k in REWARD_KEYS + ('max_act_vel', 'final_reward_mult'):
         raw = getattr(parsed, f'override_{k}')
         if raw is not None:
             cfg[k] = _coerce(k, raw)
@@ -1113,16 +1120,28 @@ def _patch_max_act_vel(cfg):
     DeformEnv class (matches how train_privileged.py applies the flag —
     one class-attribute write propagates everywhere)."""
     mav = cfg.get('max_act_vel')
-    if mav in (None, 'none', '', 'auto'):
-        return
-    try:
-        from dedo.envs.deform_env import DeformEnv
-        old = DeformEnv.MAX_ACT_VEL
-        DeformEnv.MAX_ACT_VEL = float(mav)
-        print(f'[init] DeformEnv.MAX_ACT_VEL: {old} -> '
-              f'{DeformEnv.MAX_ACT_VEL}')
-    except Exception as e:
-        print(f'[warn] failed to patch MAX_ACT_VEL: {e!r}')
+    if mav not in (None, 'none', '', 'auto'):
+        try:
+            from dedo.envs.deform_env import DeformEnv
+            old = DeformEnv.MAX_ACT_VEL
+            DeformEnv.MAX_ACT_VEL = float(mav)
+            print(f'[init] DeformEnv.MAX_ACT_VEL: {old} -> '
+                  f'{DeformEnv.MAX_ACT_VEL}')
+        except Exception as e:
+            print(f'[warn] failed to patch MAX_ACT_VEL: {e!r}')
+
+    # Also handle final_reward_mult patching here so a single helper
+    # covers both DeformEnv class-attribute overrides.
+    frm = cfg.get('final_reward_mult')
+    if frm not in (None, 'none', ''):
+        try:
+            from dedo.envs.deform_env import DeformEnv
+            old = DeformEnv.FINAL_REWARD_MULT
+            DeformEnv.FINAL_REWARD_MULT = float(frm)
+            print(f'[init] DeformEnv.FINAL_REWARD_MULT: {old} -> '
+                  f'{DeformEnv.FINAL_REWARD_MULT}')
+        except Exception as e:
+            print(f'[warn] failed to patch FINAL_REWARD_MULT: {e!r}')
 
 
 if __name__ == '__main__':

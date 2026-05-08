@@ -312,6 +312,11 @@ def build_run_name_suffix(extra_args, *, algo='PPO', obs_kind=None,
         v = getattr(a, name, 0)
         if v:
             parts.append(f'_{tag}{float(v):g}')
+    # Terminal-magnitude scale (override of dedo's FINAL_REWARD_MULT=400).
+    # Only emitted when explicitly set, since None = keep dedo default.
+    frm = getattr(a, 'final_reward_mult', None)
+    if frm is not None:
+        parts.append(f'_frm{float(frm):g}')
 
     if extra_tag:
         parts.append(f'_{extra_tag}')

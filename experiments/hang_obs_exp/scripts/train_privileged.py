@@ -320,6 +320,17 @@ parser.add_argument('--threading_bonus_coef', type=float, default=0.0,
                          'so prefer dist_reward_coef alone for the '
                          'first denser-reward experiments. 0 = off '
                          '(default).')
+parser.add_argument('--final_reward_mult', type=float, default=None,
+                    help='Override DeformEnv.FINAL_REWARD_MULT (default '
+                         '400). The terminal-step base reward scales as '
+                         'final_reward_mult * dist, so 400 makes the '
+                         'terminal step ~70%% of episode reward range '
+                         'and crushes the per-step dist_reward signal '
+                         'whenever the cloth ends up far from hole. '
+                         'Reducing to 50–100 equalizes the per-step '
+                         'and terminal magnitudes (50 ~ comparable to '
+                         'a 200-step dist_reward sum at coef=1). None '
+                         '= keep dedo default of 400.')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU even if CUDA is available. Often faster '
                          'for the small MLP over privileged obs since GPU '
@@ -370,6 +381,19 @@ else:
     _DeformEnvForPatch.MAX_ACT_VEL = _mav_mode
     print(f'[init] DeformEnv.MAX_ACT_VEL: {_orig_max_act_vel} -> '
           f'{_DeformEnvForPatch.MAX_ACT_VEL}')
+
+# Patch DeformEnv.FINAL_REWARD_MULT if requested. Same class-attribute
+# pattern as MAX_ACT_VEL — reads in dedo's get_reward() are dynamic, so
+# a single write propagates everywhere. Default 400 makes the terminal
+# step ~70% of episode reward range; reducing to 50-100 equalizes
+# per-step (dist_reward) and terminal magnitudes for healthier credit
+# assignment.
+if extra_args.final_reward_mult is not None:
+    from dedo.envs.deform_env import DeformEnv as _DeformEnvForPatch
+    _orig_final_mult = _DeformEnvForPatch.FINAL_REWARD_MULT
+    _DeformEnvForPatch.FINAL_REWARD_MULT = float(extra_args.final_reward_mult)
+    print(f'[init] DeformEnv.FINAL_REWARD_MULT: {_orig_final_mult} -> '
+          f'{_DeformEnvForPatch.FINAL_REWARD_MULT}')
 
 # Single source of truth: `extra_args.success_factor` flows into the
 # training env, the eval env, AND the BC scripted-demo collection env
