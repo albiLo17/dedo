@@ -373,15 +373,8 @@ class _LiveDisplay:
         self.ax_img.set_yticks([])
         self.ax_step.axhline(0, color='gray', lw=0.5)
         self.ax_cum.axhline(0, color='gray', lw=0.5)
-        # symlog on both axes — per-step so the terminal base_reward
-        # spike doesn't compress vel_pen / action_pen (~-1 each step)
-        # into invisibility, cumulative so small contributions
-        # (pre_settle_pen ~-8) stay distinguishable from zero on a plot
-        # otherwise dominated by a -220 total.
-        self.ax_step.set_yscale('symlog', linthresh=1.0)
-        self.ax_cum.set_yscale('symlog', linthresh=1.0)
-        self.ax_step.set_ylabel('per-step reward (symlog)')
-        self.ax_cum.set_ylabel('cumulative reward (symlog)')
+        self.ax_step.set_ylabel('per-step reward')
+        self.ax_cum.set_ylabel('cumulative reward')
         self.ax_cum.set_xlabel('step')
         self._im = self.ax_img.imshow(np.zeros(
             (cam_resolution, cam_resolution, 3), dtype=np.uint8))
@@ -783,13 +776,7 @@ def _run_episode(ep_idx, args, vec_env, agent, deform, out_dir, ckpt_stem,
         axes[0].axhline(0, color='gray', lw=0.5)
         axes[0].axvline(terminal_x, color='red', lw=0.6, linestyle='--',
                         alpha=0.5, label='terminal', zorder=0)
-        # symlog so the huge terminal base_reward spike (~ ±100s, from
-        # the (max_episode_len - stepnum) multiplier + post-settle
-        # reward) doesn't squash per-step shaping values (vel_pen,
-        # action_pen are ~-1 each step) into looking like zero. Linear
-        # in [-linthresh, +linthresh], log outside.
-        axes[0].set_yscale('symlog', linthresh=1.0)
-        axes[0].set_ylabel('per-step reward (symlog)')
+        axes[0].set_ylabel('per-step reward')
         axes[0].legend(loc='best', fontsize=8, ncol=2)
         title = (f'{stem}\n'
                  f'len={len(rewards)}  total={total_rwd:.2f}  '
@@ -835,11 +822,7 @@ def _run_episode(ep_idx, args, vec_env, agent, deform, out_dir, ckpt_stem,
         axes[1].axhline(0, color='gray', lw=0.5)
         axes[1].axvline(terminal_x, color='red', lw=0.6, linestyle='--',
                         alpha=0.5, zorder=0)
-        # symlog on cumulative too — without it, pre_settle_pen (cum -8)
-        # is visually right next to zero on a linear axis dominated by a
-        # -220 total, even though it's a real contribution.
-        axes[1].set_yscale('symlog', linthresh=1.0)
-        axes[1].set_ylabel('cumulative reward (symlog)')
+        axes[1].set_ylabel('cumulative reward')
         axes[1].set_xlabel('step')
         axes[1].legend(loc='best', fontsize=8, ncol=2)
         fig.tight_layout()
