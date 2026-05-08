@@ -432,6 +432,8 @@ def _episode_record_init():
         'action_pen': [], 'vel_pen': [], 'pre_settle_pen': [],
         'terminal_shaping': [], 'dist_reward': [], 'threading_bonus': [],
         'is_success': 0,
+        'is_threaded_legacy': None, 'is_threaded_topological': None,
+        'max_winding': None, 'hole_loops_used': None,
         'adaptive_dist': None, 'adaptive_thresh': None,
     }
 
@@ -514,6 +516,16 @@ def rollout_policy(checkpoint_dir, cfg, n_episodes, deterministic,
                 rec['threading_bonus'].append(tb)
                 if 'is_success' in info:
                     rec['is_success'] = int(info['is_success'])
+                if 'is_threaded_legacy' in info:
+                    rec['is_threaded_legacy'] = int(
+                        bool(info['is_threaded_legacy']))
+                if 'is_threaded_topological' in info:
+                    rec['is_threaded_topological'] = int(
+                        bool(info['is_threaded_topological']))
+                if 'max_winding' in info:
+                    rec['max_winding'] = float(info['max_winding'])
+                if 'hole_loops_used' in info:
+                    rec['hole_loops_used'] = int(info['hole_loops_used'])
                 if 'adaptive_dist' in info:
                     rec['adaptive_dist'] = float(info['adaptive_dist'])
                 if 'adaptive_thresh' in info:
@@ -586,6 +598,16 @@ def rollout_demos(demo_paths, cfg, video_dir=None,
                 rec['threading_bonus'].append(tb)
                 if 'is_success' in info:
                     rec['is_success'] = int(info['is_success'])
+                if 'is_threaded_legacy' in info:
+                    rec['is_threaded_legacy'] = int(
+                        bool(info['is_threaded_legacy']))
+                if 'is_threaded_topological' in info:
+                    rec['is_threaded_topological'] = int(
+                        bool(info['is_threaded_topological']))
+                if 'max_winding' in info:
+                    rec['max_winding'] = float(info['max_winding'])
+                if 'hole_loops_used' in info:
+                    rec['hole_loops_used'] = int(info['hole_loops_used'])
                 if 'adaptive_dist' in info:
                     rec['adaptive_dist'] = float(info['adaptive_dist'])
                 if 'adaptive_thresh' in info:
@@ -693,6 +715,16 @@ def rollout_scripted(cfg, n_episodes, video_dir=None,
             rec['threading_bonus'].append(tb)
             if 'is_success' in info:
                 rec['is_success'] = int(info['is_success'])
+            if 'is_threaded_legacy' in info:
+                rec['is_threaded_legacy'] = int(
+                    bool(info['is_threaded_legacy']))
+            if 'is_threaded_topological' in info:
+                rec['is_threaded_topological'] = int(
+                    bool(info['is_threaded_topological']))
+            if 'max_winding' in info:
+                rec['max_winding'] = float(info['max_winding'])
+            if 'hole_loops_used' in info:
+                rec['hole_loops_used'] = int(info['hole_loops_used'])
             if 'adaptive_dist' in info:
                 rec['adaptive_dist'] = float(info['adaptive_dist'])
             if 'adaptive_thresh' in info:
@@ -1009,9 +1041,14 @@ def print_summary(episodes, cfg):
           f'vp={cfg["vel_penalty"]} ap={cfg["action_penalty"]} '
           f'psc={cfg["pre_settle_coef"]}')
     print(f'  {"ep":>3} {"len":>4} {"sum":>10} {"base_sum":>10} '
-          f'{"act":>8} {"vel":>8} {"psc":>8} {"shp":>8} {"succ":>4} {"dist":>8}')
+          f'{"act":>8} {"vel":>8} {"psc":>8} {"shp":>8} '
+          f'{"succ":>4} {"leg":>3} {"top":>3} {"wind":>6} '
+          f'{"dist":>8}')
     for i, rec in enumerate(episodes):
         d = rec['adaptive_dist']
+        leg = rec.get('is_threaded_legacy')
+        top = rec.get('is_threaded_topological')
+        w = rec.get('max_winding')
         print(f'  {i:3d} {len(rec["step"]):4d} '
               f'{sum(rec["reward"]):10.2f} {sum(rec["base"]):10.2f} '
               f'{sum(rec["action_pen"]):8.2f} '
@@ -1019,6 +1056,9 @@ def print_summary(episodes, cfg):
               f'{sum(rec["pre_settle_pen"]):8.2f} '
               f'{sum(rec["terminal_shaping"]):8.2f} '
               f'{rec["is_success"]:4d} '
+              f'{("-" if leg is None else f"{leg}"):>3} '
+              f'{("-" if top is None else f"{top}"):>3} '
+              f'{("-" if w is None else f"{w:.3f}"):>6} '
               f'{("nan" if d is None else f"{d:.3f}"):>8}')
     sums = np.array([sum(r['reward']) for r in episodes])
     succ = np.array([r['is_success'] for r in episodes])
