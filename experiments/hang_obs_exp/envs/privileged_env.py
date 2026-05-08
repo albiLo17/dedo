@@ -192,7 +192,9 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                  fail_penalty: float = 0.0,
                  vel_penalty: float = 0.0,
                  action_penalty: float = 0.0,
-                 pre_settle_coef: float = 0.0):
+                 pre_settle_coef: float = 0.0,
+                 dist_reward_coef: float = 0.0,
+                 threading_bonus_coef: float = 0.0):
         """
         success_factor: if not None, override the env's fixed success
         threshold (0.125 m) with an ADAPTIVE one — success requires
@@ -241,6 +243,37 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         reward has effective coef FINAL_REWARD_MULT/WORKSPACE_BOX_SIZE
         = 400/20 = 20 per meter, so coef ~10–30 is a meaningful
         equal-or-greater counterweight; start at 20.
+
+        dist_reward_coef: per-step dense distance reward, fires every
+        step (including terminal). reward += dist_reward_coef / (1 +
+        adaptive_dist), where adaptive_dist is the same hole-centroid-
+        to-goal distance the terminal success check uses. Designed to
+        repair the credit-assignment problem where 99% of the reward
+        signal arrives at the terminal step (after the policy stops
+        acting) — this gives PPO a continuous "you're getting closer"
+        signal that's nonzero throughout the episode and largest
+        exactly when the cloth is on the hole. Suggested 0.5–2.0;
+        cumulative-over-200-steps is comparable to the success_bonus
+        magnitude. 0 = off (default, preserves the old reward shape).
+
+        threading_bonus_coef: per-step bonus that fires every step the
+        cloth is within the success threshold (adaptive_dist <
+        adaptive_thresh). Tells the policy "stay here" once it threads,
+        rather than passing through. Equivalent to a non-sparse success
+        signal that doesn't depend on post-settle physics.
+
+        CAVEAT — the underlying detection is the same hole-centroid-to-
+        goal distance check used by the terminal success criterion, so
+        it inherits the same flakiness (cloth can be near the peg
+        without being topologically threaded; cloth can thread briefly
+        during a swing without staying). For the first denser-reward
+        experiments, prefer dist_reward_coef alone (which doesn't need
+        a threading detection — it's pure distance) and leave this at
+        0. Re-enable after a better threading metric (e.g. peg-z
+        between top/bottom hole-loop vertices, or winding number)
+        replaces the centroid-distance check.
+
+        Disabled if success_factor is None. 0 = off (default).
         """
         assert obs_mode in self.MODES, f'obs_mode must be one of {self.MODES}'
         env.args.cam_resolution = 0
@@ -256,8 +289,18 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._vel_penalty = float(vel_penalty)
         self._action_penalty = float(action_penalty)
         self._pre_settle_coef = float(pre_settle_coef)
+        self._dist_reward_coef = float(dist_reward_coef)
+        self._threading_bonus_coef = float(threading_bonus_coef)
         self._prev_verts = None
         self._hole_radius = None
+        # Per-episode counter for diagnostics: how many steps were
+        # within threshold? The new threading_bonus + this counter
+        # together let us read off "how often is the cloth threaded
+        # during an episode" which post-settle success fails to
+        # capture (cloth can thread at step 80 then slip during settle).
+        self._ep_threading_steps = 0
+        self._ep_dist_reward_sum = 0.0
+        self._ep_threading_bonus_sum = 0.0
 
         # Per-episode reward bookkeeping for the diagnostics callback.
         self._ep_step_count = 0
@@ -294,6 +337,34 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
             self.env, self.obs_mode, self._hole_vertex_indices,
             corner_indices=self._corner_indices)
 
+    def _compute_adaptive_dist(self, verts=None):
+        """Return (adaptive_dist, adaptive_thresh) for the current sim
+        state, or (None, None) if the hole geometry is unavailable.
+
+        Single source of truth for both per-step shaping (dist_reward,
+        threading_bonus) and the terminal success check, so they always
+        agree. `verts` may be passed in to avoid a redundant
+        `get_mesh_data` query when the caller already has them (the
+        step() path queries verts once and reuses).
+        """
+        if not self._hole_vertex_indices or self._hole_radius is None:
+            return None, None
+        if verts is None:
+            _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
+            verts = np.asarray(verts, dtype=np.float32)
+        hv = verts[self._hole_vertex_indices]
+        hv = hv[~np.isnan(hv).any(axis=1)]
+        if len(hv) == 0:
+            return None, None
+        centroid = hv.mean(axis=0)
+        goal = np.asarray(self.env.goal_pos[0], dtype=np.float32)
+        dist = float(np.linalg.norm(centroid - goal))
+        if self._success_factor is None:
+            thresh = None
+        else:
+            thresh = float(self._hole_radius * self._success_factor)
+        return dist, thresh
+
     def _measure_hole_radius(self):
         """Mean distance from hole centroid to hole-loop vertices, in m.
         Captured at reset so the adaptive threshold reflects the hole
@@ -329,6 +400,9 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._ep_base_reward_sum = 0.0
         self._ep_vel_penalty_sum = 0.0
         self._ep_action_penalty_sum = 0.0
+        self._ep_threading_steps = 0
+        self._ep_dist_reward_sum = 0.0
+        self._ep_threading_bonus_sum = 0.0
         return self._build_obs()
 
     def observation(self, obs):
@@ -381,6 +455,54 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
             self._prev_verts = verts_now
 
         # ------------------------------------------------------------------
+        # (2.5) Per-step dense distance reward and threading bonus.
+        #
+        #   Repairs the credit-assignment problem: under the legacy reward
+        #   shape, ~85% of episode return arrives at the terminal step
+        #   (dedo's FINAL_REWARD_MULT=400 dominates per-step base ~0.01).
+        #   PPO can't tell which mid-episode action helped, so it walks
+        #   the policy on noise. These two terms put a continuous signal
+        #   at every step that's largest exactly when the cloth is on
+        #   the hole.
+        #
+        #     dist_reward   = dist_reward_coef / (1 + adaptive_dist)
+        #     threading_bonus = threading_bonus_coef  if adaptive_dist
+        #                       < adaptive_thresh
+        #
+        #   adaptive_dist is the same hole-centroid-to-goal distance the
+        #   terminal success check uses, so the per-step signal points
+        #   at the same target as the eventual reward.
+        # ------------------------------------------------------------------
+        dist_reward = 0.0
+        threading_bonus = 0.0
+        cur_adaptive_dist = None
+        cur_adaptive_thresh = None
+        if self._dist_reward_coef > 0.0 or self._threading_bonus_coef > 0.0:
+            cur_adaptive_dist, cur_adaptive_thresh = (
+                self._compute_adaptive_dist())
+            if cur_adaptive_dist is not None:
+                if self._dist_reward_coef > 0.0:
+                    dist_reward = (
+                        self._dist_reward_coef / (1.0 + cur_adaptive_dist))
+                    reward = float(reward) + dist_reward
+                    info['dist_reward'] = dist_reward
+                    self._ep_dist_reward_sum += dist_reward
+                if (self._threading_bonus_coef > 0.0
+                        and cur_adaptive_thresh is not None
+                        and cur_adaptive_dist < cur_adaptive_thresh):
+                    threading_bonus = self._threading_bonus_coef
+                    reward = float(reward) + threading_bonus
+                    info['threading_bonus'] = threading_bonus
+                    self._ep_threading_bonus_sum += threading_bonus
+                    self._ep_threading_steps += 1
+                # Always expose the per-step adaptive_dist for diagnostics
+                # even when no shaping fires from it. Lets eval_reward_decomp
+                # plot the cloth-to-hole distance trajectory directly.
+                info['adaptive_dist_step'] = cur_adaptive_dist
+                if cur_adaptive_thresh is not None:
+                    info['adaptive_thresh_step'] = cur_adaptive_thresh
+
+        # ------------------------------------------------------------------
         # (3) Pre-settle distance penalty (terminal only).
         #     Linear shaping on the hole-to-goal distance at policy
         #     handoff (BEFORE make_final_steps drops the cloth under
@@ -406,17 +528,16 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         if (done and 'is_success' in info
                 and self._success_factor is not None
                 and self._hole_radius is not None):
-            _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
-            verts = np.asarray(verts, dtype=np.float32)
-            hv = (verts[self._hole_vertex_indices]
-                  if self._hole_vertex_indices else np.zeros((0, 3)))
-            hv = hv[~np.isnan(hv).any(axis=1)]
-            if len(hv) > 0:
-                centroid = hv.mean(axis=0)
-                goal = np.asarray(self.env.goal_pos[0], dtype=np.float32)
-                adaptive_dist = float(np.linalg.norm(centroid - goal))
-                adaptive_thresh = float(
-                    self._hole_radius * self._success_factor)
+            # Reuse the per-step computation if it ran this step, else
+            # compute fresh. Cuts a redundant get_mesh_data call when
+            # both per-step shaping and terminal shaping are active.
+            if cur_adaptive_dist is not None:
+                adaptive_dist = cur_adaptive_dist
+                adaptive_thresh = cur_adaptive_thresh
+            else:
+                adaptive_dist, adaptive_thresh = (
+                    self._compute_adaptive_dist())
+            if adaptive_dist is not None and adaptive_thresh is not None:
                 adaptive_is_success = bool(adaptive_dist < adaptive_thresh)
 
                 info['is_success'] = adaptive_is_success
@@ -451,6 +572,9 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                 adaptive_dist=adaptive_dist,
                 adaptive_thresh=adaptive_thresh,
                 pre_settle_pen=pre_settle_pen,
+                dist_reward_sum=self._ep_dist_reward_sum,
+                threading_bonus_sum=self._ep_threading_bonus_sum,
+                threading_steps=self._ep_threading_steps,
             )
 
         return obs, reward, done, info
@@ -465,14 +589,25 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                                   total_reward,
                                   base_is_success, adaptive_is_success,
                                   adaptive_dist, adaptive_thresh,
-                                  pre_settle_pen=0.0):
+                                  pre_settle_pen=0.0,
+                                  dist_reward_sum=0.0,
+                                  threading_bonus_sum=0.0,
+                                  threading_steps=0):
         info['rwd_diag/reward/episode_total'] = float(
             self._ep_base_reward_sum
             - self._ep_vel_penalty_sum
             - self._ep_action_penalty_sum
+            + dist_reward_sum
+            + threading_bonus_sum
             + terminal_shaping
             - pre_settle_pen
         )
+        info['rwd_diag/reward/dist_reward_sum'] = float(dist_reward_sum)
+        info['rwd_diag/reward/threading_bonus_sum'] = float(
+            threading_bonus_sum)
+        info['rwd_diag/task/threading_steps'] = int(threading_steps)
+        info['rwd_diag/task/threading_fraction'] = (
+            float(threading_steps) / max(self._ep_step_count, 1))
         info['rwd_diag/reward/base_sum'] = float(self._ep_base_reward_sum)
         info['rwd_diag/reward/vel_penalty_sum'] = float(
             self._ep_vel_penalty_sum)

@@ -301,6 +301,25 @@ parser.add_argument('--pre_settle_coef', type=float, default=0.0,
                          'effective coef ~20/m, so a coef of 20 equal-'
                          'weights threading-by-control vs ballistic drop. '
                          '0 = off; start at 20.')
+parser.add_argument('--dist_reward_coef', type=float, default=0.0,
+                    help='Per-step DENSE distance reward, fires every '
+                         'step. reward += coef / (1 + adaptive_dist). '
+                         'Repairs the credit-assignment problem where '
+                         'legacy reward concentrates ~85%% of episode '
+                         'return at the terminal step (after the policy '
+                         'stops acting) — gives PPO a continuous "you '
+                         'are getting closer" signal. Suggested 0.5–2.0 '
+                         '(cumulative-over-200-steps comparable to '
+                         'success_bonus). 0 = off (default; preserves '
+                         'legacy reward).')
+parser.add_argument('--threading_bonus_coef', type=float, default=0.0,
+                    help='Per-step bonus when adaptive_dist < threshold '
+                         '(cloth on hole). CAVEAT: detection inherits '
+                         'the same flakiness as the terminal success '
+                         'check (centroid-distance, not topological), '
+                         'so prefer dist_reward_coef alone for the '
+                         'first denser-reward experiments. 0 = off '
+                         '(default).')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU even if CUDA is available. Often faster '
                          'for the small MLP over privileged obs since GPU '
@@ -446,7 +465,9 @@ def make_wrapped_env(args, obs_mode_str, monitor_dir=None):
                                     fail_penalty=extra_args.fail_penalty,
                                     vel_penalty=extra_args.vel_penalty,
                                     action_penalty=extra_args.action_penalty,
-                                    pre_settle_coef=extra_args.pre_settle_coef)
+                                    pre_settle_coef=extra_args.pre_settle_coef,
+                                    dist_reward_coef=extra_args.dist_reward_coef,
+                                    threading_bonus_coef=extra_args.threading_bonus_coef)
         # Monitor records ep rewards/lengths so SB3 logs rollout/ep_rew_mean.
         env = Monitor(env, filename=monitor_dir)
         return env
@@ -479,7 +500,9 @@ eval_env_raw = PrivilegedObsWrapper(eval_env_raw, obs_mode=obs_mode,
                                     fail_penalty=extra_args.fail_penalty,
                                     vel_penalty=extra_args.vel_penalty,
                                     action_penalty=extra_args.action_penalty,
-                                    pre_settle_coef=extra_args.pre_settle_coef)
+                                    pre_settle_coef=extra_args.pre_settle_coef,
+                                    dist_reward_coef=extra_args.dist_reward_coef,
+                                    threading_bonus_coef=extra_args.threading_bonus_coef)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -711,7 +734,9 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
                                     fail_penalty=extra_args.fail_penalty,
                                     vel_penalty=extra_args.vel_penalty,
                                     action_penalty=extra_args.action_penalty,
-                                    pre_settle_coef=extra_args.pre_settle_coef)
+                                    pre_settle_coef=extra_args.pre_settle_coef,
+                                    dist_reward_coef=extra_args.dist_reward_coef,
+                                    threading_bonus_coef=extra_args.threading_bonus_coef)
     raw.seed(args.seed + 1000)
 
     if save_dir is not None:

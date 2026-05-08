@@ -306,7 +306,9 @@ def build_run_name_suffix(extra_args, *, algo='PPO', obs_kind=None,
     parts.append(f'_sf{float(sf):g}' if sf is not None else '_sf_default')
     for tag, name in [('sb', 'success_bonus'), ('fp', 'fail_penalty'),
                       ('vp', 'vel_penalty'), ('ap', 'action_penalty'),
-                      ('psc', 'pre_settle_coef')]:
+                      ('psc', 'pre_settle_coef'),
+                      ('dr', 'dist_reward_coef'),
+                      ('tb', 'threading_bonus_coef')]:
         v = getattr(a, name, 0)
         if v:
             parts.append(f'_{tag}{float(v):g}')

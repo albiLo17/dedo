@@ -165,6 +165,10 @@ def parse_args():
             ('vel_penalty', None, 'override per-step vel_penalty coef'),
             ('action_penalty', None, 'override per-step action_penalty coef'),
             ('pre_settle_coef', None, 'override terminal pre_settle_coef'),
+            ('dist_reward_coef', None,
+             'override per-step dist_reward_coef'),
+            ('threading_bonus_coef', None,
+             'override per-step threading_bonus_coef'),
             ('obs_mode', None, 'override obs mode used by the wrapper'),
             ('max_act_vel', None, 'override DeformEnv.MAX_ACT_VEL'),
     ]:
@@ -178,6 +182,7 @@ def parse_args():
 # ---------------------------------------------------------------------------
 REWARD_KEYS = ('success_factor', 'success_bonus', 'fail_penalty',
                'vel_penalty', 'action_penalty', 'pre_settle_coef',
+               'dist_reward_coef', 'threading_bonus_coef',
                'obs_mode')
 
 
@@ -223,7 +228,8 @@ def load_run_config(checkpoint_dir):
     cfg.setdefault('obs_mode', 'hole_centroid')
     cfg.setdefault('success_factor', None)
     for k in ('success_bonus', 'fail_penalty', 'vel_penalty',
-              'action_penalty', 'pre_settle_coef'):
+              'action_penalty', 'pre_settle_coef',
+              'dist_reward_coef', 'threading_bonus_coef'):
         cfg.setdefault(k, 0.0)
     cfg.setdefault('max_episode_len', 200)
     cfg.setdefault('seed', 42)
@@ -246,6 +252,8 @@ def load_demo_config(any_demo_pkl):
         'vel_penalty': 0.0,
         'action_penalty': 0.0,
         'pre_settle_coef': 0.0,
+        'dist_reward_coef': 0.0,
+        'threading_bonus_coef': 0.0,
         'max_episode_len': max(d.get('len', 200), 200),
         'seed': 42,
     }
@@ -294,7 +302,9 @@ def make_env(dedo_args, cfg, seed_offset=0):
         fail_penalty=float(cfg['fail_penalty']),
         vel_penalty=float(cfg['vel_penalty']),
         action_penalty=float(cfg['action_penalty']),
-        pre_settle_coef=float(cfg['pre_settle_coef']))
+        pre_settle_coef=float(cfg['pre_settle_coef']),
+        dist_reward_coef=float(cfg.get('dist_reward_coef', 0.0)),
+        threading_bonus_coef=float(cfg.get('threading_bonus_coef', 0.0)))
     env.seed(int(dedo_args.seed) + seed_offset)
     return env
 
@@ -390,20 +400,26 @@ def _capture_settle_frames(vw, info):
 # ---------------------------------------------------------------------------
 def _decompose_step(reward, info):
     """Extract reward components from one step's (reward, info) tuple.
-    Returns (base, action_pen, vel_pen, pre_settle_pen, shaping)."""
+    Returns (base, action_pen, vel_pen, pre_settle_pen, shaping,
+    dist_reward, threading_bonus). Recovers `base` from total reward by
+    subtracting all wrapper-added shaping terms."""
     a_pen = float(info.get('action_penalty', 0.0))
     v_pen = float(info.get('vel_penalty', 0.0))
     ps_pen = float(info.get('pre_settle_penalty', 0.0))
     shaping = float(info.get('shaping_added', 0.0))
-    base = float(reward) + a_pen + v_pen + ps_pen - shaping
-    return base, a_pen, v_pen, ps_pen, shaping
+    dist_rew = float(info.get('dist_reward', 0.0))
+    thread_bonus = float(info.get('threading_bonus', 0.0))
+    base = (float(reward) + a_pen + v_pen + ps_pen
+            - shaping - dist_rew - thread_bonus)
+    return base, a_pen, v_pen, ps_pen, shaping, dist_rew, thread_bonus
 
 
 def _episode_record_init():
     return {
         'step': [], 'reward': [], 'base': [],
         'action_pen': [], 'vel_pen': [], 'pre_settle_pen': [],
-        'terminal_shaping': [], 'is_success': 0,
+        'terminal_shaping': [], 'dist_reward': [], 'threading_bonus': [],
+        'is_success': 0,
         'adaptive_dist': None, 'adaptive_thresh': None,
     }
 
@@ -473,8 +489,8 @@ def rollout_policy(checkpoint_dir, cfg, n_episodes, deterministic,
                 action, _ = agent.predict(norm_obs[None],
                                           deterministic=deterministic)
                 obs, reward, done, info = inner_env.step(action[0])
-                base, a_pen, v_pen, ps_pen, shaping = _decompose_step(
-                    reward, info)
+                base, a_pen, v_pen, ps_pen, shaping, dr, tb = (
+                    _decompose_step(reward, info))
                 rec['step'].append(step)
                 rec['reward'].append(float(reward))
                 rec['base'].append(base)
@@ -482,6 +498,8 @@ def rollout_policy(checkpoint_dir, cfg, n_episodes, deterministic,
                 rec['vel_pen'].append(v_pen)
                 rec['pre_settle_pen'].append(ps_pen)
                 rec['terminal_shaping'].append(shaping)
+                rec['dist_reward'].append(dr)
+                rec['threading_bonus'].append(tb)
                 if 'is_success' in info:
                     rec['is_success'] = int(info['is_success'])
                 if 'adaptive_dist' in info:
@@ -543,8 +561,8 @@ def rollout_demos(demo_paths, cfg, video_dir=None,
             rec = _episode_record_init()
             for step, a in enumerate(acts):
                 obs, reward, done, info = env.step(a)
-                base, a_pen, v_pen, ps_pen, shaping = _decompose_step(
-                    reward, info)
+                base, a_pen, v_pen, ps_pen, shaping, dr, tb = (
+                    _decompose_step(reward, info))
                 rec['step'].append(step)
                 rec['reward'].append(float(reward))
                 rec['base'].append(base)
@@ -552,6 +570,8 @@ def rollout_demos(demo_paths, cfg, video_dir=None,
                 rec['vel_pen'].append(v_pen)
                 rec['pre_settle_pen'].append(ps_pen)
                 rec['terminal_shaping'].append(shaping)
+                rec['dist_reward'].append(dr)
+                rec['threading_bonus'].append(tb)
                 if 'is_success' in info:
                     rec['is_success'] = int(info['is_success'])
                 if 'adaptive_dist' in info:
@@ -648,7 +668,8 @@ def rollout_scripted(cfg, n_episodes, video_dir=None,
                 act_unscaled / DeformEnv.MAX_ACT_VEL, -1.0, 1.0
             ).astype(np.float32)
             obs, reward, done, info = env.step(normalized)
-            base, a_pen, v_pen, ps_pen, shaping = _decompose_step(reward, info)
+            base, a_pen, v_pen, ps_pen, shaping, dr, tb = (
+                _decompose_step(reward, info))
             rec['step'].append(step)
             rec['reward'].append(float(reward))
             rec['base'].append(base)
@@ -656,6 +677,8 @@ def rollout_scripted(cfg, n_episodes, video_dir=None,
             rec['vel_pen'].append(v_pen)
             rec['pre_settle_pen'].append(ps_pen)
             rec['terminal_shaping'].append(shaping)
+            rec['dist_reward'].append(dr)
+            rec['threading_bonus'].append(tb)
             if 'is_success' in info:
                 rec['is_success'] = int(info['is_success'])
             if 'adaptive_dist' in info:
@@ -708,11 +731,14 @@ COMPONENT_COLORS = {
     'vel_pen': '#2ca02c',                # green
     'pre_settle_pen': '#d62728',         # red
     'terminal_shaping': '#9467bd',       # purple
+    'dist_reward': '#17becf',            # cyan (per-step dense distance)
+    'threading_bonus': '#bcbd22',        # olive (per-step threading)
     'reward': '#000000',                 # black (sum, for reference)
 }
 SIGN = {
     'base': +1, 'action_pen': -1, 'vel_pen': -1,
-    'pre_settle_pen': -1, 'terminal_shaping': +1, 'reward': +1,
+    'pre_settle_pen': -1, 'terminal_shaping': +1,
+    'dist_reward': +1, 'threading_bonus': +1, 'reward': +1,
 }
 
 
@@ -779,7 +805,8 @@ def plot_decomposition(episodes, cfg, out_png, title_extra=''):
     # in dedo's get_reward()), so we drop it here and break it out in R1R.
     ax = axes[1, 0]
     comp_names = ['base', 'action_pen', 'vel_pen',
-                  'pre_settle_pen', 'terminal_shaping']
+                  'pre_settle_pen', 'terminal_shaping',
+                  'dist_reward', 'threading_bonus']
     active = []
     for name in comp_names:
         any_nonzero = any(
@@ -913,12 +940,20 @@ def plot_decomposition(episodes, cfg, out_png, title_extra=''):
     # Suptitle: the reward shape this run was trained against, so reading
     # the plot doesn't require cross-referencing config.json.
     sf = cfg['success_factor']
+    dr = cfg.get('dist_reward_coef', 0.0)
+    tb = cfg.get('threading_bonus_coef', 0.0)
+    extras = ''
+    if dr:
+        extras += f'  dr={dr:g}'
+    if tb:
+        extras += f'  tb={tb:g}'
     title = (
         f'Reward decomposition  ({title_extra})\n'
         f'obs_mode={cfg["obs_mode"]}  '
         f'sf={sf}  sb={cfg["success_bonus"]:g}  '
         f'fp={cfg["fail_penalty"]:g}  vp={cfg["vel_penalty"]:g}  '
         f'ap={cfg["action_penalty"]:g}  psc={cfg["pre_settle_coef"]:g}'
+        f'{extras}'
     )
     fig.suptitle(title, fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -930,7 +965,8 @@ def plot_decomposition(episodes, cfg, out_png, title_extra=''):
 def write_csv(episodes, out_csv):
     fields = ['episode', 'step', 'reward', 'base',
               'action_pen', 'vel_pen', 'pre_settle_pen',
-              'terminal_shaping', 'is_success']
+              'terminal_shaping', 'dist_reward', 'threading_bonus',
+              'is_success']
     with open(out_csv, 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(fields)
@@ -943,6 +979,8 @@ def write_csv(episodes, out_csv):
                             f'{rec["vel_pen"][s]:.6f}',
                             f'{rec["pre_settle_pen"][s]:.6f}',
                             f'{rec["terminal_shaping"][s]:.6f}',
+                            f'{rec["dist_reward"][s]:.6f}',
+                            f'{rec["threading_bonus"][s]:.6f}',
                             rec['is_success']])
     print(f'[csv]  wrote {out_csv}')
 
@@ -999,6 +1037,7 @@ def main():
             'success_bonus': 0.0, 'fail_penalty': 0.0,
             'vel_penalty': 0.0, 'action_penalty': 0.0,
             'pre_settle_coef': 0.0,
+            'dist_reward_coef': 0.0, 'threading_bonus_coef': 0.0,
             'max_episode_len': 200, 'seed': parsed.seed,
         }
         title_extra = f'scripted ({parsed.n_episodes} ep)'
