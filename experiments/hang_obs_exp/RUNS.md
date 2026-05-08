@@ -39,8 +39,9 @@ Variations are noted per run.
 | F   | Slow-drift / tight-PPO on D-base             | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | clip_range=0.05, ppo_epochs=3, target_kl=0.02            | Running. Tracks G; slow-drift not the lever so far.    |
 | G   | Clean L4 rerun of D                          | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | (none)                                                   | Running. Baseline for F / H / I comparison.            |
 | H   | BC anchor on D-base                          | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | bc_anchor_batches=4, bc_anchor_lr=1e-4                   | Running.                                               |
-| I   | Demo-based critic warmup on D-base           | 512x512 | 5e-5 | 0 / 50                                 | 1.2 | 100 | 20  | critic_warmup_demo_lr=3e-4                               | Crashed at warmup (SB3 forward_critic API). Fixed; rerun pending. |
-| J   | vp=0 ablation on D-base                      | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | **vel_penalty=0** (rest = D-base)                        | TBD. Tests whether vel_penalty was the dominant attractor. |
+| I   | Demo-based critic warmup on D-base           | 512x512 | 5e-5 | 0 / 50                                 | 1.2 | 100 | 20  | critic_warmup_demo_lr=3e-4                               | Running (rerun, after SB3 API fix). Real recovery: 0.03 plateau through 500k → 0.23 by 750k. Kept alive parallel to K. |
+| J   | vp=0 ablation on D-base                      | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | **vel_penalty=0** (rest = D-base)                        | **REJECTED.** vp=0 did not prevent BC erasure; same 0.7 → 0.05 collapse pattern as D/G by 250k. Diagnosis pivoted to reward-shape (terminal-step dominance), not vel_penalty. |
+| K   | Dense reward redesign on D-base              | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | **vel_penalty=0, dist_reward_coef=1.0, final_reward_mult=50** | TBD. First test of the rebalanced per-step reward (see "Reward redesign" section). |
 
 Critic-warmup column reads as `<rollouts> / <demo_epochs>`:
 
@@ -531,7 +532,114 @@ python experiments/hang_obs_exp/scripts/train_privileged.py \
   actions). Strong evidence for keeping shaping; pivot to H-stacking
   or AWAC.
 
-**Status.** TBD.
+**Outcome (2026-05-08, ~600k env steps before kill).**
+**REJECTED.** `eval/success_rate` collapsed 0.62 → 0.05 by 250k and
+flatlined at 0–0.05 through 600k+ — identical shape to D and G
+(vp=8 baselines). `vel_penalty_sum` was correctly suppressed to ~0
+throughout, but the policy still drifted away from the BC manifold.
+Diagnostics:
+
+- `train/explained_variance` reached 0.6–0.8 — the critic was
+  *not* random, weakening the structural-critic argument that
+  motivated Run I.
+- `train/value_loss` peaked at 3.5+ during collapse window (3–10×
+  other runs), indicating PPO updates with high-magnitude noisy
+  advantages.
+- `train/approx_kl` was 0.025–0.030 (3–5× D/H/I), `train/clip_fraction`
+  ~0.30 — PPO was making aggressive updates per rollout.
+- Reward decomposition (`eval_reward_decomp.py`) on J's checkpoint at
+  600k showed the policy *did* approach the hole (per-step base rises
+  from −0.25 to −0.11 by step 75) and then *drifted away*
+  (back to −0.20 by step 200). Cloth ends episodes at adaptive_dist
+  ~3.4 vs threshold ~0.7.
+- The terminal-step `base = -FINAL_REWARD_MULT × dist` term reached
+  −100 to −250 per failed episode. With per-step base contributing
+  only ~−40 cumulatively, terminal step dominated ~85% of episode
+  return — credit assignment was broken regardless of vel_penalty.
+
+**Diagnosis (revised).** The dominant cause of BC erasure is
+**reward concentration at the terminal step combined with
+post-settle dependence**, not vel_penalty and not random V. PPO
+sees a tiny per-step signal during the episode and a huge,
+delayed, settling-physics-dependent terminal signal — credit
+assignment fails, advantages are noisy in magnitude, and the
+policy walks away from BC. This motivated the reward redesign
+(see below) and Run K.
+
+**Status.** Killed at ~600k. Wandb run kept for diagnostic
+comparison.
+
+---
+
+### Run K — Dense reward redesign on D-base
+
+**Hypothesis.** Replace the terminal-dominated reward with a
+per-step dense distance signal so PPO sees a continuous "you're
+getting closer" reward throughout the episode rather than waiting
+for a delayed, settling-physics-dependent terminal spike. Two
+changes from J (which is otherwise identical):
+
+1. `--dist_reward_coef 1.0` adds `+1 / (1 + adaptive_dist)` per step.
+   Cumulative ~+30 to +110 per episode, depending on closeness —
+   comparable in magnitude to the +100 success_bonus.
+2. `--final_reward_mult 50` (down from dedo default 400) compresses
+   the terminal-base magnitude. Without this, drifted episodes pay
+   −100 to −250 at terminal — far larger than the per-step signal —
+   and PPO's gradient is still terminal-dominated.
+
+`threading_bonus_coef = 0` (deferred until a non-centroid-distance
+threading detector replaces the flaky `adaptive_dist < threshold`
+check; see "Reward redesign" subsection).
+
+`pre_settle_coef` is held at 20 (D-base default). Pre-settle only
+fires at terminal, magnitude ~−10 to −20 for scripted demos at
+psc=20 — modest backstop against ballistic-drop exploits, doesn't
+crush per-step signal.
+
+**Wandb manual name (suggested).**
+
+```
+K: dense reward redesign on D-base - dr=1.0, vp=0, frm=50 (rebalanced terminal)
+```
+
+**Auto-suffix.** Includes the new `_dr` and `_frm` tags from
+`build_run_name_suffix`:
+
+```
+_hole_centroid_512x512_lr5e-5_cw2_lstd-2.7_bc300x60_sf1.2_sb100_psc20_dr1_frm50
+```
+
+**Command.** Launched on the L4 (per RUN-J protocol — M4 sim
+early-termination bug is not confirmed fixed).
+
+```bash
+python experiments/hang_obs_exp/scripts/train_privileged.py \
+    --wandb_run_name 'K: dense reward redesign on D-base - dr=1.0, vp=0, frm=50 (rebalanced terminal)' \
+    --obs_mode hole_centroid \
+    --max_act_vel 4.1 --log_std_init -2.7 \
+    --lr 5e-5 --critic_warmup_rollouts 2 \
+    --success_factor 1.2 --success_bonus 100 \
+    --pre_settle_coef 20 --vel_penalty 0 \
+    --dist_reward_coef 1.0 --threading_bonus_coef 0 \
+    --final_reward_mult 50 \
+    --bc_episodes 300 --bc_demos_only_success --bc_epochs 60 \
+    --net_arch 512,512 \
+    --total_env_steps 3000000 --seed 42 --cpu --use_wandb
+```
+
+**Pre-launch verification.** Reward shape was visualized via
+`eval_reward_decomp.py --scripted` under the K config before launch
+(2026-05-08). Scripted demos under K-shape:
+- 8/10 episodes succeed (matching vp=0 distribution)
+- Net per-episode total: +150–200 for successes, +60–90 for
+  near-miss failures (clean ~+85 cardinal gap from the success_bonus)
+- Per-step `dist_reward` cumulative: +90–110 per episode —
+  comparable in magnitude to the +100 terminal_shaping bonus
+- Per-step contribution rises from 0.16 → 0.83 (peak at step 150)
+  then settles to ~0.65 — the cloth-on-hole "stay here" signal is
+  visible and continuous
+
+**Status.** TBD (about to launch).
 
 ---
 
@@ -606,12 +714,18 @@ the 50 epochs to roughly 0.01 to 0.1 in normalized return space) and
 `train/explained_variance` early in PPO (should start meaningfully
 positive instead of near 0).
 
-**Status.** Crashed during the demo-V warmup step on first launch
-(2026-05-06): `policy.mlp_extractor.forward_critic(...)` doesn't
-exist in the installed SB3 version. Fixed in `_critic_warmup_demos.py`
-by switching to the version-agnostic
-`_, latent_vf = policy.mlp_extractor(features)` tuple unpack. Rerun
-queued behind J.
+**Status.** First launch (2026-05-06) crashed during the demo-V
+warmup step: `policy.mlp_extractor.forward_critic(...)` doesn't
+exist in the installed SB3 version. Fixed in
+`_critic_warmup_demos.py` by switching to the version-agnostic
+`_, latent_vf = policy.mlp_extractor(features)` tuple unpack.
+
+Rerun (2026-05-07) is **running and showing real recovery**:
+post-BC drop to ~0.03 by 200k as expected, holds through 500k,
+then `eval/success_rate` climbs to 0.10–0.23 by 750k. This is
+comparable to D's M4 peak of 0.30 at 1.5M — possibly the demo-V
+warmup is pulling the recovery curve earlier. Worth letting run
+to ~3M steps. Kept running in parallel with K.
 
 ---
 
@@ -673,6 +787,68 @@ this field; `_load_manual_demos` warns and disables critic warmup if
 any loaded pkl is missing it. To use older demo dirs with critic
 warmup, re-collect via `--bc_episodes 300` on a fresh run, or write a
 small migration script.
+
+---
+
+## Reward redesign (2026-05-08)
+
+Triggered by Run J's rejection. Rather than continue patching PPO's
+machinery (lr, warmup, anchor, critic-warmup), we repaired the
+reward shape directly. Three new `PrivilegedObsWrapper` constructor
+parameters (and matching `train_privileged.py` flags):
+
+- `--dist_reward_coef <coef>`: per-step dense distance reward.
+  `reward += coef / (1 + adaptive_dist)` every step (including
+  terminal). Smooth, monotonic, peaks at the hole. Doesn't depend
+  on a discrete threading detector. Suggested 0.5–2.0; cumulative-
+  over-200-steps is comparable to `success_bonus`.
+- `--threading_bonus_coef <coef>`: per-step bonus when
+  `adaptive_dist < threshold`. **Caveat**: detection inherits the
+  same flakiness as the terminal success check (centroid distance,
+  not topological). Left at 0 until a non-distance threading
+  detector (peg-z containment or winding number) replaces the
+  centroid check.
+- `--final_reward_mult <coef>`: override `DeformEnv.FINAL_REWARD_MULT`
+  (default 400). Patches the class attribute the same way
+  `--max_act_vel` does. Reducing to 50–100 compresses the terminal
+  failure-tail magnitude so per-step `dist_reward` isn't crushed
+  whenever cloth ends far from hole.
+
+`info` dict gained `dist_reward`, `threading_bonus`, and
+`adaptive_dist_step` keys per step; episode-end diagnostics gained
+`rwd_diag/reward/dist_reward_sum`,
+`rwd_diag/reward/threading_bonus_sum`,
+`rwd_diag/task/threading_steps`, and
+`rwd_diag/task/threading_fraction`. `eval_reward_decomp.py` was
+extended to plot `+dist_reward` (cyan) and `+threading_bonus`
+(olive) alongside the existing components, and accepts
+`--override_dist_reward_coef`, `--override_threading_bonus_coef`,
+and `--override_final_reward_mult` so reward shapes can be
+prototyped on scripted demos before launching training.
+
+**Why this is a methodologically clean change.** The K reward shape
+was visualized via `eval_reward_decomp.py --scripted` *before*
+launching, and verified to:
+1. Provide a per-step signal of magnitude comparable to terminal
+   (per-step dist_reward sum ~+95 vs terminal_shaping +100).
+2. Cleanly separate successes (~+155 net) from near-miss failures
+   (~+75 net) by the +100 success_bonus gap.
+3. Not blow up the terminal step magnitude on canonical-expert
+   trajectories.
+
+This directly addresses the J-era diagnosis: PPO erased BC because
+the per-step gradient was an order of magnitude smaller than the
+terminal gradient, AND the terminal gradient depended on settling
+physics the policy couldn't directly affect. Both are now fixed.
+
+**Threading-metric work (deferred).** A proper threading detector
+(peg-z between top and bottom hole-loop vertices, or winding
+number of cloth loop around peg axis) is the next planned
+infrastructure improvement. It (a) lets us re-enable
+`threading_bonus_coef`, and (b) replaces the flaky terminal
+success criterion that has known false negatives (cloth threads
+during episode, slips during settle, marked failure). Deferred
+behind K because dist_reward alone doesn't need it.
 
 ---
 

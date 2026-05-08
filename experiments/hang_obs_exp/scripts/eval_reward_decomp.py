@@ -954,6 +954,9 @@ def plot_decomposition(episodes, cfg, out_png, title_extra=''):
         extras += f'  dr={dr:g}'
     if tb:
         extras += f'  tb={tb:g}'
+    frm = cfg.get('final_reward_mult')
+    if frm not in (None, 'none', ''):
+        extras += f'  frm={float(frm):g}'
     title = (
         f'Reward decomposition  ({title_extra})\n'
         f'obs_mode={cfg["obs_mode"]}  '
