@@ -77,11 +77,23 @@ parser.add_argument('--bc_demo_path', type=str, default=None,
 parser.add_argument('--bc_demos_only_success', action='store_true',
                     help='When loading manual demos, keep only those marked '
                          'success=1 in the pkl.')
+parser.add_argument('--success_metric', type=str, default='distance',
+                    choices=['distance', 'threading'],
+                    help='Which metric defines is_success at episode end. '
+                         '"distance" uses hole-centroid → goal_pos '
+                         '(dedo default; threshold is fixed unless '
+                         '--success_factor overrides it adaptively). '
+                         '"threading" uses a geometric linking test — '
+                         'True iff a hanger rod pierces the cloth-hole '
+                         'loop. Threading is robust to post-settle '
+                         'centroid drift and to lift-and-drop exploits, '
+                         'and ignores --success_factor.')
 parser.add_argument('--success_factor', type=float, default=1.2,
                     help='If set, override env success threshold with '
                          'dist < success_factor * hole_radius (adaptive). '
                          'e.g. 0.8 = hole-radius-proportional. Applied to '
-                         'training, eval, and final-eval envs.')
+                         'training, eval, and final-eval envs. Ignored '
+                         'when --success_metric=threading.')
 parser.add_argument('--success_bonus', type=float, default=200.0,
                     help='Extra reward added at terminal step when the '
                          'adaptive success criterion fires. Makes PPO '
@@ -194,6 +206,7 @@ def make_wrapped_env(args, obs_mode_str, monitor_dir=None):
         # before PrivilegedObsWrapper / Monitor see them.
         env = RetryResetEnv(env)
         env = PrivilegedObsWrapper(env, obs_mode=obs_mode_str,
+                                    success_metric=extra_args.success_metric,
                                     success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
@@ -234,6 +247,7 @@ eval_args.cam_viewmat = [9.0, -25.0, 45.0, 0.0, 0.5, 6.5]
 eval_env_raw = gym.make(eval_args.env, args=eval_args)
 eval_env_raw = RetryResetEnv(eval_env_raw)
 eval_env_raw = PrivilegedObsWrapper(eval_env_raw, obs_mode=obs_mode,
+                                     success_metric=extra_args.success_metric,
                                      success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
@@ -281,12 +295,14 @@ if extra_args.cpu:
 if dedo_args.use_wandb:
     import wandb
     if wandb.run is not None:
+        sm = extra_args.success_metric
         sf = extra_args.success_factor
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
         vp = extra_args.vel_penalty
         psc = extra_args.pre_settle_coef
         ap = extra_args.action_penalty
+        sm_tag = f'_sm-{sm}'
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
@@ -294,10 +310,11 @@ if dedo_args.use_wandb:
         psc_tag = f'_psc{psc:g}' if psc else ''
         ap_tag = f'_ap{ap:g}' if ap else ''
         wandb.run.name = (
-            f'{wandb.run.name}_256x256{sf_tag}{sb_tag}{fp_tag}{vp_tag}'
-            f'{psc_tag}{ap_tag}')
+            f'{wandb.run.name}_256x256{sm_tag}{sf_tag}{sb_tag}{fp_tag}'
+            f'{vp_tag}{psc_tag}{ap_tag}')
         wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
+            f'success_metric={sm}',
             f'success_factor={sf if sf is not None else "default"}',
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
@@ -311,6 +328,7 @@ if dedo_args.use_wandb:
         # filter on. dedo_args was logged at init_train but doesn't
         # include extra_args.
         wandb.config.update({
+            'success_metric': sm,
             'shaping_success_factor': sf,
             'shaping_success_bonus': sb,
             'shaping_fail_penalty': fp,
@@ -367,7 +385,8 @@ else:
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
 # Build a self-describing basename so eval mp4s on disk and in wandb media
 # folders are identifiable without checking the surrounding metadata.
-_video_basename = f'eval_{obs_mode}_sf{extra_args.success_factor:g}'
+_video_basename = (f'eval_{obs_mode}_sm-{extra_args.success_metric}'
+                   f'_sf{extra_args.success_factor:g}')
 if extra_args.success_bonus:
     _video_basename += f'_sb{extra_args.success_bonus:g}'
 if extra_args.fail_penalty:
@@ -398,6 +417,7 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes):
     raw = gym.make(args.env, args=deepcopy(args))
     raw = RetryResetEnv(raw)
     raw = PrivilegedObsWrapper(raw, obs_mode=obs_mode_str,
+                                success_metric=extra_args.success_metric,
                                 success_factor=extra_args.success_factor,
                                     success_bonus=extra_args.success_bonus,
                                     fail_penalty=extra_args.fail_penalty,
@@ -601,6 +621,12 @@ agent.save(ckpt_path)
 # same normalized obs the policy was trained on.
 vec_env.save(os.path.join(dedo_args.logdir, 'vec_normalize.pkl'))
 pickle.dump(dedo_args, open(os.path.join(dedo_args.logdir, 'args.pkl'), 'wb'))
+# Persist the wrapper-side shaping config too — args.pkl only has dedo_args,
+# but the obs_mode / shaping coefs (success_metric, success_factor,
+# success_bonus, …) live in extra_args. replay_checkpoint.py picks this
+# up so the user doesn't have to remember which flags this run used.
+pickle.dump(extra_args,
+            open(os.path.join(dedo_args.logdir, 'extra_args.pkl'), 'wb'))
 print(f'\nDone. Checkpoint: {ckpt_path}')
 
 # ---------------------------------------------------------------------------
@@ -610,20 +636,33 @@ from stable_baselines3.common.evaluation import evaluate_policy
 
 print(f'\nRunning final eval ({extra_args.n_final_eval_episodes} episodes)...')
 final_successes = []
+final_threadings = []
+final_distance_successes = []
 
 def _final_cb(_locals, _globals=None):
     info = _locals.get('info', {})
     if 'is_success' in info:
         final_successes.append(int(info['is_success']))
+    if 'is_threaded' in info:
+        final_threadings.append(int(info['is_threaded']))
+    if 'is_distance_success' in info:
+        final_distance_successes.append(int(info['is_distance_success']))
 
 mean_rwd, std_rwd = evaluate_policy(
     agent, eval_env, n_eval_episodes=extra_args.n_final_eval_episodes,
     deterministic=True, callback=_final_cb, return_episode_rewards=False)
 
-final_success_rate = (sum(final_successes) / len(final_successes)
-                      if final_successes else float('nan'))
+def _rate(xs):
+    return sum(xs) / len(xs) if xs else float('nan')
+
+final_success_rate = _rate(final_successes)
+final_threading_rate = _rate(final_threadings)
+final_distance_success_rate = _rate(final_distance_successes)
 print(f'Final eval — mean_rwd={mean_rwd:.3f} ± {std_rwd:.3f}  '
-      f'success_rate={final_success_rate:.3f}  (n={len(final_successes)})')
+      f'success_rate={final_success_rate:.3f}  '
+      f'threading_rate={final_threading_rate:.3f}  '
+      f'distance_success_rate={final_distance_success_rate:.3f}  '
+      f'(n={len(final_successes)})')
 
 if dedo_args.use_wandb:
     import wandb
@@ -631,6 +670,8 @@ if dedo_args.use_wandb:
         'final_eval/mean_reward': mean_rwd,
         'final_eval/std_reward': std_rwd,
         'final_eval/success_rate': final_success_rate,
+        'final_eval/threading_rate': final_threading_rate,
+        'final_eval/distance_success_rate': final_distance_success_rate,
         'final_eval/n_episodes': len(final_successes),
     })
     wandb.finish()

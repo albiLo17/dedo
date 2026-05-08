@@ -93,6 +93,15 @@ class HangVideoCallback(BaseCallback):
         self._steps_since_save = num_steps_between_save  # save right away
         self._episode_count = 0
         self._success_window = deque(maxlen=100)
+        # Parallel windows for the two underlying metrics — both are
+        # populated unconditionally by PrivilegedObsWrapper at episode end,
+        # regardless of which one was selected as `is_success`. Logging
+        # both means a single training run shows on the wandb dashboard
+        # whether (a) optimizing distance also drives threading up, and
+        # (b) optimizing threading also drives the centroid into the
+        # goal region — i.e. agreement vs disagreement of the metrics.
+        self._threading_window = deque(maxlen=100)
+        self._distance_success_window = deque(maxlen=100)
         # Rolling per-step shaping windows. ~2000 samples ≈ 500 steps × 4
         # envs, so the logged mean tracks the last few rollouts and
         # responds quickly when the policy changes.
@@ -128,6 +137,22 @@ class HangVideoCallback(BaseCallback):
                     'rollout/success_rate_100',
                     sum(self._success_window) / len(self._success_window))
                 self.logger.record('rollout/episodes', self._episode_count)
+            # Both underlying metrics, gated separately so we keep the
+            # window populated even if one of them ever goes missing
+            # (e.g. a hanger_id resolution failure suppresses is_threaded).
+            if 'is_threaded' in info:
+                self._threading_window.append(int(info['is_threaded']))
+                self.logger.record(
+                    'rollout/threading_rate_100',
+                    sum(self._threading_window)
+                    / len(self._threading_window))
+            if 'is_distance_success' in info:
+                self._distance_success_window.append(
+                    int(info['is_distance_success']))
+                self.logger.record(
+                    'rollout/distance_success_rate_100',
+                    sum(self._distance_success_window)
+                    / len(self._distance_success_window))
             # Rolling per-step shaping stats. Recording every step is cheap
             # — SB3 only flushes to disk/wandb at log_interval.
             if 'action_penalty' in info:
@@ -189,6 +214,8 @@ class HangVideoCallback(BaseCallback):
                      and self._eval_count % 4 == 0)
         screens = []
         eval_successes = []
+        eval_threadings = []
+        eval_distance_successes = []
 
         # Toggle settle-frame capture on the underlying DeformEnv only when
         # we're recording, so training/eval-without-video stays cheap.
@@ -203,6 +230,11 @@ class HangVideoCallback(BaseCallback):
             info = _locals.get('info', {})
             if 'is_success' in info:
                 eval_successes.append(int(info['is_success']))
+            if 'is_threaded' in info:
+                eval_threadings.append(int(info['is_threaded']))
+            if 'is_distance_success' in info:
+                eval_distance_successes.append(
+                    int(info['is_distance_success']))
             if not log_video:
                 return
             # Append this step's frames into the per-episode buffer (we
@@ -252,6 +284,14 @@ class HangVideoCallback(BaseCallback):
             self.logger.record(
                 'eval/success_rate',
                 sum(eval_successes) / len(eval_successes))
+        if eval_threadings:
+            self.logger.record(
+                'eval/threading_rate',
+                sum(eval_threadings) / len(eval_threadings))
+        if eval_distance_successes:
+            self.logger.record(
+                'eval/distance_success_rate',
+                sum(eval_distance_successes) / len(eval_distance_successes))
 
         if not screens:
             return True

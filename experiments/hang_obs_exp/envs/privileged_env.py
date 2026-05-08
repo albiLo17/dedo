@@ -44,6 +44,138 @@ from dedo.utils.mesh_utils import get_mesh_data
 _WBOX = 20.0
 _MAX_HOLE_VERTS = 40
 
+# Hanger URDF + globalScaling, used by the threading-success metric below.
+# Must match SCENE_INFO['hangcloth']['entities']['urdf/hanger.urdf'] in
+# dedo/utils/task_info.py — change both together.
+_HANGER_GLOBAL_SCALING = 10.0
+
+
+# ---------------------------------------------------------------------------
+# Threading success metric: True iff a hanger rod pierces the cloth's hole
+# loop. This is a topological linking test — robust to hole-centroid drift
+# after settle and to "lift cloth high, drop it onto goal" exploits, which
+# both leave the rod-vs-loop linking unchanged.
+#
+# Algorithm (per loop):
+#   1. Fit a least-squares plane to the loop verts (SVD → centroid + normal).
+#   2. For each hanger rod segment, find where (if at all) it crosses that
+#      plane.
+#   3. Project the crossing point and the loop into the plane's 2D basis,
+#      then run point-in-polygon. Any rod inside any loop → success.
+# Cloth holes from procedural_hang_cloth are small + near-planar after
+# settle, so the planar-polygon approximation matches a Gauss linking
+# integral in practice while staying O(loops * rods).
+# ---------------------------------------------------------------------------
+def _hanger_rod_segments_base_frame(scale=_HANGER_GLOBAL_SCALING):
+    """Hanger rod segments in the hanger's BASE frame, derived from
+    urdf/hanger.urdf. Each entry is a (2, 3) array [p0, p1]."""
+    # rod_link_top: vertical cylinder length=0.05, origin offset (0,0,0.05).
+    top = np.array([[0.0, 0.0, 0.025], [0.0, 0.0, 0.075]], dtype=np.float32)
+    # rod_link_left: cylinder length=0.15, rpy=(0, 1.2566, 0), xyz=(-0.07, 0, 0).
+    angle_l, half_l = 1.25663706144, 0.075
+    cl, sl = np.cos(angle_l), np.sin(angle_l)
+    left = np.array([
+        [+sl * half_l - 0.07, 0.0, +cl * half_l],
+        [-sl * half_l - 0.07, 0.0, -cl * half_l],
+    ], dtype=np.float32)
+    # rod_link_right: cylinder length=0.15, rpy=(0, 1.8849, 0), xyz=(0.07, 0, 0).
+    angle_r, half_r = 1.88495559215, 0.075
+    cr, sr = np.cos(angle_r), np.sin(angle_r)
+    right = np.array([
+        [+sr * half_r + 0.07, 0.0, +cr * half_r],
+        [-sr * half_r + 0.07, 0.0, -cr * half_r],
+    ], dtype=np.float32)
+    return [scale * top, scale * left, scale * right]
+
+
+def _segments_to_world(segments_base, base_pos, base_quat, sim):
+    R = np.asarray(sim.getMatrixFromQuaternion(base_quat),
+                   dtype=np.float32).reshape(3, 3)
+    t = np.asarray(base_pos, dtype=np.float32)
+    return [(R @ seg[0] + t, R @ seg[1] + t) for seg in segments_base]
+
+
+def _point_in_polygon_2d(pt, poly):
+    """Ray-cast point-in-polygon. poly: (N, 2) ordered vertices, N >= 3."""
+    n = len(poly)
+    if n < 3:
+        return False
+    px, py = float(pt[0]), float(pt[1])
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(poly[i, 0]), float(poly[i, 1])
+        xj, yj = float(poly[j, 0]), float(poly[j, 1])
+        if (yi > py) != (yj > py):
+            denom = yj - yi
+            if abs(denom) > 1e-12:
+                x_int = (xj - xi) * (py - yi) / denom + xi
+                if px < x_int:
+                    inside = not inside
+        j = i
+    return inside
+
+
+def _segment_pierces_loop(p0, p1, hv):
+    """One rod segment vs one hole loop. Returns True iff the segment
+    crosses the loop's least-squares plane *inside* the loop polygon."""
+    if len(hv) < 3:
+        return False
+    centroid = hv.mean(axis=0)
+    centered = hv - centroid
+    try:
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return False
+    normal, u, v = vt[2], vt[0], vt[1]
+    poly_2d = np.stack([centered @ u, centered @ v], axis=1)
+    # Sort verts by angle around centroid so the polygon is well-defined
+    # even if deform_true_loop_vertices arrives unordered.
+    angles = np.arctan2(poly_2d[:, 1], poly_2d[:, 0])
+    poly_2d = poly_2d[np.argsort(angles)]
+
+    d0 = float(np.dot(p0 - centroid, normal))
+    d1 = float(np.dot(p1 - centroid, normal))
+    if d0 * d1 > 0:
+        return False  # both endpoints on the same side
+    if abs(d0 - d1) < 1e-9:
+        return False  # parallel to plane
+    t = d0 / (d0 - d1)
+    if not (0.0 <= t <= 1.0):
+        return False
+    x = p0 + t * (p1 - p0)
+    rel = x - centroid
+    return _point_in_polygon_2d(np.array([rel @ u, rel @ v]), poly_2d)
+
+
+def is_cloth_threaded(deform_env, hole_loops, hanger_id,
+                      scale=_HANGER_GLOBAL_SCALING):
+    """True iff any hanger rod pierces any cloth-hole loop.
+
+    hole_loops: list[list[int]] — vertex indices for each hole loop
+        (i.e. args.deform_true_loop_vertices, kept per-loop, NOT
+        flattened — multi-hole cloths thread independently).
+    hanger_id: pybullet body id of the hanger URDF.
+    """
+    if not hole_loops or hanger_id is None:
+        return False
+    sim = deform_env.sim
+    _, verts = get_mesh_data(sim, deform_env.deform_id)
+    verts = np.asarray(verts, dtype=np.float32)
+    base_pos, base_quat = sim.getBasePositionAndOrientation(hanger_id)
+    segs_world = _segments_to_world(
+        _hanger_rod_segments_base_frame(scale=scale),
+        base_pos, base_quat, sim)
+    for loop in hole_loops:
+        if len(loop) < 3:
+            continue
+        hv = verts[loop]
+        hv = hv[~np.isnan(hv).any(axis=1)]
+        for p0, p1 in segs_world:
+            if _segment_pierces_loop(p0, p1, hv):
+                return True
+    return False
+
 
 def build_privileged_obs(deform_env, obs_mode, hole_vertex_indices):
     """Compute the privileged obs for a given mode from the underlying
@@ -182,8 +314,10 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
     """
 
     MODES = ('hole_centroid', 'hole_vertices', 'full_mesh', 'enriched')
+    SUCCESS_METRICS = ('distance', 'threading')
 
     def __init__(self, env, obs_mode: str = 'hole_centroid',
+                 success_metric: str = 'distance',
                  success_factor: float = None,
                  success_bonus: float = 0.0,
                  fail_penalty: float = 0.0,
@@ -191,12 +325,22 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                  pre_settle_coef: float = 0.0,
                  action_penalty: float = 0.0):
         """
+        success_metric: 'distance' (default; current behavior — uses
+        hole-centroid → goal_pos distance, optionally overridden with a
+        radius-proportional adaptive threshold via success_factor) or
+        'threading' (uses a geometric linking test — True iff a hanger
+        rod passes through the cloth-hole loop). Threading is robust to
+        post-settle centroid drift and to lift-and-drop exploits, since
+        both leave the rod-vs-loop topology unchanged. With 'threading',
+        success_factor is ignored.
+
         success_factor: if not None, override the env's fixed success
         threshold (0.125 m) with an ADAPTIVE one — success requires
         hole-centroid-to-goal distance < success_factor * hole_radius,
         where hole_radius is the mean distance from the hole centroid to
         the hole-loop vertices, measured at reset. ~0.6-1.0 is reasonable;
         smaller is stricter. None keeps dedo's fixed criterion unchanged.
+        Only consulted when success_metric == 'distance'.
 
         success_bonus: extra reward added at the terminal step IFF the
         adaptive success criterion fires. 0 = no shaping (default; PPO
@@ -239,11 +383,16 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         equal-or-greater counterweight; start at 20.
         """
         assert obs_mode in self.MODES, f'obs_mode must be one of {self.MODES}'
+        assert success_metric in self.SUCCESS_METRICS, \
+            f'success_metric must be one of {self.SUCCESS_METRICS}'
         env.args.cam_resolution = 0
         super().__init__(env)
 
         self.obs_mode = obs_mode
-        self._hole_vertex_indices = []
+        self._success_metric = success_metric
+        self._hole_loops = []           # list[list[int]] — per-loop indices
+        self._hole_vertex_indices = []  # flat concatenation, used by obs builders
+        self._hanger_id = None
         self._goal_pos = None
         self._success_factor = success_factor
         self._success_bonus = float(success_bonus)
@@ -273,11 +422,23 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         )
         self._obs_dim = obs_dim
 
-    def _get_hole_indices(self):
+    def _get_hole_loops(self):
+        """Per-loop vertex indices. Threading test needs the loops kept
+        separate (multi-hole cloths thread independently); the obs builders
+        only want a flat concatenation."""
         if hasattr(self.env.args, 'deform_true_loop_vertices'):
-            loops = self.env.args.deform_true_loop_vertices
-            return [idx for loop in loops for idx in loop]
+            return [list(loop) for loop in
+                    self.env.args.deform_true_loop_vertices]
         return []
+
+    def _get_hanger_id(self):
+        """SCENE_INFO['hangcloth']['entities'] iterates {hanger.urdf,
+        tallrod.urdf} in insertion order, so DeformEnv.rigid_ids[0] is
+        the hanger body. Used by the threading-success test."""
+        rigid_ids = getattr(self.env, 'rigid_ids', None)
+        if rigid_ids is not None and len(rigid_ids) > 0:
+            return rigid_ids[0]
+        return None
 
     def _build_obs(self):
         return build_privileged_obs(
@@ -300,7 +461,10 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
 
     def reset(self):
         self.env.reset()
-        self._hole_vertex_indices = self._get_hole_indices()
+        self._hole_loops = self._get_hole_loops()
+        self._hole_vertex_indices = [i for loop in self._hole_loops
+                                     for i in loop]
+        self._hanger_id = self._get_hanger_id()
         self._goal_pos = self.env.goal_pos.copy()
         self._hole_radius = self._measure_hole_radius()
         if self._vel_penalty > 0.0:
@@ -316,6 +480,12 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
     def step(self, action):
         _, reward, done, info = self.env.step(action)
         obs = self._build_obs()
+        # Snapshot the env-side reward before any wrapper-side shaping is
+        # applied, so downstream consumers (e.g. replay_checkpoint.py) can
+        # plot each component of the reward separately. Sum of components
+        # = info['base_reward'] - action_penalty - vel_penalty
+        #                       - pre_settle_penalty + shaping_added.
+        info['base_reward'] = float(reward)
         # Action-magnitude penalty: discourages bang-bang/flailing control.
         # Computed on the post-clip action that was actually applied.
         # Applied every step (including terminal) — the action was chosen
@@ -356,33 +526,60 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
             pen = self._pre_settle_coef * pre_dist
             reward = float(reward) - pen
             info['pre_settle_penalty'] = pen
-        # Adaptive success: override env's fixed 0.125m threshold with one
-        # proportional to the hole's effective radius. Optionally inject
-        # a terminal bonus/penalty into the reward so PPO actually
-        # optimizes the (adaptive) success criterion, not just distance.
-        if (done and 'is_success' in info
-                and self._success_factor is not None
-                and self._hole_radius is not None):
-            _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
-            verts = np.asarray(verts, dtype=np.float32)
-            hv = verts[self._hole_vertex_indices] \
-                if self._hole_vertex_indices else np.zeros((0, 3))
-            hv = hv[~np.isnan(hv).any(axis=1)]
-            if len(hv) > 0:
-                centroid = hv.mean(axis=0)
-                goal = np.asarray(self.env.goal_pos[0], dtype=np.float32)
-                dist = float(np.linalg.norm(centroid - goal))
-                thresh = self._hole_radius * self._success_factor
-                is_success = bool(dist < thresh)
-                info['is_success'] = is_success
-                info['adaptive_dist'] = dist
-                info['adaptive_thresh'] = thresh
-                info['hole_radius'] = self._hole_radius
+        # Episode-end success metric & shaping. Two metrics are tracked:
+        #   - threading: rod-pierces-loop linking test (topological).
+        #   - distance:  hole-centroid → goal_pos distance, optionally
+        #                radius-proportional via success_factor.
+        # `is_success` is set to whichever the configured success_metric
+        # selects; the other is logged alongside under its own key.
+        if done:
+            threading_success = None
+            if self._hole_loops and self._hanger_id is not None:
+                threading_success = is_cloth_threaded(
+                    self.env, self._hole_loops, self._hanger_id)
+                info['is_threaded'] = bool(threading_success)
 
+            # info['is_success'] arrives from dedo as the fixed-threshold
+            # distance test; with success_factor we recompute it adaptively.
+            distance_success = info.get('is_success')
+            if (self._success_factor is not None
+                    and self._hole_radius is not None
+                    and self._hole_vertex_indices):
+                _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
+                verts = np.asarray(verts, dtype=np.float32)
+                hv = verts[self._hole_vertex_indices]
+                hv = hv[~np.isnan(hv).any(axis=1)]
+                if len(hv) > 0:
+                    centroid = hv.mean(axis=0)
+                    goal = np.asarray(self.env.goal_pos[0], dtype=np.float32)
+                    dist = float(np.linalg.norm(centroid - goal))
+                    thresh = self._hole_radius * self._success_factor
+                    distance_success = bool(dist < thresh)
+                    info['adaptive_dist'] = dist
+                    info['adaptive_thresh'] = thresh
+                    info['hole_radius'] = self._hole_radius
+            if distance_success is not None:
+                info['is_distance_success'] = bool(distance_success)
+
+            if (self._success_metric == 'threading'
+                    and threading_success is not None):
+                chosen = bool(threading_success)
+            else:
+                chosen = (bool(distance_success)
+                          if distance_success is not None else False)
+            info['is_success'] = chosen
+            info['success_metric'] = self._success_metric
+
+            # Shaping fires only when an adaptive metric is in effect — so
+            # default behavior (no success_factor, distance mode) leaves
+            # dedo's untouched is_success and emits no extra reward.
+            shape_active = (self._success_metric == 'threading'
+                            or self._success_factor is not None)
+            if shape_active:
                 shaping = 0.0
-                if is_success and self._success_bonus != 0.0:
+                if chosen and self._success_bonus != 0.0:
                     shaping += self._success_bonus
-                elif (not is_success) and self._fail_penalty != 0.0:
+                elif (not chosen) and self._fail_penalty != 0.0:
                     shaping -= self._fail_penalty
                 if shaping != 0.0:
                     reward = float(reward) + shaping
