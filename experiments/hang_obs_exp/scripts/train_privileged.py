@@ -63,6 +63,11 @@ parser.add_argument('--use_wandb', action='store_true',
                     help='Log metrics to wandb')
 parser.add_argument('--n_final_eval_episodes', type=int, default=20,
                     help='Number of deterministic eval episodes at end of training')
+parser.add_argument('--n_eval_episodes', type=int, default=10,
+                    help='Episodes per periodic eval during training '
+                         '(HangVideoCallback runs eval every 2 checkpoints). '
+                         'Bump up for less-noisy eval/success_rate curves '
+                         'at the cost of training wall-clock.')
 parser.add_argument('--bc_episodes', type=int, default=50,
                     help='Number of scripted demo episodes for BC pretrain '
                          '(0 to skip)')
@@ -401,7 +406,8 @@ _video_basename += f'_seed{extra_args.seed}'
 cb = HangVideoCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                        num_steps_between_save=num_steps_between_save,
                        viz=False, debug=False,
-                       video_basename=_video_basename)
+                       video_basename=_video_basename,
+                       n_eval_episodes=extra_args.n_eval_episodes)
 
 # ---------------------------------------------------------------------------
 # Behavior cloning pretrain on scripted demos (huge unlock for sparse-reward

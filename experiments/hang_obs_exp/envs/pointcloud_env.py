@@ -20,6 +20,8 @@ from gym import spaces
 
 from dedo.utils.mesh_utils import get_mesh_data
 from dedo.envs.deform_env import DeformEnv
+from dedo.utils.task_info import DEFAULT_CAM_PROJECTION
+from experiments.hang_obs_exp.envs.privileged_env import is_cloth_threaded
 
 _GRIP_DIM = 12
 _DEFAULT_N_POINTS = 512
@@ -36,21 +38,27 @@ def _proj_matrix(near=_PCD_NEAR, far=_PCD_FAR):
 class PointCloudObsWrapper(gym.ObservationWrapper):
     """Replaces obs with a depth-derived point cloud."""
 
+    SUCCESS_METRICS = ('distance', 'threading')
+
     def __init__(self, env,
                  n_points: int = _DEFAULT_N_POINTS,
                  cam_resolution: int = 128,
+                 success_metric: str = 'distance',
                  success_factor: float = None,
                  success_bonus: float = 0.0,
                  fail_penalty: float = 0.0,
                  vel_penalty: float = 0.0,
                  pre_settle_coef: float = 0.0,
                  action_penalty: float = 0.0):
+        assert success_metric in self.SUCCESS_METRICS, \
+            f'success_metric must be one of {self.SUCCESS_METRICS}'
         # PCD wrapper requires a working camera — force cam_resolution.
         env.args.cam_resolution = cam_resolution
         super().__init__(env)
 
         self._n_points = n_points
         self._cam_res_pcd = cam_resolution
+        self._success_metric = success_metric
         self._success_factor = success_factor
         self._success_bonus = float(success_bonus)
         self._fail_penalty = float(fail_penalty)
@@ -58,7 +66,9 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
         self._pre_settle_coef = float(pre_settle_coef)
         self._action_penalty = float(action_penalty)
 
-        self._hole_vertex_indices = []
+        self._hole_loops = []           # list[list[int]] — kept per-loop
+        self._hole_vertex_indices = []  # flat concatenation, used by PCD obs
+        self._hanger_id = None
         self._goal_pos = None
         self._hole_radius = None
         self._prev_verts = None
@@ -82,11 +92,28 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
     # ------------------------------------------------------------------
     # Hole / goal bookkeeping (mirrors PrivilegedObsWrapper).
     # ------------------------------------------------------------------
+    def _get_hole_loops(self):
+        """Per-loop vertex indices. Threading test needs the loops kept
+        separate (multi-hole cloths thread independently)."""
+        if hasattr(self._deform.args, 'deform_true_loop_vertices'):
+            return [list(loop) for loop in
+                    self._deform.args.deform_true_loop_vertices]
+        return []
+
     def _get_hole_indices(self):
         if hasattr(self._deform.args, 'deform_true_loop_vertices'):
             loops = self._deform.args.deform_true_loop_vertices
             return [idx for loop in loops for idx in loop]
         return []
+
+    def _get_hanger_id(self):
+        """SCENE_INFO['hangcloth']['entities'] iterates {hanger.urdf,
+        tallrod.urdf} in insertion order, so DeformEnv.rigid_ids[0] is
+        the hanger body. Used by the threading-success test."""
+        rigid_ids = getattr(self._deform, 'rigid_ids', None)
+        if rigid_ids is not None and len(rigid_ids) > 0:
+            return rigid_ids[0]
+        return None
 
     def _measure_hole_radius(self):
         if not self._hole_vertex_indices:
@@ -175,7 +202,10 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
 
     def reset(self):
         self.env.reset()
-        self._hole_vertex_indices = self._get_hole_indices()
+        self._hole_loops = self._get_hole_loops()
+        self._hole_vertex_indices = [i for loop in self._hole_loops
+                                     for i in loop]
+        self._hanger_id = self._get_hanger_id()
         self._goal_pos = self._deform.goal_pos.copy()
         self._hole_radius = self._measure_hole_radius()
         if self._vel_penalty > 0.0:
@@ -233,30 +263,58 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
             reward = float(reward) - pen
             info['pre_settle_penalty'] = pen
 
-        # Adaptive success + reward shaping (same logic as PrivilegedObsWrapper).
-        if (done and 'is_success' in info
-                and self._success_factor is not None
-                and self._hole_radius is not None):
-            _, verts = get_mesh_data(self._deform.sim, self._deform.deform_id)
-            verts = np.asarray(verts, dtype=np.float32)
-            hv = verts[self._hole_vertex_indices] \
-                if self._hole_vertex_indices else np.zeros((0, 3))
-            hv = hv[~np.isnan(hv).any(axis=1)]
-            if len(hv) > 0:
-                centroid = hv.mean(axis=0)
-                goal = np.asarray(self._deform.goal_pos[0], dtype=np.float32)
-                dist = float(np.linalg.norm(centroid - goal))
-                thresh = self._hole_radius * self._success_factor
-                is_success = bool(dist < thresh)
-                info['is_success'] = is_success
-                info['adaptive_dist'] = dist
-                info['adaptive_thresh'] = thresh
-                info['hole_radius'] = self._hole_radius
+        # Episode-end success metric & shaping. Two metrics are tracked:
+        #   - threading: rod-pierces-loop linking test (topological).
+        #   - distance:  hole-centroid → goal_pos distance, optionally
+        #                radius-proportional via success_factor.
+        # `is_success` is set to whichever success_metric selects; the
+        # other is logged alongside under its own key (mirrors
+        # PrivilegedObsWrapper).
+        if done:
+            threading_success = None
+            if self._hole_loops and self._hanger_id is not None:
+                threading_success = is_cloth_threaded(
+                    self._deform, self._hole_loops, self._hanger_id)
+                info['is_threaded'] = bool(threading_success)
 
+            distance_success = info.get('is_success')
+            if (self._success_factor is not None
+                    and self._hole_radius is not None
+                    and self._hole_vertex_indices):
+                _, verts = get_mesh_data(
+                    self._deform.sim, self._deform.deform_id)
+                verts = np.asarray(verts, dtype=np.float32)
+                hv = verts[self._hole_vertex_indices]
+                hv = hv[~np.isnan(hv).any(axis=1)]
+                if len(hv) > 0:
+                    centroid = hv.mean(axis=0)
+                    goal = np.asarray(self._deform.goal_pos[0],
+                                      dtype=np.float32)
+                    dist = float(np.linalg.norm(centroid - goal))
+                    thresh = self._hole_radius * self._success_factor
+                    distance_success = bool(dist < thresh)
+                    info['adaptive_dist'] = dist
+                    info['adaptive_thresh'] = thresh
+                    info['hole_radius'] = self._hole_radius
+            if distance_success is not None:
+                info['is_distance_success'] = bool(distance_success)
+
+            if (self._success_metric == 'threading'
+                    and threading_success is not None):
+                chosen = bool(threading_success)
+            else:
+                chosen = (bool(distance_success)
+                          if distance_success is not None else False)
+            info['is_success'] = chosen
+            info['success_metric'] = self._success_metric
+
+            shape_active = (self._success_metric == 'threading'
+                            or self._success_factor is not None)
+            if shape_active:
                 shaping = 0.0
-                if is_success and self._success_bonus != 0.0:
+                if chosen and self._success_bonus != 0.0:
                     shaping += self._success_bonus
-                elif (not is_success) and self._fail_penalty != 0.0:
+                elif (not chosen) and self._fail_penalty != 0.0:
                     shaping -= self._fail_penalty
                 if shaping != 0.0:
                     reward = float(reward) + shaping
@@ -276,7 +334,13 @@ class PointCloudObsWrapper(gym.ObservationWrapper):
             return img
 
     def _overlay_pcd(self, img, width, height):
-        view, proj = self._camera_matrices()
+        # Important: the depth-capture pass uses FOV=60 (see _proj_matrix)
+        # while DeformEnv.render() uses DEFAULT_CAM_PROJECTION (FOV=90).
+        # The captured world points are correct in world space, but to
+        # land them on the right pixels of the RGB image we must project
+        # through the SAME matrix the RGB image was rendered with.
+        view = self._deform._cam_viewmat
+        proj = DEFAULT_CAM_PROJECTION['projectionMatrix']
         v = np.asarray(view, dtype=np.float64).reshape(4, 4, order='F')
         p = np.asarray(proj, dtype=np.float64).reshape(4, 4, order='F')
         pts = self._last_pcd_world

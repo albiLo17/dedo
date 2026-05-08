@@ -68,7 +68,8 @@ class CustomCallback(BaseCallback):
     """
 
     def __init__(self, eval_env, logdir, num_train_envs, args,
-                 num_steps_between_save=10000, viz=False, debug=False):
+                 num_steps_between_save=10000, viz=False, debug=False,
+                 n_eval_episodes=5):
         super(CustomCallback, self).__init__(debug)
         # Those variables will be accessible in the callback
         # (they are defined in the base class)
@@ -98,6 +99,7 @@ class CustomCallback(BaseCallback):
         self._episode_count = 0
         self._success_window = deque(maxlen=100)
         self._eval_count = 0
+        self._n_eval_episodes = int(n_eval_episodes)
 
     def _on_training_start(self) -> None:
         """
@@ -159,7 +161,8 @@ class CustomCallback(BaseCallback):
 
                 evaluate_policy(
                     self.model, self._eval_env, callback=grab_screens,
-                    n_eval_episodes=5, deterministic=True)
+                    n_eval_episodes=self._n_eval_episodes,
+                    deterministic=True)
 
                 if eval_successes:
                     self.logger.record('eval/success_rate',

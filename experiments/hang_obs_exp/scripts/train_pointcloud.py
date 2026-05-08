@@ -57,12 +57,27 @@ parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true')
 parser.add_argument('--n_final_eval_episodes', type=int, default=20)
+parser.add_argument('--n_eval_episodes', type=int, default=5,
+                    help='Episodes per periodic eval during training '
+                         '(CustomCallback runs eval every 2 checkpoints). '
+                         'Bump up for less-noisy eval/success_rate curves '
+                         'at the cost of training wall-clock.')
 parser.add_argument('--n_points', type=int, default=512,
                     help='Number of points in the PCD obs (subsampled '
                          'from depth-back-projected world points).')
 parser.add_argument('--cam_resolution_pcd', type=int, default=128,
                     help='Render resolution used for the depth → PCD pipe.')
 # Adaptive success + shaping (same defaults as train_privileged.py).
+parser.add_argument('--success_metric', type=str, default='distance',
+                    choices=['distance', 'threading'],
+                    help='Which metric defines is_success at episode end. '
+                         '"distance" uses hole-centroid → goal_pos '
+                         '(dedo default; threshold scaled by '
+                         '--success_factor). "threading" uses a geometric '
+                         'linking test — True iff a hanger rod pierces the '
+                         'cloth-hole loop. Threading is robust to post-'
+                         'settle centroid drift and lift-and-drop exploits, '
+                         'and ignores --success_factor.')
 parser.add_argument('--success_factor', type=float, default=1.2)
 parser.add_argument('--success_bonus', type=float, default=200.0)
 parser.add_argument('--fail_penalty', type=float, default=0.0)
@@ -173,6 +188,7 @@ def make_wrapped_env(args, monitor_dir=None):
             env,
             n_points=extra_args.n_points,
             cam_resolution=extra_args.cam_resolution_pcd,
+            success_metric=extra_args.success_metric,
             success_factor=extra_args.success_factor,
             success_bonus=extra_args.success_bonus,
             fail_penalty=extra_args.fail_penalty,
@@ -208,6 +224,7 @@ eval_env_raw = PointCloudObsWrapper(
     eval_env_raw,
     n_points=extra_args.n_points,
     cam_resolution=extra_args.cam_resolution_pcd,
+    success_metric=extra_args.success_metric,
     success_factor=extra_args.success_factor,
     success_bonus=extra_args.success_bonus,
     fail_penalty=extra_args.fail_penalty,
@@ -251,6 +268,7 @@ if extra_args.cpu:
 if dedo_args.use_wandb:
     import wandb
     if wandb.run is not None:
+        sm = extra_args.success_metric
         sf = extra_args.success_factor
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
@@ -258,6 +276,7 @@ if dedo_args.use_wandb:
         psc = extra_args.pre_settle_coef
         ap = extra_args.action_penalty
         bc_tag = '_bc' if _use_bc else ''
+        sm_tag = f'_sm-{sm}'
         sf_tag = f'_sf{sf:g}' if sf is not None else '_sf_default'
         sb_tag = f'_sb{sb:g}' if sb else ''
         fp_tag = f'_fp{fp:g}' if fp else ''
@@ -265,12 +284,13 @@ if dedo_args.use_wandb:
         psc_tag = f'_psc{psc:g}' if psc else ''
         ap_tag = f'_ap{ap:g}' if ap else ''
         wandb.run.name = (f'{wandb.run.name}_pcd{extra_args.n_points}'
-                          f'{bc_tag}{sf_tag}{sb_tag}{fp_tag}'
+                          f'{bc_tag}{sm_tag}{sf_tag}{sb_tag}{fp_tag}'
                           f'{vp_tag}{psc_tag}{ap_tag}')
         wandb.run.save()
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pointcloud',
             f'bc={"yes" if _use_bc else "no"}',
+            f'success_metric={sm}',
             f'success_factor={sf}',
             f'success_bonus={sb}',
             f'fail_penalty={fp}',
@@ -285,6 +305,7 @@ if dedo_args.use_wandb:
         # Promote shaping coefs to top-level config keys (filterable in
         # the wandb runs table; not auto-included from extra_args).
         wandb.config.update({
+            'success_metric': sm,
             'shaping_success_factor': sf,
             'shaping_success_bonus': sb,
             'shaping_fail_penalty': fp,
@@ -331,7 +352,8 @@ agent = PPO('MlpPolicy', vec_env, **rl_kwargs)
 num_steps_between_save = dedo_args.log_save_interval * 10 * 50
 cb = CustomCallback(eval_env, dedo_args.logdir, n_envs, dedo_args,
                     num_steps_between_save=num_steps_between_save,
-                    viz=False, debug=False)
+                    viz=False, debug=False,
+                    n_eval_episodes=extra_args.n_eval_episodes)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +369,7 @@ def _collect_pcd_demos(args, num_episodes):
         raw,
         n_points=extra_args.n_points,
         cam_resolution=extra_args.cam_resolution_pcd,
+        success_metric=extra_args.success_metric,
         success_factor=extra_args.success_factor,
         success_bonus=0.0,  # don't shape demo rewards
         fail_penalty=0.0)
@@ -534,22 +557,37 @@ from stable_baselines3.common.evaluation import evaluate_policy
 
 print(f'\nRunning final eval ({extra_args.n_final_eval_episodes} episodes)...')
 final_successes = []
+final_threadings = []
+final_distance_successes = []
 
 
 def _final_cb(_locals, _globals=None):
     info = _locals.get('info', {})
     if 'is_success' in info:
         final_successes.append(int(info['is_success']))
+    if 'is_threaded' in info:
+        final_threadings.append(int(info['is_threaded']))
+    if 'is_distance_success' in info:
+        final_distance_successes.append(int(info['is_distance_success']))
 
 
 mean_rwd, std_rwd = evaluate_policy(
     agent, eval_env, n_eval_episodes=extra_args.n_final_eval_episodes,
     deterministic=True, callback=_final_cb, return_episode_rewards=False)
 
-final_success_rate = (sum(final_successes) / len(final_successes)
-                      if final_successes else float('nan'))
+
+def _rate(xs):
+    return sum(xs) / len(xs) if xs else float('nan')
+
+
+final_success_rate = _rate(final_successes)
+final_threading_rate = _rate(final_threadings)
+final_distance_success_rate = _rate(final_distance_successes)
 print(f'Final eval — mean_rwd={mean_rwd:.3f} ± {std_rwd:.3f}  '
-      f'success_rate={final_success_rate:.3f}  (n={len(final_successes)})')
+      f'success_rate={final_success_rate:.3f}  '
+      f'threading_rate={final_threading_rate:.3f}  '
+      f'distance_success_rate={final_distance_success_rate:.3f}  '
+      f'(n={len(final_successes)})')
 
 if dedo_args.use_wandb:
     import wandb
@@ -557,6 +595,8 @@ if dedo_args.use_wandb:
         'final_eval/mean_reward': mean_rwd,
         'final_eval/std_reward': std_rwd,
         'final_eval/success_rate': final_success_rate,
+        'final_eval/threading_rate': final_threading_rate,
+        'final_eval/distance_success_rate': final_distance_success_rate,
         'final_eval/n_episodes': len(final_successes),
     })
     wandb.finish()

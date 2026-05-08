@@ -81,10 +81,12 @@ class HangVideoCallback(BaseCallback):
 
     def __init__(self, eval_env, logdir, num_train_envs, args,
                  num_steps_between_save=10000, viz=False, debug=False,
-                 video_basename='eval', render_size=300, video_fps=30):
+                 video_basename='eval', render_size=300, video_fps=30,
+                 n_eval_episodes=10):
         super().__init__(debug)
         self._eval_env = eval_env
         self._logdir = logdir
+        self._n_eval_episodes = int(n_eval_episodes)
         self._num_train_envs = num_train_envs
         self._my_args = args
         self._num_steps_between_save = num_steps_between_save
@@ -275,7 +277,8 @@ class HangVideoCallback(BaseCallback):
         try:
             evaluate_policy(
                 self.model, self._eval_env, callback=grab_screens,
-                n_eval_episodes=10, deterministic=True)
+                n_eval_episodes=self._n_eval_episodes,
+                deterministic=True)
         finally:
             if log_video and self._deform is not None:
                 self._deform._record_settle_frames = False
