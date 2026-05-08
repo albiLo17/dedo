@@ -61,6 +61,10 @@ parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true')
+parser.add_argument('--wandb_run_name', type=str, default=None,
+                    help='Custom wandb run name prefix; auto-suffix is '
+                         'still appended. See train_privileged.py for '
+                         'detail.')
 parser.add_argument('--n_final_eval_episodes', type=int, default=20)
 parser.add_argument('--n_points', type=int, default=512,
                     help='Number of points in the PCD obs (subsampled '
@@ -272,10 +276,14 @@ if dedo_args.use_wandb:
         sb = extra_args.success_bonus
         fp = extra_args.fail_penalty
         vp = extra_args.vel_penalty
-        wandb.run.name = wandb.run.name + build_run_name_suffix(
+        _suffix = build_run_name_suffix(
             extra_args, algo='PPO',
             obs_kind=f'pcd{extra_args.n_points}',
             extra_tag=extra_args.policy)
+        if extra_args.wandb_run_name:
+            wandb.run.name = extra_args.wandb_run_name + _suffix
+        else:
+            wandb.run.name = wandb.run.name + _suffix
         wandb.run.tags = list(wandb.run.tags or []) + [
             'obs=pointcloud',
             f'bc={"yes" if _use_bc else "no"}',

@@ -76,6 +76,10 @@ parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true')
+parser.add_argument('--wandb_run_name', type=str, default=None,
+                    help='Custom wandb run name prefix; auto-suffix is '
+                         'still appended. See train_privileged.py for '
+                         'detail.')
 parser.add_argument('--n_final_eval_episodes', type=int, default=50,
                     help='Deterministic eval episodes at end of '
                          'training. n=50 → SE≈0.07 at p=0.5; cheap '
@@ -392,9 +396,13 @@ if dedo_args.use_wandb:
         ap = extra_args.action_penalty
         psc = extra_args.pre_settle_coef
         bc_on = bool(extra_args.bc_demo_path or extra_args.bc_episodes > 0)
-        wandb.run.name = wandb.run.name + build_run_name_suffix(
+        _suffix = build_run_name_suffix(
             extra_args, algo='SAC', obs_kind=f'{obs_mode}_sac',
             net_arch=[256, 256])
+        if extra_args.wandb_run_name:
+            wandb.run.name = extra_args.wandb_run_name + _suffix
+        else:
+            wandb.run.name = wandb.run.name + _suffix
         wandb.run.tags = list(wandb.run.tags or []) + [
             'algo=sac',
             f'obs_mode={obs_mode}',

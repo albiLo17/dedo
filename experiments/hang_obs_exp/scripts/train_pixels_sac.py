@@ -73,6 +73,10 @@ parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true')
+parser.add_argument('--wandb_run_name', type=str, default=None,
+                    help='Custom wandb run name prefix; auto-suffix is '
+                         'still appended. See train_privileged.py for '
+                         'detail.')
 parser.add_argument('--n_final_eval_episodes', type=int, default=50,
                     help='Deterministic eval episodes at end of '
                          'training. n=50 → SE≈0.07 at p=0.5; cheap '
@@ -407,8 +411,12 @@ if dedo_args.use_wandb:
         bc_on = extra_args.bc_episodes > 0
         grip_tag = 'grip' if not extra_args.no_grip else 'pix'
         obs_kind = f'pixels{extra_args.cam_resolution}_{grip_tag}_sac'
-        wandb.run.name = wandb.run.name + build_run_name_suffix(
+        _suffix = build_run_name_suffix(
             extra_args, algo='SAC', obs_kind=obs_kind)
+        if extra_args.wandb_run_name:
+            wandb.run.name = extra_args.wandb_run_name + _suffix
+        else:
+            wandb.run.name = wandb.run.name + _suffix
         wandb.run.tags = list(wandb.run.tags or []) + [
             'algo=sac',
             'obs=pixels',

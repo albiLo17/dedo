@@ -65,6 +65,13 @@ parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp'))
 parser.add_argument('--use_wandb', action='store_true',
                     help='Log metrics to wandb')
+parser.add_argument('--wandb_run_name', type=str, default=None,
+                    help='Custom wandb run name prefix. Replaces wandb '
+                         'auto-generated PPO_<TS>_<env>; the auto-suffix '
+                         '(arch, lr, reward shape, etc.) is still '
+                         'appended. Use this to set the descriptive '
+                         '"H: BC-anchor on D-base" portion from the CLI '
+                         'instead of editing in the wandb UI later.')
 parser.add_argument('--n_final_eval_episodes', type=int, default=50,
                     help='Number of deterministic eval episodes at end '
                          'of training. SE shrinks as 1/sqrt(n); n=50 '
@@ -523,9 +530,13 @@ if dedo_args.use_wandb:
         vp = extra_args.vel_penalty
         ap = extra_args.action_penalty
         psc = extra_args.pre_settle_coef
-        wandb.run.name = wandb.run.name + build_run_name_suffix(
+        _suffix = build_run_name_suffix(
             extra_args, algo='PPO', obs_kind=obs_mode,
             net_arch=_net_arch_list)
+        if extra_args.wandb_run_name:
+            wandb.run.name = extra_args.wandb_run_name + _suffix
+        else:
+            wandb.run.name = wandb.run.name + _suffix
         wandb.run.tags = list(wandb.run.tags or []) + [
             f'success_factor={sf if sf is not None else "default"}',
             f'success_bonus={sb}',
