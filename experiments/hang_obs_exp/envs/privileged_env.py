@@ -194,7 +194,8 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                  action_penalty: float = 0.0,
                  pre_settle_coef: float = 0.0,
                  dist_reward_coef: float = 0.0,
-                 threading_bonus_coef: float = 0.0):
+                 threading_bonus_coef: float = 0.0,
+                 success_metric: str = 'topological'):
         """
         success_factor: if not None, override the env's fixed success
         threshold (0.125 m) with an ADAPTIVE one — success requires
@@ -274,6 +275,24 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         replaces the centroid-distance check.
 
         Disabled if success_factor is None. 0 = off (default).
+
+        success_metric: 'topological' (default) or 'legacy'. Controls
+        the criterion for `info['is_success']`, the active reward
+        success_bonus / fail_penalty trigger, and `--bc_demos_only_success`
+        filtering.
+            - 'topological': cloth-hole loop has winding number
+              |w| >= 0.5 around the peg axis at the terminal step.
+              Captures actual threading regardless of where the cloth
+              settles, including cases where the cloth hangs below the
+              peg tip (which the legacy check fails — z-component of 3D
+              distance dominates). Set in the wrapper from `--success_metric`.
+            - 'legacy': hole-centroid 3D distance to peg tip is below
+              `success_factor * hole_radius`. Documented false negatives
+              when cloth threads but hangs asymmetrically.
+        Both criteria are computed every terminal and exposed via
+        `info['is_threaded_topological']` and
+        `info['is_threaded_legacy']`, regardless of which one drives
+        `info['is_success']`.
         """
         assert obs_mode in self.MODES, f'obs_mode must be one of {self.MODES}'
         env.args.cam_resolution = 0
@@ -291,8 +310,14 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._pre_settle_coef = float(pre_settle_coef)
         self._dist_reward_coef = float(dist_reward_coef)
         self._threading_bonus_coef = float(threading_bonus_coef)
+        if success_metric not in ('topological', 'legacy'):
+            raise ValueError(
+                f"success_metric must be 'topological' or 'legacy', got "
+                f"{success_metric!r}")
+        self._success_metric = success_metric
         self._prev_verts = None
         self._hole_radius = None
+        self._hole_loops = []
         # Per-episode counter for diagnostics: how many steps were
         # within threshold? The new threading_bonus + this counter
         # together let us read off "how often is the cloth threaded
@@ -331,6 +356,72 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
             loops = self.env.args.deform_true_loop_vertices
             return [idx for loop in loops for idx in loop]
         return []
+
+    def _get_hole_loops(self):
+        """Per-loop list of vertex indices, preserved in loop order so the
+        winding-number computation can walk consecutive vertices around
+        the hole. The flat `_hole_vertex_indices` loses this structure."""
+        if hasattr(self.env.args, 'deform_true_loop_vertices'):
+            return [list(loop) for loop in
+                    self.env.args.deform_true_loop_vertices]
+        return []
+
+    def _check_threaded_topological(self, verts=None):
+        """Topological threading check via signed winding number.
+
+        Threading is "the cloth hole loop encircles the peg axis." That's
+        the actual topological invariant — independent of where the cloth
+        ends up settling, whether it's hanging asymmetrically, etc.
+
+        Implementation: project each hole-loop vertex into the
+        peg-axis-perpendicular (xy) plane. Walk the loop in order,
+        summing signed angle changes around the peg's xy position. If
+        |sum| >= 0.5 turns (π radians), the loop wraps the peg.
+
+        The legacy centroid-distance check has a known false-negative
+        regime: when the cloth threads and hangs *below* the peg tip,
+        the z-component of `||hole_centroid - peg_tip||` dominates and
+        the 3D distance exceeds threshold even though the cloth is
+        correctly threaded. The winding check ignores z entirely.
+
+        Returns:
+            (threaded: bool, max_winding: float, n_loops_considered: int)
+            threaded is True iff |max winding across all loops| >= 0.5.
+        """
+        if not self._hole_loops:
+            return False, 0.0, 0
+        if verts is None:
+            _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
+            verts = np.asarray(verts, dtype=np.float32)
+        peg_xy = np.asarray(self.env.goal_pos[0], dtype=np.float32)[:2]
+
+        max_abs_winding = 0.0
+        n_loops_used = 0
+        for loop in self._hole_loops:
+            if len(loop) < 3:
+                continue
+            loop_verts = verts[loop]
+            mask = ~np.isnan(loop_verts).any(axis=1)
+            if mask.sum() < 3:
+                continue
+            xy = loop_verts[mask][:, :2]
+            rel = xy - peg_xy
+            # Skip if any vertex is exactly at the peg (degenerate angle).
+            r = np.linalg.norm(rel, axis=1)
+            if (r < 1e-6).any():
+                continue
+            angles = np.arctan2(rel[:, 1], rel[:, 0])
+            # Walk consecutive edges + closing edge, wrap each diff to
+            # (-π, π] so the sum tracks signed total angular travel.
+            ext = np.concatenate([angles, angles[:1]])
+            diffs = np.diff(ext)
+            diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
+            winding = float(diffs.sum()) / (2 * np.pi)
+            n_loops_used += 1
+            if abs(winding) > max_abs_winding:
+                max_abs_winding = abs(winding)
+        return (max_abs_winding >= 0.5,
+                max_abs_winding, n_loops_used)
 
     def _build_obs(self):
         return build_privileged_obs(
@@ -383,6 +474,7 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
     def reset(self):
         self.env.reset()
         self._hole_vertex_indices = self._get_hole_indices()
+        self._hole_loops = self._get_hole_loops()
         self._goal_pos = self.env.goal_pos.copy()
         self._hole_radius = self._measure_hole_radius()
         # Cache corner indices once per episode: cloth identity is fixed
@@ -528,30 +620,46 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         if (done and 'is_success' in info
                 and self._success_factor is not None
                 and self._hole_radius is not None):
-            # Reuse the per-step computation if it ran this step, else
-            # compute fresh. Cuts a redundant get_mesh_data call when
-            # both per-step shaping and terminal shaping are active.
+            # Compute legacy metric (hole-centroid 3D distance < threshold).
             if cur_adaptive_dist is not None:
                 adaptive_dist = cur_adaptive_dist
                 adaptive_thresh = cur_adaptive_thresh
             else:
                 adaptive_dist, adaptive_thresh = (
                     self._compute_adaptive_dist())
-            if adaptive_dist is not None and adaptive_thresh is not None:
-                adaptive_is_success = bool(adaptive_dist < adaptive_thresh)
+            legacy_is_success = (
+                adaptive_dist is not None
+                and adaptive_thresh is not None
+                and bool(adaptive_dist < adaptive_thresh))
 
-                info['is_success'] = adaptive_is_success
+            # Compute topological metric (winding number around peg axis).
+            topological_is_success, max_winding, n_loops_used = (
+                self._check_threaded_topological())
+
+            # Pick which one drives info['is_success'] + reward shaping.
+            if self._success_metric == 'topological':
+                adaptive_is_success = topological_is_success
+            else:
+                adaptive_is_success = legacy_is_success
+
+            # Always expose both for debugging false positives/negatives.
+            info['is_success'] = adaptive_is_success
+            info['is_threaded_legacy'] = legacy_is_success
+            info['is_threaded_topological'] = topological_is_success
+            info['max_winding'] = float(max_winding)
+            info['hole_loops_used'] = int(n_loops_used)
+            if adaptive_dist is not None:
                 info['adaptive_dist'] = adaptive_dist
                 info['adaptive_thresh'] = adaptive_thresh
-                info['hole_radius'] = self._hole_radius
+            info['hole_radius'] = self._hole_radius
 
-                if adaptive_is_success and self._success_bonus != 0.0:
-                    terminal_shaping = self._success_bonus
-                elif (not adaptive_is_success) and self._fail_penalty != 0.0:
-                    terminal_shaping = -self._fail_penalty
-                if terminal_shaping != 0.0:
-                    reward = float(reward) + terminal_shaping
-                    info['shaping_added'] = terminal_shaping
+            if adaptive_is_success and self._success_bonus != 0.0:
+                terminal_shaping = self._success_bonus
+            elif (not adaptive_is_success) and self._fail_penalty != 0.0:
+                terminal_shaping = -self._fail_penalty
+            if terminal_shaping != 0.0:
+                reward = float(reward) + terminal_shaping
+                info['shaping_added'] = terminal_shaping
 
         # ------------------------------------------------------------------
         # (5) Update per-episode accumulators and emit diagnostics on done.
@@ -632,6 +740,22 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                   if adaptive_is_success is not None else base_is_success)
         if active is not None:
             info['rwd_diag/success/active_rate'] = int(bool(active))
+        # Both adaptive metrics (legacy + topological), so we can read off
+        # the false-negative rate of the legacy check vs the topological
+        # truth even when the run is being trained against one of them.
+        if 'is_threaded_legacy' in info:
+            info['rwd_diag/success/legacy_rate'] = int(
+                bool(info['is_threaded_legacy']))
+        if 'is_threaded_topological' in info:
+            info['rwd_diag/success/topological_rate'] = int(
+                bool(info['is_threaded_topological']))
+        if ('is_threaded_legacy' in info
+                and 'is_threaded_topological' in info):
+            info['rwd_diag/success/metric_disagree_rate'] = int(
+                bool(info['is_threaded_legacy'])
+                != bool(info['is_threaded_topological']))
+        if 'max_winding' in info:
+            info['rwd_diag/task/max_winding'] = float(info['max_winding'])
 
         # Task geometry (only meaningful when adaptive computation ran).
         if adaptive_dist is not None:

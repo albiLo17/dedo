@@ -331,6 +331,20 @@ parser.add_argument('--final_reward_mult', type=float, default=None,
                          'and terminal magnitudes (50 ~ comparable to '
                          'a 200-step dist_reward sum at coef=1). None '
                          '= keep dedo default of 400.')
+parser.add_argument('--success_metric', type=str, default='topological',
+                    choices=['topological', 'legacy'],
+                    help='Criterion for info["is_success"] / reward '
+                         'success_bonus / BC demo filtering. '
+                         '"topological" (default): cloth-hole loop has '
+                         'winding number |w|>=0.5 around the peg axis. '
+                         'Captures actual threading regardless of where '
+                         'cloth settles. "legacy": hole-centroid 3D '
+                         'distance to peg tip < success_factor * '
+                         'hole_radius. Has documented false negatives '
+                         'when cloth hangs below peg tip after '
+                         'threading. The other metric is still computed '
+                         'and emitted to wandb for comparison '
+                         '(rwd_diag/success/legacy_rate, /topological_rate).')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU even if CUDA is available. Often faster '
                          'for the small MLP over privileged obs since GPU '
@@ -491,7 +505,8 @@ def make_wrapped_env(args, obs_mode_str, monitor_dir=None):
                                     action_penalty=extra_args.action_penalty,
                                     pre_settle_coef=extra_args.pre_settle_coef,
                                     dist_reward_coef=extra_args.dist_reward_coef,
-                                    threading_bonus_coef=extra_args.threading_bonus_coef)
+                                    threading_bonus_coef=extra_args.threading_bonus_coef,
+                                    success_metric=extra_args.success_metric)
         # Monitor records ep rewards/lengths so SB3 logs rollout/ep_rew_mean.
         env = Monitor(env, filename=monitor_dir)
         return env
@@ -526,7 +541,8 @@ eval_env_raw = PrivilegedObsWrapper(eval_env_raw, obs_mode=obs_mode,
                                     action_penalty=extra_args.action_penalty,
                                     pre_settle_coef=extra_args.pre_settle_coef,
                                     dist_reward_coef=extra_args.dist_reward_coef,
-                                    threading_bonus_coef=extra_args.threading_bonus_coef)
+                                    threading_bonus_coef=extra_args.threading_bonus_coef,
+                                    success_metric=extra_args.success_metric)
 eval_env_raw = Monitor(eval_env_raw)
 eval_env_raw.seed(dedo_args.seed)
 
@@ -760,7 +776,8 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
                                     action_penalty=extra_args.action_penalty,
                                     pre_settle_coef=extra_args.pre_settle_coef,
                                     dist_reward_coef=extra_args.dist_reward_coef,
-                                    threading_bonus_coef=extra_args.threading_bonus_coef)
+                                    threading_bonus_coef=extra_args.threading_bonus_coef,
+                                    success_metric=extra_args.success_metric)
     raw.seed(args.seed + 1000)
 
     if save_dir is not None:

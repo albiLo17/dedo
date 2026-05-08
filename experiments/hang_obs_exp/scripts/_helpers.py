@@ -317,6 +317,11 @@ def build_run_name_suffix(extra_args, *, algo='PPO', obs_kind=None,
     frm = getattr(a, 'final_reward_mult', None)
     if frm is not None:
         parts.append(f'_frm{float(frm):g}')
+    # Success metric (topological / legacy). Always emitted so the run
+    # name distinguishes runs evaluated under different metrics.
+    sm = getattr(a, 'success_metric', None)
+    if sm and sm != 'topological':  # 'topological' is the new default; omit
+        parts.append(f'_sm-{sm}')
 
     if extra_tag:
         parts.append(f'_{extra_tag}')

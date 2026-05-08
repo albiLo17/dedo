@@ -173,6 +173,8 @@ def parse_args():
             ('max_act_vel', None, 'override DeformEnv.MAX_ACT_VEL'),
             ('final_reward_mult', None,
              'override DeformEnv.FINAL_REWARD_MULT (default 400)'),
+            ('success_metric', None,
+             'override wrapper success_metric: "topological" or "legacy"'),
     ]:
         p.add_argument(f'--override_{name}', type=str, default=None,
                        help=helpstr + ' (passed as string; "none" = None).')
@@ -185,7 +187,7 @@ def parse_args():
 REWARD_KEYS = ('success_factor', 'success_bonus', 'fail_penalty',
                'vel_penalty', 'action_penalty', 'pre_settle_coef',
                'dist_reward_coef', 'threading_bonus_coef',
-               'obs_mode')
+               'obs_mode', 'success_metric')
 
 
 def _coerce(name, raw):
@@ -194,7 +196,7 @@ def _coerce(name, raw):
         return raw
     if str(raw).lower() == 'none':
         return None
-    if name == 'obs_mode':
+    if name in ('obs_mode', 'success_metric'):
         return str(raw)
     return float(raw)
 
@@ -234,6 +236,7 @@ def load_run_config(checkpoint_dir):
                   f'reward shape will default to zeros — pass --override_*')
     cfg.setdefault('obs_mode', 'hole_centroid')
     cfg.setdefault('success_factor', None)
+    cfg.setdefault('success_metric', 'topological')
     for k in ('success_bonus', 'fail_penalty', 'vel_penalty',
               'action_penalty', 'pre_settle_coef',
               'dist_reward_coef', 'threading_bonus_coef'):
@@ -261,6 +264,7 @@ def load_demo_config(any_demo_pkl):
         'pre_settle_coef': 0.0,
         'dist_reward_coef': 0.0,
         'threading_bonus_coef': 0.0,
+        'success_metric': 'topological',
         'max_episode_len': max(d.get('len', 200), 200),
         'seed': 42,
     }
@@ -311,7 +315,8 @@ def make_env(dedo_args, cfg, seed_offset=0):
         action_penalty=float(cfg['action_penalty']),
         pre_settle_coef=float(cfg['pre_settle_coef']),
         dist_reward_coef=float(cfg.get('dist_reward_coef', 0.0)),
-        threading_bonus_coef=float(cfg.get('threading_bonus_coef', 0.0)))
+        threading_bonus_coef=float(cfg.get('threading_bonus_coef', 0.0)),
+        success_metric=str(cfg.get('success_metric', 'topological')))
     env.seed(int(dedo_args.seed) + seed_offset)
     return env
 
@@ -1044,6 +1049,7 @@ def main():
         cfg = {
             'obs_mode': 'hole_centroid',
             'success_factor': 1.2,  # matches view_demo.py's default
+            'success_metric': 'topological',
             'success_bonus': 0.0, 'fail_penalty': 0.0,
             'vel_penalty': 0.0, 'action_penalty': 0.0,
             'pre_settle_coef': 0.0,
