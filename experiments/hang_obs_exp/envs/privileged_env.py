@@ -195,7 +195,7 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                  pre_settle_coef: float = 0.0,
                  dist_reward_coef: float = 0.0,
                  threading_bonus_coef: float = 0.0,
-                 success_metric: str = 'topological'):
+                 success_metric: str = 'hanging'):
         """
         success_factor: if not None, override the env's fixed success
         threshold (0.125 m) with an ADAPTIVE one — success requires
@@ -276,23 +276,33 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
 
         Disabled if success_factor is None. 0 = off (default).
 
-        success_metric: 'topological' (default) or 'legacy'. Controls
-        the criterion for `info['is_success']`, the active reward
-        success_bonus / fail_penalty trigger, and `--bc_demos_only_success`
-        filtering.
-            - 'topological': cloth-hole loop has winding number
-              |w| >= 0.5 around the peg axis at the terminal step.
-              Captures actual threading regardless of where the cloth
-              settles, including cases where the cloth hangs below the
-              peg tip (which the legacy check fails — z-component of 3D
-              distance dominates). Set in the wrapper from `--success_metric`.
+        success_metric: 'hanging' (default), 'topological', or 'legacy'.
+        Controls the criterion for `info['is_success']`, the active
+        reward success_bonus / fail_penalty trigger, and
+        `--bc_demos_only_success` filtering.
+            - 'hanging': three 3D checks — lateral alignment, descended
+              past peg tip, and vertical extent. Designed to capture
+              "cloth is hanging FROM the peg" without relying on
+              non-degenerate hole-loop geometry, which the topological
+              winding number requires (and which collapses for this
+              task's flat-pressed cloth). The recommended default.
+            - 'topological': hole-loop has winding number |w| >= 0.5
+              around the peg axis. Mathematically clean, but the cloth
+              collapses at finished position — hole vertices align
+              along a vertical line through peg, xy projection
+              degenerates, and winding rounds to 0 on genuinely-
+              threaded cloth. Kept as an option for comparison.
             - 'legacy': hole-centroid 3D distance to peg tip is below
-              `success_factor * hole_radius`. Documented false negatives
-              when cloth threads but hangs asymmetrically.
-        Both criteria are computed every terminal and exposed via
-        `info['is_threaded_topological']` and
+              `success_factor * hole_radius`. Documented false
+              negatives when cloth threads and hangs below peg (z
+              component of 3D distance dominates) and false positives
+              when cloth lands close-but-beside peg.
+        All three criteria are computed every terminal step and
+        exposed via `info['is_threaded_hanging']`,
+        `info['is_threaded_topological']`, and
         `info['is_threaded_legacy']`, regardless of which one drives
-        `info['is_success']`.
+        `info['is_success']` — so we can quantify metric disagreement
+        rates from any run.
         """
         assert obs_mode in self.MODES, f'obs_mode must be one of {self.MODES}'
         env.args.cam_resolution = 0
@@ -310,10 +320,10 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         self._pre_settle_coef = float(pre_settle_coef)
         self._dist_reward_coef = float(dist_reward_coef)
         self._threading_bonus_coef = float(threading_bonus_coef)
-        if success_metric not in ('topological', 'legacy'):
+        if success_metric not in ('hanging', 'topological', 'legacy'):
             raise ValueError(
-                f"success_metric must be 'topological' or 'legacy', got "
-                f"{success_metric!r}")
+                f"success_metric must be 'hanging', 'topological', or "
+                f"'legacy', got {success_metric!r}")
         self._success_metric = success_metric
         self._prev_verts = None
         self._hole_radius = None
@@ -427,6 +437,78 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         return build_privileged_obs(
             self.env, self.obs_mode, self._hole_vertex_indices,
             corner_indices=self._corner_indices)
+
+    def _check_hanging_on_peg(self, verts=None):
+        """Threading detection that handles collapsed cloth correctly.
+
+        The topological winding-number check fails on this task because
+        the cloth *collapses* at finished position: both halves press
+        flat against each other, hole-loop vertices end up nearly
+        co-located along a vertical line through the peg axis, and the
+        xy-projection of the loop becomes a degenerate line/point.
+        Winding number flickers to 0 on genuinely-threaded cloth.
+
+        This check uses three 3D properties instead of a projection,
+        which together capture "is the cloth hanging FROM the peg":
+
+        1. **Lateral alignment**: hole_centroid xy is within
+           `success_factor * hole_radius` of the peg's xy. The cloth's
+           hole opening is laterally over the peg.
+        2. **Descended past peg tip**: at least one hole vertex has
+           z below the peg tip's z. Confirms the cloth has actually
+           come down through the peg, rejecting the "cloth balanced
+           on top of peg" exploit.
+        3. **Vertical extent**: hole-vertex z range is at least
+           `0.5 * hole_radius`. Rejects "cloth lying flat next to peg"
+           cases where lateral alignment might still pass (cloth is
+           on the ground, hole compressed flat).
+
+        All three in 3D — no projection-to-line failure mode. Catches
+        the legacy false-negative case (cloth threaded but hangs way
+        below peg → big 3D distance, but lateral=✓, descent=✓,
+        extent=✓).
+
+        Returns:
+            (hanging: bool, lat_dist: float | None,
+             descended: bool | None, z_range: float | None).
+        """
+        if not self._hole_vertex_indices or self._hole_radius is None:
+            return False, None, None, None
+        if verts is None:
+            _, verts = get_mesh_data(self.env.sim, self.env.deform_id)
+            verts = np.asarray(verts, dtype=np.float32)
+        hv = verts[self._hole_vertex_indices]
+        hv = hv[~np.isnan(hv).any(axis=1)]
+        if len(hv) < 3:
+            return False, None, None, None
+
+        centroid = hv.mean(axis=0)
+        peg = np.asarray(self.env.goal_pos[0], dtype=np.float32)
+
+        # 1. Lateral (xy) alignment — same threshold scale as legacy 3D
+        # check, just dropping the z-component that caused the false
+        # negatives on hanging-below-peg cases.
+        lat_dist = float(np.linalg.norm(centroid[:2] - peg[:2]))
+        sf = self._success_factor if self._success_factor is not None else 1.2
+        lat_thresh = float(self._hole_radius * sf)
+        lat_close = lat_dist < lat_thresh
+
+        # 2. At least one hole vertex below peg tip — rejects "balanced
+        # on tip" cases. Tolerates noise: any single vertex needs to
+        # have z below peg.z, not the whole loop.
+        min_hole_z = float(hv[:, 2].min())
+        descended = min_hole_z < peg[2]
+
+        # 3. Vertical extent — rejects flat-on-ground cases where
+        # cloth has lateral alignment but isn't actually around the
+        # peg (e.g., cloth puddled at peg base). 0.5 * hole_radius is
+        # a generous threshold; collapsed-but-hanging cloth still has
+        # at least the hole's diameter worth of vertical extent.
+        z_range = float(hv[:, 2].max() - hv[:, 2].min())
+        has_extent = z_range > (0.5 * self._hole_radius)
+
+        return (lat_close and descended and has_extent,
+                lat_dist, descended, z_range)
 
     def _compute_adaptive_dist(self, verts=None):
         """Return (adaptive_dist, adaptive_thresh) for the current sim
@@ -636,18 +718,31 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
             topological_is_success, max_winding, n_loops_used = (
                 self._check_threaded_topological())
 
+            # Compute hanging-on-peg metric (3D, robust to collapsed cloth).
+            hanging_is_success, lat_dist_xy, descended, z_range = (
+                self._check_hanging_on_peg())
+
             # Pick which one drives info['is_success'] + reward shaping.
-            if self._success_metric == 'topological':
+            if self._success_metric == 'hanging':
+                adaptive_is_success = hanging_is_success
+            elif self._success_metric == 'topological':
                 adaptive_is_success = topological_is_success
             else:
                 adaptive_is_success = legacy_is_success
 
-            # Always expose both for debugging false positives/negatives.
+            # Always expose all three for debugging metric disagreement.
             info['is_success'] = adaptive_is_success
             info['is_threaded_legacy'] = legacy_is_success
             info['is_threaded_topological'] = topological_is_success
+            info['is_threaded_hanging'] = hanging_is_success
             info['max_winding'] = float(max_winding)
             info['hole_loops_used'] = int(n_loops_used)
+            if lat_dist_xy is not None:
+                info['lat_dist_xy'] = lat_dist_xy
+            if descended is not None:
+                info['descended_past_tip'] = bool(descended)
+            if z_range is not None:
+                info['hole_z_range'] = z_range
             if adaptive_dist is not None:
                 info['adaptive_dist'] = adaptive_dist
                 info['adaptive_thresh'] = adaptive_thresh
@@ -740,22 +835,39 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
                   if adaptive_is_success is not None else base_is_success)
         if active is not None:
             info['rwd_diag/success/active_rate'] = int(bool(active))
-        # Both adaptive metrics (legacy + topological), so we can read off
-        # the false-negative rate of the legacy check vs the topological
-        # truth even when the run is being trained against one of them.
+        # All three success metrics — legacy / topological / hanging —
+        # so we can quantify cross-metric disagreement on every run,
+        # regardless of which one was the active training criterion.
         if 'is_threaded_legacy' in info:
             info['rwd_diag/success/legacy_rate'] = int(
                 bool(info['is_threaded_legacy']))
         if 'is_threaded_topological' in info:
             info['rwd_diag/success/topological_rate'] = int(
                 bool(info['is_threaded_topological']))
+        if 'is_threaded_hanging' in info:
+            info['rwd_diag/success/hanging_rate'] = int(
+                bool(info['is_threaded_hanging']))
         if ('is_threaded_legacy' in info
                 and 'is_threaded_topological' in info):
-            info['rwd_diag/success/metric_disagree_rate'] = int(
+            info['rwd_diag/success/legacy_vs_topo_disagree'] = int(
                 bool(info['is_threaded_legacy'])
                 != bool(info['is_threaded_topological']))
+        if ('is_threaded_legacy' in info
+                and 'is_threaded_hanging' in info):
+            info['rwd_diag/success/legacy_vs_hanging_disagree'] = int(
+                bool(info['is_threaded_legacy'])
+                != bool(info['is_threaded_hanging']))
+        if ('is_threaded_topological' in info
+                and 'is_threaded_hanging' in info):
+            info['rwd_diag/success/topo_vs_hanging_disagree'] = int(
+                bool(info['is_threaded_topological'])
+                != bool(info['is_threaded_hanging']))
         if 'max_winding' in info:
             info['rwd_diag/task/max_winding'] = float(info['max_winding'])
+        if 'lat_dist_xy' in info:
+            info['rwd_diag/task/lat_dist_xy'] = float(info['lat_dist_xy'])
+        if 'hole_z_range' in info:
+            info['rwd_diag/task/hole_z_range'] = float(info['hole_z_range'])
 
         # Task geometry (only meaningful when adaptive computation ran).
         if adaptive_dist is not None:

@@ -331,20 +331,27 @@ parser.add_argument('--final_reward_mult', type=float, default=None,
                          'and terminal magnitudes (50 ~ comparable to '
                          'a 200-step dist_reward sum at coef=1). None '
                          '= keep dedo default of 400.')
-parser.add_argument('--success_metric', type=str, default='topological',
-                    choices=['topological', 'legacy'],
+parser.add_argument('--success_metric', type=str, default='hanging',
+                    choices=['hanging', 'topological', 'legacy'],
                     help='Criterion for info["is_success"] / reward '
                          'success_bonus / BC demo filtering. '
-                         '"topological" (default): cloth-hole loop has '
-                         'winding number |w|>=0.5 around the peg axis. '
-                         'Captures actual threading regardless of where '
-                         'cloth settles. "legacy": hole-centroid 3D '
-                         'distance to peg tip < success_factor * '
-                         'hole_radius. Has documented false negatives '
-                         'when cloth hangs below peg tip after '
-                         'threading. The other metric is still computed '
-                         'and emitted to wandb for comparison '
-                         '(rwd_diag/success/legacy_rate, /topological_rate).')
+                         '"hanging" (default, recommended): three 3D '
+                         'checks — hole-centroid xy near peg, some hole '
+                         'vertex below peg tip, hole has vertical '
+                         'extent. Robust to collapsed cloth. '
+                         '"topological": winding number |w|>=0.5 around '
+                         'peg axis. Mathematically clean but degenerates '
+                         'on collapsed cloth (hole vertices align along '
+                         'a vertical line through peg, xy projection '
+                         'becomes a line/point). '
+                         '"legacy": hole-centroid 3D distance to peg '
+                         'tip < success_factor * hole_radius. Has '
+                         'documented false negatives (cloth hangs below '
+                         'tip) and false positives (cloth lands beside '
+                         'peg). All three are computed and emitted to '
+                         'wandb for comparison (rwd_diag/success/'
+                         '{legacy,topological,hanging}_rate, plus '
+                         'pairwise disagreement rates).')
 parser.add_argument('--cpu', action='store_true',
                     help='Force CPU even if CUDA is available. Often faster '
                          'for the small MLP over privileged obs since GPU '

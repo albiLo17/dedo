@@ -174,7 +174,7 @@ def parse_args():
             ('final_reward_mult', None,
              'override DeformEnv.FINAL_REWARD_MULT (default 400)'),
             ('success_metric', None,
-             'override wrapper success_metric: "topological" or "legacy"'),
+             'override wrapper success_metric: "hanging", "topological", or "legacy"'),
     ]:
         p.add_argument(f'--override_{name}', type=str, default=None,
                        help=helpstr + ' (passed as string; "none" = None).')
@@ -236,7 +236,7 @@ def load_run_config(checkpoint_dir):
                   f'reward shape will default to zeros — pass --override_*')
     cfg.setdefault('obs_mode', 'hole_centroid')
     cfg.setdefault('success_factor', None)
-    cfg.setdefault('success_metric', 'topological')
+    cfg.setdefault('success_metric', 'hanging')
     for k in ('success_bonus', 'fail_penalty', 'vel_penalty',
               'action_penalty', 'pre_settle_coef',
               'dist_reward_coef', 'threading_bonus_coef'):
@@ -264,7 +264,7 @@ def load_demo_config(any_demo_pkl):
         'pre_settle_coef': 0.0,
         'dist_reward_coef': 0.0,
         'threading_bonus_coef': 0.0,
-        'success_metric': 'topological',
+        'success_metric': 'hanging',
         'max_episode_len': max(d.get('len', 200), 200),
         'seed': 42,
     }
@@ -316,7 +316,7 @@ def make_env(dedo_args, cfg, seed_offset=0):
         pre_settle_coef=float(cfg['pre_settle_coef']),
         dist_reward_coef=float(cfg.get('dist_reward_coef', 0.0)),
         threading_bonus_coef=float(cfg.get('threading_bonus_coef', 0.0)),
-        success_metric=str(cfg.get('success_metric', 'topological')))
+        success_metric=str(cfg.get('success_metric', 'hanging')))
     env.seed(int(dedo_args.seed) + seed_offset)
     return env
 
@@ -433,7 +433,10 @@ def _episode_record_init():
         'terminal_shaping': [], 'dist_reward': [], 'threading_bonus': [],
         'is_success': 0,
         'is_threaded_legacy': None, 'is_threaded_topological': None,
+        'is_threaded_hanging': None,
         'max_winding': None, 'hole_loops_used': None,
+        'lat_dist_xy': None, 'descended_past_tip': None,
+        'hole_z_range': None,
         'adaptive_dist': None, 'adaptive_thresh': None,
     }
 
@@ -522,10 +525,20 @@ def rollout_policy(checkpoint_dir, cfg, n_episodes, deterministic,
                 if 'is_threaded_topological' in info:
                     rec['is_threaded_topological'] = int(
                         bool(info['is_threaded_topological']))
+                if 'is_threaded_hanging' in info:
+                    rec['is_threaded_hanging'] = int(
+                        bool(info['is_threaded_hanging']))
                 if 'max_winding' in info:
                     rec['max_winding'] = float(info['max_winding'])
                 if 'hole_loops_used' in info:
                     rec['hole_loops_used'] = int(info['hole_loops_used'])
+                if 'lat_dist_xy' in info:
+                    rec['lat_dist_xy'] = float(info['lat_dist_xy'])
+                if 'descended_past_tip' in info:
+                    rec['descended_past_tip'] = bool(
+                        info['descended_past_tip'])
+                if 'hole_z_range' in info:
+                    rec['hole_z_range'] = float(info['hole_z_range'])
                 if 'adaptive_dist' in info:
                     rec['adaptive_dist'] = float(info['adaptive_dist'])
                 if 'adaptive_thresh' in info:
@@ -604,10 +617,20 @@ def rollout_demos(demo_paths, cfg, video_dir=None,
                 if 'is_threaded_topological' in info:
                     rec['is_threaded_topological'] = int(
                         bool(info['is_threaded_topological']))
+                if 'is_threaded_hanging' in info:
+                    rec['is_threaded_hanging'] = int(
+                        bool(info['is_threaded_hanging']))
                 if 'max_winding' in info:
                     rec['max_winding'] = float(info['max_winding'])
                 if 'hole_loops_used' in info:
                     rec['hole_loops_used'] = int(info['hole_loops_used'])
+                if 'lat_dist_xy' in info:
+                    rec['lat_dist_xy'] = float(info['lat_dist_xy'])
+                if 'descended_past_tip' in info:
+                    rec['descended_past_tip'] = bool(
+                        info['descended_past_tip'])
+                if 'hole_z_range' in info:
+                    rec['hole_z_range'] = float(info['hole_z_range'])
                 if 'adaptive_dist' in info:
                     rec['adaptive_dist'] = float(info['adaptive_dist'])
                 if 'adaptive_thresh' in info:
@@ -721,10 +744,20 @@ def rollout_scripted(cfg, n_episodes, video_dir=None,
             if 'is_threaded_topological' in info:
                 rec['is_threaded_topological'] = int(
                     bool(info['is_threaded_topological']))
+            if 'is_threaded_hanging' in info:
+                rec['is_threaded_hanging'] = int(
+                    bool(info['is_threaded_hanging']))
             if 'max_winding' in info:
                 rec['max_winding'] = float(info['max_winding'])
             if 'hole_loops_used' in info:
                 rec['hole_loops_used'] = int(info['hole_loops_used'])
+            if 'lat_dist_xy' in info:
+                rec['lat_dist_xy'] = float(info['lat_dist_xy'])
+            if 'descended_past_tip' in info:
+                rec['descended_past_tip'] = bool(
+                    info['descended_past_tip'])
+            if 'hole_z_range' in info:
+                rec['hole_z_range'] = float(info['hole_z_range'])
             if 'adaptive_dist' in info:
                 rec['adaptive_dist'] = float(info['adaptive_dist'])
             if 'adaptive_thresh' in info:
@@ -1042,13 +1075,16 @@ def print_summary(episodes, cfg):
           f'psc={cfg["pre_settle_coef"]}')
     print(f'  {"ep":>3} {"len":>4} {"sum":>10} {"base_sum":>10} '
           f'{"act":>8} {"vel":>8} {"psc":>8} {"shp":>8} '
-          f'{"succ":>4} {"leg":>3} {"top":>3} {"wind":>6} '
-          f'{"dist":>8}')
+          f'{"succ":>4} {"leg":>3} {"top":>3} {"hng":>3} '
+          f'{"wind":>6} {"latxy":>6} {"zrng":>6} {"dist":>8}')
     for i, rec in enumerate(episodes):
         d = rec['adaptive_dist']
         leg = rec.get('is_threaded_legacy')
         top = rec.get('is_threaded_topological')
+        hng = rec.get('is_threaded_hanging')
         w = rec.get('max_winding')
+        latxy = rec.get('lat_dist_xy')
+        zrng = rec.get('hole_z_range')
         print(f'  {i:3d} {len(rec["step"]):4d} '
               f'{sum(rec["reward"]):10.2f} {sum(rec["base"]):10.2f} '
               f'{sum(rec["action_pen"]):8.2f} '
@@ -1058,7 +1094,10 @@ def print_summary(episodes, cfg):
               f'{rec["is_success"]:4d} '
               f'{("-" if leg is None else f"{leg}"):>3} '
               f'{("-" if top is None else f"{top}"):>3} '
+              f'{("-" if hng is None else f"{hng}"):>3} '
               f'{("-" if w is None else f"{w:.3f}"):>6} '
+              f'{("-" if latxy is None else f"{latxy:.3f}"):>6} '
+              f'{("-" if zrng is None else f"{zrng:.3f}"):>6} '
               f'{("nan" if d is None else f"{d:.3f}"):>8}')
     sums = np.array([sum(r['reward']) for r in episodes])
     succ = np.array([r['is_success'] for r in episodes])
@@ -1089,11 +1128,12 @@ def main():
         cfg = {
             'obs_mode': 'hole_centroid',
             'success_factor': 1.2,  # matches view_demo.py's default
-            'success_metric': 'topological',
+            'success_metric': 'hanging',
             'success_bonus': 0.0, 'fail_penalty': 0.0,
             'vel_penalty': 0.0, 'action_penalty': 0.0,
             'pre_settle_coef': 0.0,
             'dist_reward_coef': 0.0, 'threading_bonus_coef': 0.0,
+            'success_metric': 'hanging',
             'max_episode_len': 200, 'seed': parsed.seed,
         }
         title_extra = f'scripted ({parsed.n_episodes} ep)'

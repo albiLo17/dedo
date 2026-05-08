@@ -14,6 +14,65 @@ two related questions:
    `success_factor`, `success_bonus`, and `pre_settle_coef` are sampled
    across runs to give independent reads on each.
 
+## Saga at a glance (for slides)
+
+The investigation arc, in chronological order:
+
+1. **A–E** — single-knob sweep over PPO machinery (lr, warmup, reward
+   shape, capacity). Every run shows the same post-BC cliff: 0.5–0.77 →
+   0.10–0.30 plateau within 200–300k env steps. Conclusion: it's not
+   any single PPO hyperparameter.
+2. **F (slow-drift), H (BC anchor), I (demo-V critic warmup)** —
+   structural fixes targeting actor drift, replay anchoring, and
+   critic seeding respectively. F and H tracked the no-fix baseline.
+   I showed partial recovery (0.03 → 0.23 by 750k) before being killed.
+3. **Reward-decomposition diagnosis (mid-investigation).** Built
+   `eval_reward_decomp.py` to plot reward components per step / per
+   episode. Discovered ~85% of episode return concentrates at the
+   terminal step (`dedo_final_reward_mult = 400`), which depends on
+   *post-settle* physics the policy can't directly affect. Credit
+   assignment is broken regardless of BC erasure.
+4. **J (vp=0 ablation)** — first reward-shape run, dropping
+   vel_penalty to test whether velocity penalty was the dominant
+   attractor pulling the policy toward the do-nothing trough.
+   **REJECTED**: same collapse pattern as the rest. Reward-shape
+   redesign was needed, not just a coef tweak.
+5. **Reward redesign** — added per-step `dist_reward = coef / (1 +
+   adaptive_dist)` for dense distance signal, plus
+   `--final_reward_mult` flag to scale down dedo's terminal magnitude.
+   Visualized on canonical scripted experts: per-step now contributes
+   ~50% of episode reward range (was ~15%).
+6. **K (dense reward)** — first run with redesigned reward
+   (`dr=1.0, frm=50, vp=0`). At 81k steps, eval/success_rate started
+   declining (0.70 → 0.44). Killed before drawing conclusions because
+   of (7).
+7. **Success-metric discovery** — observed 5 consecutive eval rollouts
+   that visually threaded the peg but were marked as failure. The
+   legacy `||hole_centroid - peg||_3 < threshold` metric has known
+   false-negative regimes (cloth threads but hangs *below* peg tip,
+   z-component dominates 3D distance).
+8. **Topological winding-number metric (first attempt)** — implemented;
+   tested locally; found it's *stricter* than legacy, not more
+   lenient. On scripted experts: 5/10 (topological) vs 7/10 (legacy).
+   Disagreements were all in the legacy-false-positive direction.
+9. **Topological breaks on collapsed cloth** — user identified the
+   real failure mode: cloth COLLAPSES at finished position, hole
+   loop vertices align along a vertical line through peg, xy
+   projection degenerates, winding number becomes noisy and rounds
+   to 0.
+10. **Hanging-on-peg metric (current state)** — three-check
+    replacement: lateral alignment + descended-past-tip + has-vertical-
+    extent. Robust to collapsed cloth because all three checks are in
+    3D, no projection degeneracy.
+
+**Net lesson for the slide deck.** The "BC erasure is universal" claim
+across A–J is partially a measurement artifact. We were optimizing
+against a metric that disagrees with visual ground truth in
+predictable ways. Until the success metric is fixed, every claim
+about "BC erasure rate" or "policy collapse" should be re-measured.
+
+---
+
 All runs use:
 
 - `--obs_mode hole_centroid` (18-dim privileged obs on `HangProcCloth-v1`)
@@ -39,9 +98,10 @@ Variations are noted per run.
 | F   | Slow-drift / tight-PPO on D-base             | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | clip_range=0.05, ppo_epochs=3, target_kl=0.02            | Running. Tracks G; slow-drift not the lever so far.    |
 | G   | Clean L4 rerun of D                          | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | (none)                                                   | Running. Baseline for F / H / I comparison.            |
 | H   | BC anchor on D-base                          | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | bc_anchor_batches=4, bc_anchor_lr=1e-4                   | Running.                                               |
-| I   | Demo-based critic warmup on D-base           | 512x512 | 5e-5 | 0 / 50                                 | 1.2 | 100 | 20  | critic_warmup_demo_lr=3e-4                               | Running (rerun, after SB3 API fix). Real recovery: 0.03 plateau through 500k → 0.23 by 750k. Kept alive parallel to K. |
+| I   | Demo-based critic warmup on D-base           | 512x512 | 5e-5 | 0 / 50                                 | 1.2 | 100 | 20  | critic_warmup_demo_lr=3e-4                               | Killed at ~1M (rerun, after SB3 API fix). Showed real partial recovery: 0.03 plateau through 500k → 0.23 by 750k → declined to ~0.10 by 1M. Killed when shifting attention to success-metric work. |
 | J   | vp=0 ablation on D-base                      | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | **vel_penalty=0** (rest = D-base)                        | **REJECTED.** vp=0 did not prevent BC erasure; same 0.7 → 0.05 collapse pattern as D/G by 250k. Diagnosis pivoted to reward-shape (terminal-step dominance), not vel_penalty. |
-| K   | Dense reward redesign on D-base              | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | **vel_penalty=0, dist_reward_coef=1.0, final_reward_mult=50** | TBD. First test of the rebalanced per-step reward (see "Reward redesign" section). |
+| K   | Dense reward redesign on D-base              | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | **vel_penalty=0, dist_reward_coef=1.0, final_reward_mult=50** | **Killed at ~100k.** Started declining (0.70 → 0.44 by 81k); killed before drawing conclusions because the success metric was discovered to be unreliable (false negatives on visually-threaded eval rollouts). See "Success-metric saga" below. |
+| K2  | K + topological success metric               | 512x512 | 5e-5 | 2 / 0                                  | 1.2 | 100 | 20  | K-config + `--success_metric topological`                | **Pending.** Held until the success metric is fixed (winding-number topo check breaks on collapsed cloth — see saga). Will use the new "hanging-on-peg" metric instead. |
 
 Critic-warmup column reads as `<rollouts> / <demo_epochs>`:
 
@@ -787,6 +847,126 @@ this field; `_load_manual_demos` warns and disables critic warmup if
 any loaded pkl is missing it. To use older demo dirs with critic
 warmup, re-collect via `--bc_episodes 300` on a fresh run, or write a
 small migration script.
+
+---
+
+## Success-metric saga (2026-05-08)
+
+A separate failure mode from BC erasure, surfaced late in the
+investigation. While monitoring K's rollout videos, observed **5
+consecutive eval rollouts that visually threaded the peg but were
+marked as failure by the success metric** (`info['is_success'] = 0`).
+This called every conclusion drawn from `eval/success_rate` into
+question — every "BC erasure" we'd seen could be partly an artifact
+of the metric, not the policy. Killed K to investigate before
+spending more compute.
+
+**Legacy metric (pre-2026-05-08).**
+
+```python
+# In PrivilegedObsWrapper at terminal step:
+adaptive_dist = ||hole_centroid - peg_tip||  # 3D L2 distance
+adaptive_thresh = hole_radius * success_factor  # ~ 0.6 m
+is_success = adaptive_dist < adaptive_thresh
+```
+
+Failure modes of the legacy metric:
+
+- **False negatives**: cloth threads peg and hangs *below* the peg
+  tip. Because distance is 3D, the z-component (hole hanging below
+  tip) dominates ‖·‖, exceeding threshold even though the cloth is
+  topologically threaded. This is the "5 in a row clearly successes
+  but marked failed" mode the user observed.
+- **False positives**: cloth lands *beside* the peg without
+  threading. Hole centroid happens to be close to peg in 3D, but
+  cloth never encircled peg axis. Marked success.
+
+**First fix attempt: topological winding number.**
+
+Implemented `_check_threaded_topological()` in `privileged_env.py`:
+project hole loop vertices into the xy-plane (perpendicular to the
+vertical peg axis), walk vertices in loop order summing signed
+angle changes around peg's xy position. Threshold |winding| >= 0.5.
+Mathematically clean: |w|=1 if peg is inside loop projection,
+|w|=0 if outside.
+
+Verified locally on canonical scripted-controller experts (10
+episodes, vp=0, sb=100, dr=1, frm=50):
+
+| metric          | success rate | notes                                  |
+| --------------- | ------------ | -------------------------------------- |
+| legacy          | 7/10         | 2 false positives (cloth beside peg)   |
+| topological     | 5/10         | catches 0 false negatives on this dist |
+
+Disagreements: 2 cases where legacy says success (3D dist small)
+but winding=0 (loop doesn't encircle peg) — true legacy false
+positives, correctly rejected by topological. Zero cases where
+topological caught legacy false negatives — *unexpected*.
+
+Diagnostic on K1's collapsed-policy checkpoint
+(`PPO_260508_103039_HangProcCloth-v1`, 20 episodes):
+
+- Topological success rate: **0/20**
+- All `dist` values 0.92–8.5 (cloth ends episodes far from peg)
+- Confirms K1's policy was genuinely not threading; the 0.10–0.23
+  legacy success rate observed in wandb was likely all false
+  positives (close-but-beside peg)
+
+So topological is **stricter** than legacy, not more lenient.
+Switching K2 to topological would *retain fewer BC demos* and
+*fire success_bonus less often* — potentially worsening the
+training signal.
+
+**Why topological breaks on this task.** User pointed out (with
+screenshot): the cloth *collapses* at finished position. Both
+halves press flat against each other, and the hole loop vertices
+end up nearly co-located along a vertical line through the peg
+axis. Projected to xy plane, the loop becomes a degenerate
+line/point — the winding-number computation gets noisy because
+vertex angles flicker between θ and θ+π. Genuinely-threaded
+collapsed cloth registers as winding ~0, not ~1. **The topological
+metric I built has its own systematic false-negative regime.**
+
+**Second fix attempt: "hanging-on-peg" three-check (in progress).**
+
+The visually-meaningful check is "is cloth hanging FROM the peg",
+which decomposes into:
+
+1. **Lateral alignment**: `||hole_centroid_xy − peg_xy|| < lat_threshold`.
+   Cloth's hole is laterally over the peg.
+2. **Cloth descended past peg tip**: `min(hole_z) < peg_tip_z`.
+   Some part of the hole is below the peg tip — confirms threading
+   happened, not "cloth balanced on top".
+3. **Cloth has vertical extent**: `range(hole_z) > min_extent`.
+   Rejects "cloth lying flat next to peg" cases where lateral
+   check might still pass.
+
+Tolerates collapsed cloth (no projection-to-line problem since
+checks are in 3D). Catches all four canonical cases correctly:
+
+| scenario                                  | lat | desc | range | result        |
+| ----------------------------------------- | --- | ---- | ----- | ------------- |
+| Threaded, hanging, collapsed (success)    | ✓   | ✓    | ✓     | SUCCESS       |
+| Cloth flat beside peg                     | ?   | ✓    | ✗     | FAIL (correctly) |
+| Cloth balanced on peg tip                 | ✓   | ✗    | ✓     | FAIL (correctly) |
+| Threaded but cloth hangs way below peg    | ✓   | ✓    | ✓     | SUCCESS (catches the legacy false negative) |
+
+**Implications for slides.** The whole "BC erasure is universal"
+narrative across runs A–J is partially a measurement artifact.
+The legacy metric had ~20–40% disagreement with topological
+truth on scripted experts (estimated from the 7/10 vs 5/10 split
+with 2 disagreement directions). For collapsed-cloth threadings
+(which dominates this task), neither legacy nor topological
+captured ground truth reliably — only the new hanging check does.
+
+**Open questions to acknowledge.** The hanging-on-peg metric
+itself is thresholded; we're trusting that our chosen
+`min_extent` and `lat_threshold` match human visual judgment.
+Without a labeled set of videos with ground-truth threaded/not
+classifications, all three metrics are calibrated against
+intuition. A confusion-matrix study against human-labeled videos
+would close this gap and is worth doing before treating any new
+metric as authoritative.
 
 ---
 
