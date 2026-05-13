@@ -284,6 +284,13 @@ def _save_demo(ep_obs_per_mode, ep_act, ep_rwd, ep_success):
         # scripts to warn when the recorded criterion differs from the
         # one the agent will actually be trained against.
         'success_factor': extra.success_factor,
+        # Action-scale parity invariant. Demos store actions in the
+        # MAX_ACT_VEL frame active at recording time; reloading them
+        # in a training run under a different MAX_ACT_VEL would
+        # silently mistrain. _load_manual_demos enforces this matches.
+        # record_demo.py never patches the class attribute, so this is
+        # always dedo's default (10.0) unless something upstream changed it.
+        'max_act_vel': float(DeformEnv.MAX_ACT_VEL),
         'len': len(ep_act),
     }
     with open(path, 'wb') as f:
