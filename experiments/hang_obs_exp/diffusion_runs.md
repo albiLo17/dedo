@@ -664,6 +664,87 @@ diff<TS>_rgb_pre_lr1e-4_e300_bs64_ah4_sm-legacy_s2026
 diff<TS>_pcd_lr1e-4_e300_bs128_ah4_sm-legacy_s2026
 ```
 
+### v3 eval-cap bug + fix (2026-05-14)
+
+The first v3 state run (`diff260514-073100`) hit **0.1 legacy success at
+epoch 20** — wildly off the expected privileged-state ceiling, especially
+worse than v2's 0.5 stall. Pulled the first eval video and saw the
+gripper anchors pulling the cloth **taut against the peg at episode end**,
+exactly the v2 pull-taut anti-pattern that the v3 brake-tail fix was
+supposed to eliminate.
+
+**Root cause.** [collect_bc_demos.py](scripts/collect_bc_demos.py) sets
+`deform.max_episode_len = len(scripted_traj) + episode_tail_frames`
+per-episode (≈51 ctrl steps for v3), but the eval env in
+`train_diffusion_bc.py` was constructed with `args.max_episode_len = 200`
+and never per-episode-overridden. So every eval episode ran for **~4×
+longer than the training distribution** — steps 51-200 fed the diffusion
+policy obs windows it had never seen, and the policy drifted into
+cumulative lateral force impulses on the anchors. By step 200 the
+gripper was way off-axis from the peg, and the gravity-settle phase
+(which doesn't release anchors, only stops applying external force on
+them — see [deform_env.py:412](../../dedo/envs/deform_env.py#L412)) just
+froze the cloth at that stretched configuration.
+
+The bug was masked through v2 because v2 demos had the same
+trailing-velocity tail that pull-taut training data — the policy's OOD
+behavior past step 51 happened to *match* the training distribution by
+luck. v3's clean brake-tail demos exposed it.
+
+**Validation.** Wrote a standalone
+[eval_diffusion_bc.py](scripts/eval_diffusion_bc.py) that loads
+`policy_best.pt` directly (no demo dir needed; reads env config from
+ckpt metadata). On the broken v3 state ckpt:
+
+| `--max_episode_len` | first 12 episodes (legacy success) |
+| ------------------- | ---------------------------------- |
+| 200 (the bug) | 0 / 3 (matches the wandb 0.1 rate) |
+| 56 (in-distribution) | **12 / 12** |
+
+So the policy itself was fine all along — the eval was just measuring
+the wrong thing.
+
+**Fix.** Two-layer:
+
+1. **Per-episode dynamic sizing** in
+   [evaluate_policy](scripts/train_diffusion_bc.py): after `e.reset()`,
+   build the scripted hole-aware trajectory the demo controller WOULD
+   have run for the current cloth (`build_hole_aware_waypoints` +
+   `build_traj` + `merge_traj`, same calls as `collect_bc_demos.py`),
+   set `deform.max_episode_len = len(traj) + args.episode_tail_frames`.
+   This mirrors collect-time per-episode termination exactly. New shared
+   helper `compute_per_episode_max_len` in
+   [_helpers.py](scripts/_helpers.py) used by both the in-training eval
+   and the standalone `eval_diffusion_bc.py`.
+
+2. **`args.max_episode_len`** stays as the hard safety ceiling
+   (default 200) so a runaway cloth can't run unbounded; demoted from
+   "the eval cap" to "the worst-case ceiling."
+
+`episode_tail_frames` defaults to 5 (matches `collect_bc_demos.py`
+default) and is now embedded in every ckpt's metadata so
+`eval_diffusion_bc.py` can recover it without the demo dir.
+
+**Other small things that fell out of this audit:**
+
+- Added `--resume` flag to `train_diffusion_bc.py` (loads weights + EMA
+  shadow + optimizer + scheduler state from a ckpt and continues the
+  epoch counter; ckpts saved by the updated `_save_ema_checkpoint`
+  persist this state). Useful for crash recovery on future runs.
+- `_save_ema_checkpoint` now persists `step_counter`, `best_eval_success`,
+  and `best_eval_epoch` alongside the model state.
+- `make_final_steps()` doesn't release the gripper anchors (commented
+  out in dedo to avoid jerk forces); the gravity-settle drape relies on
+  the anchors having their own mass
+  (`ANCHOR_MASS=0.1 kg`, [anchor_utils.py:18](../../dedo/utils/anchor_utils.py#L18))
+  plus the cloth's distributed weight. This works as long as the anchors
+  enter settle at a sensible position (which the fix now guarantees).
+
+**Relaunch.** Same launch commands as the v3 block below — `--resume` is
+opt-in, and `--episode_tail_frames` defaults to 5, so the existing
+tmux commands work unchanged. The original `diff260514-073100*` runs
+were killed; the relaunched ones supersede them.
+
 ### Encoder feat_dim across modes (v3)
 
 | mode | encoder | primary feat | + grip | + goal | total |

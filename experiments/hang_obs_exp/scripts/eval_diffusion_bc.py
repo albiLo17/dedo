@@ -40,7 +40,7 @@ from dedo.utils.args import get_args_parser, args_postprocess
 from dedo.utils.mesh_utils import get_mesh_data
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import RetryResetEnv  # noqa: E402
+from _helpers import RetryResetEnv, compute_per_episode_max_len  # noqa: E402
 from _bc_obs_helpers import (  # noqa: E402
     capture_rgb_depth,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
@@ -58,11 +58,25 @@ def parse_args():
                    help='Path to policy_best.pt / policy_epNNNN.pt. '
                         'obs_normalizer.pkl is auto-discovered in the '
                         'same directory.')
-    p.add_argument('--max_episode_len', type=int, default=56,
-                   help='Eval-time per-episode cap. Default 56 matches '
-                        'the v3 brake-tail demo distribution '
-                        '(~51 ctrl steps + 5 frame buffer). Set higher '
-                        'to test the OOD-tail failure mode.')
+    p.add_argument('--max_episode_len', type=int, default=200,
+                   help='Hard safety ceiling on per-episode length. '
+                        'The actual per-episode cap is computed dynamically '
+                        'from the scripted hole-aware trajectory for each '
+                        'cloth (= len(traj) + --episode_tail_frames), '
+                        'mirroring collect_bc_demos.py exactly. This flag '
+                        'is the upper bound the dynamic value cannot exceed.')
+    p.add_argument('--episode_tail_frames', type=int, default=None,
+                   help='Brake-tail frames appended after the scripted traj. '
+                        'Default None = read from ckpt metadata (which '
+                        'matches collect-time exactly); explicit value '
+                        'overrides. Should match what the demos were '
+                        'collected with (5 in v3).')
+    p.add_argument('--force_fixed_max_ep_len', type=int, default=None,
+                   help='Skip the per-episode dynamic sizing and force '
+                        'a single fixed max_episode_len for every episode. '
+                        'Useful for A/B testing the OOD-tail failure mode '
+                        '(e.g. --force_fixed_max_ep_len 200 reproduces the '
+                        'pre-fix behavior).')
     p.add_argument('--n_episodes', type=int, default=30)
     p.add_argument('--eval_seed', type=int, default=2026 + 9999,
                    help='Matches train_diffusion_bc.py: '
@@ -101,6 +115,22 @@ def main():
     eval_max_act_vel = float(ckpt['max_act_vel'])
     eval_sim_freq = int(ckpt['sim_freq'])
     eval_sim_steps_per_action = int(ckpt['sim_steps_per_action'])
+    eval_ctrl_freq = float(ckpt.get('ctrl_freq',
+                                    eval_sim_freq / eval_sim_steps_per_action))
+
+    # Tail frames: CLI override wins, then ckpt metadata, then default 5
+    # (matches collect_bc_demos.py default).
+    if args.episode_tail_frames is not None:
+        episode_tail_frames = int(args.episode_tail_frames)
+        tail_source = 'CLI'
+    elif 'episode_tail_frames' in ckpt:
+        episode_tail_frames = int(ckpt['episode_tail_frames'])
+        tail_source = 'ckpt'
+    else:
+        episode_tail_frames = 5
+        tail_source = 'default (ckpt has no episode_tail_frames; legacy)'
+    print(f'[init] episode_tail_frames = {episode_tail_frames} '
+          f'(source: {tail_source})')
 
     print(f'[init] obs_mode={obs_mode} obs_horizon={obs_horizon} '
           f'pred_horizon={pred_horizon} action_horizon={action_horizon}')
@@ -219,10 +249,10 @@ def main():
     # --- Rollout loop ------------------------------------------------------
     s_hanging = s_topo = s_legacy = 0
     ep_lens = []
+    per_ep_maxes = []
     with torch.no_grad():
         for ep in range(args.n_episodes):
             e.reset()
-            deform.max_episode_len = args.max_episode_len  # belt-and-suspenders
 
             hole_idx = get_hole_indices(deform)
             if not hole_idx:
@@ -235,13 +265,33 @@ def main():
             corner_idx = identify_cloth_corners(verts0)
             hole_radius = measure_hole_radius(deform, hole_idx)
 
+            # Per-episode max_ep_len: mirror collect_bc_demos.py exactly —
+            # build the scripted traj this cloth would have used and cap
+            # the episode at len(traj) + episode_tail_frames. The CLI
+            # --force_fixed_max_ep_len escape hatch is for A/B-testing
+            # the OOD-tail failure mode.
+            if args.force_fixed_max_ep_len is not None:
+                per_ep_max = int(args.force_fixed_max_ep_len)
+            else:
+                per_ep_max = compute_per_episode_max_len(
+                    deform, ctrl_freq=eval_ctrl_freq,
+                    tail_frames=episode_tail_frames,
+                    safety_cap=args.max_episode_len)
+                if per_ep_max is None:
+                    per_ep_max = int(args.max_episode_len)
+                    print(f'  [ep {ep+1}/{args.n_episodes}] WARN: scripted-'
+                          f'traj build failed; falling back to safety cap '
+                          f'{per_ep_max}')
+            deform.max_episode_len = per_ep_max
+            per_ep_maxes.append(per_ep_max)
+
             first_obs = capture_obs(hole_idx, corner_idx)
             obs_deque = collections.deque(
                 [first_obs] * obs_horizon, maxlen=obs_horizon)
 
             step = 0
             done = False
-            while not done and step < args.max_episode_len:
+            while not done and step < per_ep_max:
                 normed = [obs_normalizer.apply(s) for s in obs_deque]
                 obs_t = stack_obs_seq(normed)
                 naction = policy.predict_action(obs_t, encoder).squeeze(0)
@@ -255,7 +305,7 @@ def main():
                     step += 1
                     new_obs = capture_obs(hole_idx, corner_idx)
                     obs_deque.append(new_obs)
-                    if done or step >= args.max_episode_len:
+                    if done or step >= per_ep_max:
                         break
 
             h = int(check_hanging_on_peg(
@@ -273,7 +323,16 @@ def main():
     e.close()
 
     n = args.n_episodes
-    print(f'\n=== Eval results (n={n}, max_episode_len={args.max_episode_len}) ===')
+    if args.force_fixed_max_ep_len is not None:
+        sizing_desc = f'fixed max_episode_len={args.force_fixed_max_ep_len}'
+    elif per_ep_maxes:
+        sizing_desc = (f'per-ep dynamic, len(traj)+{episode_tail_frames}, '
+                       f'min={min(per_ep_maxes)} max={max(per_ep_maxes)} '
+                       f'mean={np.mean(per_ep_maxes):.1f} '
+                       f'(safety cap={args.max_episode_len})')
+    else:
+        sizing_desc = f'no episodes ran'
+    print(f'\n=== Eval results (n={n}, sizing: {sizing_desc}) ===')
     print(f'  legacy        = {s_legacy}/{n} = {s_legacy/n:.3f}')
     print(f'  hanging       = {s_hanging}/{n} = {s_hanging/n:.3f}')
     print(f'  topological   = {s_topo}/{n} = {s_topo/n:.3f}')

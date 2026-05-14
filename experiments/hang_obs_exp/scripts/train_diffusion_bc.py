@@ -59,7 +59,7 @@ from dedo.demo_preset import build_traj, merge_traj  # noqa: F401
 # eval env.
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers import RetryResetEnv  # noqa: E402
+from _helpers import RetryResetEnv, compute_per_episode_max_len  # noqa: E402
 
 # Reuse the camera and success-check helpers so eval-time RGB/PCD/success
 # match collection-time bit-for-bit.
@@ -189,7 +189,29 @@ parser.add_argument('--save_every_epochs', type=int, default=0,
                          'regardless of this flag — every eval pass '
                          'compares against the running best and mirrors '
                          'the EMA weights to policy_best.pt on improvement.')
-parser.add_argument('--max_episode_len', type=int, default=200)
+parser.add_argument('--resume', type=str, default=None,
+                    help='Path to a checkpoint to resume training from. '
+                         'Loads weights, EMA shadow, optimizer state, LR '
+                         'scheduler state, and resumes the epoch counter. '
+                         'Falls back gracefully if the ckpt was saved by an '
+                         'older version that did not persist optimizer/ema/'
+                         'scheduler state (a warning is printed and those '
+                         'components start fresh). Architecture flags '
+                         '(obs_horizon/pred_horizon/etc.) must match the '
+                         'ckpt — load_state_dict will error out on shape '
+                         'mismatch.')
+parser.add_argument('--max_episode_len', type=int, default=200,
+                    help='Safety ceiling on per-episode length. The actual '
+                         'per-episode cap at eval is the scripted-traj '
+                         'length + --episode_tail_frames (mirrors '
+                         'collect_bc_demos.py), with this value as upper '
+                         'bound.')
+parser.add_argument('--episode_tail_frames', type=int, default=5,
+                    help='Brake-tail frames appended after the scripted '
+                         'trajectory; the eval env\'s per-episode '
+                         'max_episode_len = len(traj) + tail. Must match '
+                         'the value used at demo collection time (default '
+                         '5 in collect_bc_demos.py).')
 parser.add_argument('--eval_cam_resolution', type=int, default=None,
                     help='Camera resolution at eval time. Default = the '
                          'resolution recorded in the demo pkls. Override '
@@ -595,17 +617,15 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Pick the eval-time max_episode_len. Demos are collected with
-# deform.max_episode_len = traj_len + episode_tail_frames per-episode (see
-# collect_bc_demos.py), so the training distribution only covers control
-# steps 0..(max demo length). If the eval env runs longer, the policy
-# operates OOD for the tail of every episode — for HangProcCloth this
-# manifests as cumulative force impulses pulling the anchors laterally
-# until the cloth ends up taut between gripper and peg.
-#
-# Use (longest training demo + small buffer) so even the slowest in-
-# distribution rollout can brake before terminating, but cap at
-# args.max_episode_len so a CLI-set ceiling still wins.
+# Primary per-episode max_episode_len at eval is computed DYNAMICALLY in
+# the eval loop (mirrors collect_bc_demos.py: build the scripted traj for
+# the current cloth and cap at `len(traj) + episode_tail_frames`). The
+# value below is the FALLBACK used when traj construction fails for a
+# specific episode (degenerate hole geometry, NaN mesh, etc.) — set to a
+# sensible "looks like the training distribution" length derived from the
+# longest recorded demo + small buffer. args.max_episode_len remains the
+# absolute safety ceiling that even the dynamic per-episode value can't
+# exceed.
 # ---------------------------------------------------------------------------
 _EVAL_EP_LEN_BUFFER = 5  # ~333 ms at 15 Hz; plenty of brake-and-handoff slack
 if recorded_episode_lengths:
@@ -614,16 +634,17 @@ if recorded_episode_lengths:
     eval_max_episode_len = min(
         int(_max_demo_len + _EVAL_EP_LEN_BUFFER),
         int(args.max_episode_len))
-    print(f'[data] eval max_episode_len = {eval_max_episode_len} '
+    print(f'[data] eval max_episode_len FALLBACK = {eval_max_episode_len} '
           f'(longest demo={_max_demo_len}, mean={_mean_demo_len:.1f}, '
-          f'buffer=+{_EVAL_EP_LEN_BUFFER}, safety cap={args.max_episode_len})')
-    if eval_max_episode_len < args.max_episode_len:
-        print(f'[data] (eval is tighter than --max_episode_len so training-'
-              f'distribution OOD tail is avoided)')
+          f'buffer=+{_EVAL_EP_LEN_BUFFER}, safety cap={args.max_episode_len}). '
+          f'Used only if per-episode scripted-traj construction fails; '
+          f'normal eval episodes are sized per-cloth via build_traj+tail.')
 else:
     eval_max_episode_len = int(args.max_episode_len)
     print(f'[data] no per-demo episode lengths recorded; eval '
-          f'max_episode_len = {eval_max_episode_len} (from --max_episode_len)')
+          f'max_episode_len FALLBACK = {eval_max_episode_len} '
+          f'(from --max_episode_len). Per-episode dynamic sizing is still '
+          f'attempted at eval time via build_traj+episode_tail_frames.')
 
 
 # =============================================================================
@@ -835,6 +856,46 @@ ema = EMAModel(parameters=trainables, power=args.ema_power)
 
 
 # =============================================================================
+# Resume from checkpoint (optional). Expects a ckpt saved by this script's
+# current _save_ema_checkpoint — i.e. one that persists optimizer, EMA,
+# and LR scheduler state alongside weights. Old weight-only ckpts will
+# raise on the first missing key; recover by training from scratch.
+# =============================================================================
+resume_start_epoch = 0
+resume_step_counter = 0
+resume_best_eval_success = float('-inf')
+resume_best_eval_epoch = -1
+if args.resume:
+    if not os.path.exists(args.resume):
+        raise FileNotFoundError(f'--resume path does not exist: {args.resume}')
+    print(f'\n=== Resuming from {args.resume} ===')
+    rckpt = torch.load(args.resume, map_location=device)
+
+    policy.load_state_dict(rckpt['policy_state_dict'])
+    encoder.load_state_dict(rckpt['encoder_state_dict'])
+    ema.load_state_dict(rckpt['ema_state_dict'])
+    optimizer.load_state_dict(rckpt['optimizer_state_dict'])
+    lr_scheduler.load_state_dict(rckpt['scheduler_state_dict'])
+    resume_start_epoch = int(rckpt['epoch'])
+    resume_step_counter = int(rckpt['step_counter'])
+    resume_best_eval_success = float(rckpt['best_eval_success'])
+    resume_best_eval_epoch = int(rckpt['best_eval_epoch'])
+
+    print(f'  [resume] policy + encoder + EMA + optimizer + scheduler loaded')
+    print(f'  [resume] epoch counter -> {resume_start_epoch} '
+          f'(will train epochs {resume_start_epoch + 1}..{args.num_epochs})')
+    print(f'  [resume] step counter -> {resume_step_counter}')
+    print(f'  [resume] best_eval_success seeded at '
+          f'{resume_best_eval_success:.3f} (epoch {resume_best_eval_epoch})')
+
+    if resume_start_epoch >= args.num_epochs:
+        raise RuntimeError(
+            f'ckpt epoch ({resume_start_epoch}) >= --num_epochs '
+            f'({args.num_epochs}); nothing to train. Either pass a '
+            f'larger --num_epochs or use a ckpt from an earlier epoch.')
+
+
+# =============================================================================
 # In-env evaluation
 #
 # The eval env mirrors collect_bc_demos.py exactly: gym.make HangProcCloth-v1,
@@ -861,7 +922,7 @@ def _build_eval_env(eval_seed):
         '--num_envs=0',
         '--total_env_steps=0',
         '--seed', str(eval_seed),
-        '--max_episode_len', str(eval_max_episode_len),
+        '--max_episode_len', str(args.max_episode_len),
         f'--sim_freq={eval_sim_freq}',
         f'--sim_steps_per_action={eval_sim_steps_per_action}',
         '--cam_viewmat',
@@ -997,13 +1058,6 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         else:
             deform._record_settle_frames = False
         e.reset()
-        # Belt-and-suspenders: also set the attribute directly on the deform
-        # object in case any env-reset path re-initializes it from a stale
-        # default. The sys.argv-routed value at gym.make is the primary path;
-        # this just guarantees per-episode termination matches the training
-        # distribution even if a future refactor breaks the construction-time
-        # plumbing.
-        deform.max_episode_len = eval_max_episode_len
         hole_idx = get_hole_indices(deform)
         if not hole_idx:
             # Skip degenerate clothes — count as failure to keep n_episodes honest.
@@ -1015,6 +1069,20 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         corner_idx = identify_cloth_corners(verts0)
         hole_radius = measure_hole_radius(deform, hole_idx)
 
+        # Per-episode max_ep_len: mirror collect_bc_demos.py exactly —
+        # build the scripted trajectory for THIS cloth (the demo
+        # controller would have run it for len(traj) steps), and cap the
+        # episode at min(len(traj) + episode_tail_frames, args.max_episode_len).
+        # Falls back to the demo-distribution-derived `eval_max_episode_len`
+        # if scripted-traj construction fails (e.g. degenerate hole geometry).
+        _per_ep_max = compute_per_episode_max_len(
+            deform, ctrl_freq=eval_ctrl_freq,
+            tail_frames=args.episode_tail_frames,
+            safety_cap=args.max_episode_len)
+        if _per_ep_max is None:
+            _per_ep_max = eval_max_episode_len
+        deform.max_episode_len = _per_ep_max
+
         # Prime obs deque with the initial obs (repeated obs_horizon times).
         first_obs = _capture_obs_for_policy(
             deform, args.obs_mode, args.state_key, hole_idx, corner_idx)
@@ -1024,7 +1092,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         ep_rwd = 0.0
         step = 0
         done = False
-        while not done and step < eval_max_episode_len:
+        while not done and step < _per_ep_max:
             # 1) Apply obs normalizer per frame, stack to (1, To, *), run policy.
             normed = _apply_normalizer_to_seq(
                 list(obs_deque), obs_normalizer)
@@ -1057,7 +1125,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
                     deform, args.obs_mode, args.state_key,
                     hole_idx, corner_idx)
                 obs_deque.append(new_obs)
-                if done or step >= eval_max_episode_len:
+                if done or step >= _per_ep_max:
                     break
         # Append the post-settle (gravity-phase) frames captured by
         # dedo inside make_final_steps. `info['settle_frames']` exists
@@ -1149,7 +1217,8 @@ with open(os.path.join(logdir, 'config.json'), 'w') as f:
         'eval_sim_freq': int(eval_sim_freq),
         'eval_sim_steps_per_action': int(eval_sim_steps_per_action),
         'eval_max_act_vel': float(DeformEnv.MAX_ACT_VEL),
-        'eval_max_episode_len': int(eval_max_episode_len),
+        'eval_max_episode_len_fallback': int(eval_max_episode_len),
+        'eval_episode_tail_frames': int(args.episode_tail_frames),
         'demo_episode_lengths_min': (int(min(recorded_episode_lengths))
                                      if recorded_episode_lengths else None),
         'demo_episode_lengths_max': (int(max(recorded_episode_lengths))
@@ -1188,20 +1257,36 @@ _CKPT_METADATA_TEMPLATE = {
     'ctrl_freq': float(eval_ctrl_freq),
     'sim_freq': int(eval_sim_freq),
     'sim_steps_per_action': int(eval_sim_steps_per_action),
+    # Per-episode eval cap = len(scripted_traj) + episode_tail_frames.
+    # Saved so a standalone eval script can rebuild the per-episode
+    # termination policy without the demo dir.
+    'episode_tail_frames': int(args.episode_tail_frames),
+    'max_episode_len_safety_cap': int(args.max_episode_len),
 }
 
 
 def _save_ema_checkpoint(path, epoch=None, eval_metrics=None):
-    """Snapshot EMA weights to disk, restoring live weights on exit.
-    All save paths (periodic, best, final) go through this helper so the
-    on-disk format is uniform: load with torch.load(path) -> dict ready
-    to feed into policy.load_state_dict / encoder.load_state_dict.
+    """Snapshot EMA weights + full training state to disk.
+
+    `policy_state_dict` / `encoder_state_dict` contain the EMA-applied
+    weights so a deploy script can `torch.load(path)` and use them directly.
+    The remaining keys (ema_state_dict, optimizer_state_dict,
+    scheduler_state_dict, epoch, step_counter, best_eval_*) persist enough
+    state for `--resume` to pick the run back up without drift.
+    Live (training) weights are restored on exit so the next training step
+    continues from the unaveraged params.
     """
     ema_state_local = [p.detach().clone() for p in trainables]
     ema.copy_to(trainables)
     ckpt = {
         'policy_state_dict': policy.state_dict(),
         'encoder_state_dict': encoder.state_dict(),
+        'ema_state_dict': ema.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': lr_scheduler.state_dict(),
+        'step_counter': int(step_counter),
+        'best_eval_success': float(best_eval_success),
+        'best_eval_epoch': int(best_eval_epoch),
         **_CKPT_METADATA_TEMPLATE,
     }
     if epoch is not None:
@@ -1256,12 +1341,12 @@ print(f'\n=== Training (epochs={args.num_epochs}, '
 # if the current rate beats the running best, mirror the EMA weights to
 # policy_best.pt — so a crash or premature kill still leaves you with
 # the best-performing snapshot to deploy from.
-best_eval_success = float('-inf')
-best_eval_epoch = -1
+best_eval_success = resume_best_eval_success
+best_eval_epoch = resume_best_eval_epoch
 best_ckpt_path = os.path.join(logdir, 'policy_best.pt')
 
-step_counter = 0
-for epoch in range(args.num_epochs):
+step_counter = resume_step_counter
+for epoch in range(resume_start_epoch, args.num_epochs):
     epoch_loss = []
     epoch_start = time.time()
     for obs_b, act_b in dataloader:
