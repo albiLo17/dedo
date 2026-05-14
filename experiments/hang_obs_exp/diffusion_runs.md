@@ -59,6 +59,17 @@ the visual observation pipeline differs.
    directly compatible. All three metrics (hanging, topological,
    legacy) are still computed and logged at every eval pass so analysis
    can re-anchor on a different metric later without recollecting.
+6. **v1 launched, partial results, kill + relaunch as v2 (2026-05-14).**
+   v1 ran for ~125 / 46 / 48 epochs on state / rgb / pcd before being
+   killed. State saturated at 1.0 legacy success in the first eval
+   pass; pcd was at 50% legacy / 80-90% hanging and climbing; rgb was
+   stuck at 0 across every metric (random ResNet-18 init on 150
+   demos = visuomotor BC out of data regime). Three changes for v2:
+   sim ctrl freq 30 → 15 Hz (longer-horizon actions per step), RGB
+   uses ImageNet pretrain (new `--pretrained_rgb` flag), and the new
+   checkpoint/video infra (best-eval ckpt, periodic ckpts, eval mp4s)
+   that hadn't existed at v1 launch time gets used. See "v1 partial
+   results" + "v2 — relaunch" sections below.
 
 ---
 
@@ -182,8 +193,9 @@ python experiments/hang_obs_exp/scripts/train_diffusion_bc.py \
     --seed 2026
 ```
 
-**Status.** Launched in tmux session `diff-state` on the L4 (started
-2026-05-13).
+**Status (v1).** Killed at ~epoch 125/200 (2026-05-14). The eval curve
+had already saturated at 1.0 legacy success rate by the first eval pass
+(epoch 20). Superseded by v2 (see below).
 
 ---
 
@@ -224,8 +236,12 @@ python experiments/hang_obs_exp/scripts/train_diffusion_bc.py \
     --seed 2026
 ```
 
-**Status.** Launched in tmux session `diff-rgb` on the L4 (started
-2026-05-13).
+**Status (v1).** Killed at ~epoch 46/200 (2026-05-14). The eval curve
+was flat at 0 / 0 / 0 across legacy, hanging, topological — RGB never
+got off the floor. Root cause: random Kaiming init on a 11 M-param
+ResNet-18 against 150 demos × ~80 steps is well outside the
+data-coverage regime where visuomotor BC converges from scratch.
+Superseded by v2 with `--pretrained_rgb` (ImageNet init).
 
 ---
 
@@ -269,8 +285,160 @@ python experiments/hang_obs_exp/scripts/train_diffusion_bc.py \
     --seed 2026
 ```
 
-**Status.** Launched in tmux session `diff-pcd` on the L4 (started
-2026-05-13).
+**Status (v1).** Killed at ~epoch 48/200 (2026-05-14). Eval rate was at
+50% legacy / 80-90% hanging / 15% topological — already learning, but
+killed alongside the others to keep all three on the same v2 dataset.
+Notable: PCD was the only mode where `eval/success_hanging` >
+`eval/success_legacy` (the opposite of state), suggesting the PCD
+policy produced "threaded but loose" rollouts that hanging caught but
+legacy missed. Worth a closer look in the v2 videos.
+
+---
+
+## v1 partial results (before kill)
+
+The three v1 runs ran for different epoch counts on a shared L4 (state
+trains fastest, so it got further). All three were killed simultaneously
+on 2026-05-14 to share a clean v2 dataset and infra. Approximate wandb
+state at kill time:
+
+| mode | epochs done | `eval/success_legacy` | `eval/success_hanging` | `eval/success_topological` |
+| ---- | ----------- | --------------------- | ---------------------- | -------------------------- |
+| state | ~125 | 1.0 (since epoch 20) | ~0.95 | ~0.30 |
+| rgb | ~46 | 0.0 | 0.0 | 0.0 |
+| pcd | ~48 | ~0.50 | ~0.80-0.90 | ~0.15 |
+
+**Two observations worth keeping for the writeup:**
+
+1. **State 1.0 legacy / 0.30 topological is the collapsed-cloth
+   pathology in action.** Every state-mode rollout passed the
+   centroid-distance check (legacy), most also passed the hanging-on-peg
+   3D check, but most also failed the winding-number check. This is
+   exactly what RUNS.md's "Why topological breaks on this task"
+   subsection predicts — the cloth collapses flat against the peg at
+   the end of the episode, hole-loop vertices align along a vertical
+   line through the peg axis, the xy-projection becomes degenerate,
+   and the winding sum rounds to ~0. **Don't anchor analysis on
+   topological for this task.**
+2. **PCD's hanging > legacy reversal is interesting.** The PCD policy
+   gets ~80-90% on hanging but only ~50% on legacy. The PCD policy
+   likely produces a different threading style than state — perhaps it
+   ends episodes with the cloth lower (the depth-back-projection
+   doesn't see the peg base from this camera angle as crisply), so
+   the centroid is further from the peg in 3D (legacy fails) but
+   geometrically still hanging from the peg (hanging passes). Spot-
+   checking the v2 videos will tell us.
+
+The RGB 0% across all metrics is the unsurprising story: random-init
+ResNet-18 on 150 demos × 80 steps × 128² pixels = the BC-from-scratch
+regime that the diffusion-policy paper specifically uses ImageNet
+pretrain to escape. v2 fixes this.
+
+---
+
+## v2 — relaunch with sim-rate, RGB pretrain, richer artifacts
+
+Three changes from v1, decided 2026-05-14 after seeing the v1 curves:
+
+1. **Sim control frequency 30 → 15 Hz** (via `--ctrl_freq 15`). Halves
+   the number of control steps per episode (from ~80 to ~40-60) so
+   each policy decision covers a longer real-world interval. The
+   scripted controller's three-phase trajectory (1.4 s lift + 1.0 s
+   thread + 0.6 s hold = 3 s) lands in ~45 control steps at 15 Hz
+   instead of ~90 at 30 Hz, so `--max_episode_len 120` now gives
+   plenty of margin without padding the back half with "hold" steps.
+   This also widens the action-magnitude distribution per step (the
+   waypoint controller's velocity-per-control-step roughly doubles),
+   which together with the `--max_act_vel 4.0` bump should give the
+   diffusion policy a clearer action signal to fit.
+2. **RGB ImageNet pretrain.** New `--pretrained_rgb` flag loads
+   `IMAGENET1K_V1` weights into the ResNet-18 conv stack before the
+   BN→GN swap. The BN→GN replacement zeroes the normalization layers'
+   gamma/beta/running stats, but the conv kernels carry over — which
+   is the bulk of the transferable signal per the diffusion-policy
+   paper's recipe. Wired through `train_diffusion_bc.py:100, 267, 726`
+   to `_diffusion_policy.py:135-138` (`RGBObsEncoder(pretrained=True)`).
+   The `_pre` token in the run-name suffix marks runs that used it.
+3. **Richer eval artifacts.** v1 launched before `--save_every_epochs`,
+   `policy_best.pt` mirroring, and eval-video logging existed. v2
+   inherits all three: periodic numbered ckpts every 20 epochs, an
+   always-on best-eval ckpt that updates whenever `eval/success_rate`
+   improves, and an mp4 logged to wandb each eval pass (covers policy
+   phase + the 500-step post-settle gravity phase, sub-sampled at
+   stride 5).
+
+### v2 demo collection
+
+```bash
+python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
+    --demos_dir logs/hang_obs_exp/bc_demos_15hz_v1 \
+    --n_demos 150 \
+    --cam_resolution 128 --pcd_n_points 512 \
+    --max_act_vel 4.0 \
+    --success_metric legacy --success_factor 1.2 \
+    --ctrl_freq 15 --max_episode_len 120 \
+    --debug_viz_first_n 3 --debug_viz_every 25 \
+    --seed 2026
+```
+
+Deltas from the v1 collection command:
+
+| flag | v1 | v2 | reason |
+| ---- | -- | -- | ------ |
+| `--max_act_vel` | 3.5 | 4.0 | small headroom bump for the 15 Hz higher-magnitude steps |
+| `--ctrl_freq` | (dedo default 30) | 15 | longer-horizon actions, fewer steps per episode |
+| `--max_episode_len` | 200 | 120 | sized for the new ctrl rate; scripted controller fits in ~45 steps |
+| `--debug_viz_*` | (off) | first 3 every 25 | demo-collection debug videos so we can eyeball what's being recorded |
+
+The pkl schema additionally now stores `ctrl_freq`, `sim_freq`, and
+`sim_steps_per_action` so the training script can verify the eval env
+matches the collection rate (the existing `max_act_vel` / `cam_viewmat`
+parity checks already prevent silent mismatches on those axes; the new
+fields extend the same guard pattern to the control rate).
+
+### v2 launch commands
+
+```bash
+export DEMOS=~/github/dedo/logs/hang_obs_exp/bc_demos_15hz_v1
+```
+
+```bash
+tmux new-session -d -s diff-state "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode state --state_key hole_centroid --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 256 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/state.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-rgb "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode rgb --pretrained_rgb --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 64 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/rgb.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-pcd "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode pcd --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 128 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/pcd.log; echo DONE; sleep infinity'"
+```
+
+Expected v2 wandb run names:
+```
+diff<TS>_state_lr1e-4_e200_bs256_sm-legacy_s2026
+diff<TS>_rgb_pre_lr1e-4_e200_bs64_sm-legacy_s2026          ← _pre token marks ImageNet init
+diff<TS>_pcd_lr1e-4_e200_bs128_sm-legacy_s2026
+```
+
+### Open metric-validation question (followup, not blocking)
+
+We haven't independently verified which of `legacy`, `hanging`, or
+`topological` matches human-eyeball "did the cloth thread the peg" most
+closely. RUNS.md documents the legacy false-positive (cloth lands
+beside peg, centroid happens close) and false-negative (cloth threads
+deep, centroid 3D distance dominated by z) modes, and proposes the
+hanging-on-peg three-check as a fix — but the hanging metric's
+`lat_threshold` / `min_extent` thresholds are calibrated against
+intuition, not labeled video. Now that v2 logs eval videos
+automatically (mid-training and final, mp4 per eval pass), a half-day
+followup is:
+
+1. After the v2 runs land, collect the final-eval videos for all three
+   modes (n=50 episodes each).
+2. Hand-label each episode as visually-threaded / not-threaded.
+3. Build a 3-way confusion matrix vs each of the three metrics.
+4. Pick the metric with the lowest hand-label disagreement as the
+   canonical one going forward, and re-anchor reporting if needed.
+
+The runs themselves don't depend on the answer — we log all three rates
+per eval pass, so the analysis can re-anchor without retraining.
 
 ---
 
