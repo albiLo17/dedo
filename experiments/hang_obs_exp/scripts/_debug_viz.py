@@ -107,53 +107,58 @@ def overlay_pcd_on_rgb(rgb: np.ndarray, pcd_world: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Top-down PCD scatter, rendered directly to a numpy image (no matplotlib
-# per-frame — too slow for 75+ frames per demo).
+# PCD rendered from the SAME camera the dataset uses to capture RGB/depth.
+# This is what the policy actually consumes: the 3D points back-projected
+# from this exact view, then forward-projected back to 2D screen space to
+# visualize their distribution. Aligned 1:1 with the RGB obs so the viewer
+# can compare obs RGB ↔ PCD coverage at a glance.
 # ---------------------------------------------------------------------------
-_TOPDOWN_X_RANGE = (-5.0, 5.0)
-_TOPDOWN_Y_RANGE = (-3.0, 6.0)
-_TOPDOWN_Z_RANGE = (4.0, 12.0)  # for colormap
+def pcd_camera_view_image(pcd_world: np.ndarray, view, proj,
+                          size: int = 300,
+                          colormap_by: str = 'depth') -> np.ndarray:
+    """Project world-space PCD through (view, proj) and paint dots
+    colored by depth (NDC z, near=cool, far=warm). Black background.
+    Same camera as the obs RGB → geometrically aligned with the
+    middle panel of the debug video.
 
-
-def pcd_topdown_image(pcd_world: np.ndarray, size: int = 300) -> np.ndarray:
-    """Top-down (xy) scatter of the world-space PCD, colored by z height.
-
-    Fixed world bounds (_TOPDOWN_X/Y_RANGE) so the view doesn't jitter
-    frame-to-frame. Returns an (size, size, 3) uint8 image.
+    `colormap_by='depth'` uses NDC z (camera-relative depth).
+    `colormap_by='world_z'` uses world z (height above ground).
     """
-    img = np.full((size, size, 3), 30, dtype=np.uint8)  # dark gray bg
+    img = np.zeros((size, size, 3), dtype=np.uint8)
     if len(pcd_world) == 0:
         return img
-    x_lo, x_hi = _TOPDOWN_X_RANGE
-    y_lo, y_hi = _TOPDOWN_Y_RANGE
-    z_lo, z_hi = _TOPDOWN_Z_RANGE
-    xs = pcd_world[:, 0]
-    ys = pcd_world[:, 1]
-    zs = pcd_world[:, 2]
-    in_box = (xs >= x_lo) & (xs <= x_hi) & (ys >= y_lo) & (ys <= y_hi)
-    xs, ys, zs = xs[in_box], ys[in_box], zs[in_box]
-    if len(xs) == 0:
-        return img
-    # Map world -> pixel.
-    u = ((xs - x_lo) / (x_hi - x_lo) * (size - 1)).astype(np.int32)
-    # y axis points up in the image (invert).
-    v = (size - 1
-         - ((ys - y_lo) / (y_hi - y_lo) * (size - 1)).astype(np.int32))
-    u = np.clip(u, 0, size - 1)
-    v = np.clip(v, 0, size - 1)
-    # Color by z, using a simple manual colormap (avoid matplotlib lookups
-    # per-frame). Low z = cool / blue; high z = warm / red.
-    t = np.clip((zs - z_lo) / (z_hi - z_lo), 0.0, 1.0)
+    v = np.asarray(view, dtype=np.float64).reshape(4, 4, order='F')
+    p = np.asarray(proj, dtype=np.float64).reshape(4, 4, order='F')
+    pts_h = np.concatenate(
+        [pcd_world, np.ones((len(pcd_world), 1))], axis=1)
+    clip = (p @ v @ pts_h.T).T
+    ok = clip[:, 3] != 0.0
+    clip = clip[ok]
+    pcd_kept = pcd_world[ok]
+    ndc = clip[:, :3] / clip[:, 3:4]
+    u = ((ndc[:, 0] + 1.0) * 0.5 * size).astype(np.int32)
+    vv = ((1.0 - (ndc[:, 1] + 1.0) * 0.5) * size).astype(np.int32)
+    in_view = ((u >= 0) & (u < size) & (vv >= 0) & (vv < size)
+               & (ndc[:, 2] > -1) & (ndc[:, 2] < 1))
+    u = u[in_view]
+    vv = vv[in_view]
+    pcd_kept = pcd_kept[in_view]
+    ndc_z = ndc[in_view, 2]
+    if colormap_by == 'world_z':
+        t = np.clip((pcd_kept[:, 2] - 4.0) / 8.0, 0.0, 1.0)
+    else:  # depth
+        t = np.clip((ndc_z + 1.0) * 0.5, 0.0, 1.0)
     r = (np.clip(2.0 * t, 0.0, 1.0) * 255).astype(np.uint8)
     g = (np.clip(1.0 - np.abs(2.0 * t - 1.0), 0.0, 1.0) * 255).astype(np.uint8)
     b = (np.clip(2.0 * (1.0 - t), 0.0, 1.0) * 255).astype(np.uint8)
-    # Paint 1-pixel dots. Use np indexed assignment.
-    img[v, u, 0] = r
-    img[v, u, 1] = g
-    img[v, u, 2] = b
-    # Draw a thin grid + origin cross so the viewer has a frame of reference.
-    img[size // 2, :, :] = [80, 80, 80]
-    img[:, size // 2, :] = [80, 80, 80]
+    # 3x3 dots so points are visible after a downstream nearest-neighbor
+    # upscale to the video panel size.
+    color = np.stack([r, g, b], axis=-1)
+    for du in (-1, 0, 1):
+        for dv in (-1, 0, 1):
+            u2 = np.clip(u + du, 0, size - 1)
+            v2 = np.clip(vv + dv, 0, size - 1)
+            img[v2, u2] = color
     return img
 
 

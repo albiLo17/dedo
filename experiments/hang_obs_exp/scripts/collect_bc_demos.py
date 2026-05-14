@@ -79,7 +79,7 @@ from _bc_obs_helpers import (  # noqa: E402
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     resolve_deform)
 from _debug_viz import (  # noqa: E402
-    hole_centroid_world, overlay_pcd_on_rgb, pcd_topdown_image,
+    hole_centroid_world, overlay_pcd_on_rgb, pcd_camera_view_image,
     render_sim_with_centroid, build_video_frame, write_video_mp4,
     save_grid_png, save_actions_plot, summarize_action_stream)
 
@@ -206,6 +206,22 @@ parser.add_argument('--debug_n_grid_samples', type=int, default=5,
                          'the PNG grid (post-settle frame is added as an '
                          'extra row). 5 + 1 = 6 rows is a comfortable '
                          'PNG height.')
+parser.add_argument('--episode_tail_frames', type=int, default=5,
+                    help='Number of zero-velocity hold frames appended '
+                         'after the planned trajectory ends, before '
+                         '`done` fires and the gravity settle runs. '
+                         'Each frame gives the PD controller a chance '
+                         'to brake the anchor against the cloth\'s '
+                         'momentum, so make_final_steps starts from a '
+                         'near-stationary pose. 5 frames is ~0.33 s at '
+                         '15 Hz / ~0.08 s at 62.5 Hz. 0 disables (drops '
+                         'directly into gravity settle). The dedo '
+                         'make_final_steps phase always runs after, '
+                         'regardless. With this knob set, demo length '
+                         '= len(traj) + episode_tail_frames (capped at '
+                         '--max_episode_len for safety), so episode '
+                         'duration scales naturally with ctrl_freq '
+                         'instead of being a fixed step count.')
 extra = parser.parse_args()
 
 
@@ -290,6 +306,31 @@ _debug_dir = os.path.join(extra.demos_dir, 'debug_viz') if _debug_enabled else N
 if _debug_dir is not None:
     os.makedirs(_debug_dir, exist_ok=True)
 
+# Monkey-patch deform.render() so the dedo-side settle-frame captures
+# inside make_final_steps use the SAME projection matrix as our obs
+# RGB camera (fov=60, near=0.1, far=30). Without this, settle frames
+# look zoomed out (~90° fov from DEFAULT_CAM_PROJECTION) relative to
+# the policy-phase sim panel in the debug video. View matrix is
+# already identical (both use deform._cam_viewmat), so this only
+# affects the projection — no camera-pose shift.
+if _debug_enabled:
+    import types as _types
+    from _bc_obs_helpers import proj_matrix as _bc_proj_matrix
+    _MATCHED_PROJ = _bc_proj_matrix()
+
+    def _matched_render(self, mode='rgb_array', width=300, height=300):
+        assert mode == 'rgb_array'
+        _, _, rgba, _, _ = self.sim.getCameraImage(
+            width=width, height=height,
+            renderer=pybullet.ER_BULLET_HARDWARE_OPENGL,
+            viewMatrix=self._cam_viewmat,
+            projectionMatrix=_MATCHED_PROJ)
+        return np.asarray(rgba)[:, :, :3]
+
+    deform.render = _types.MethodType(_matched_render, deform)
+    print('[init] patched deform.render() to use obs-camera projection '
+          '(fov=60) so debug-video settle frames match policy-phase frames')
+
 
 def _should_debug(kept_index_zero_based: int) -> bool:
     """`kept_index_zero_based` is "this is the Nth kept demo of this run"."""
@@ -366,6 +407,20 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         print(f'[demo] traj peak |vel| = {peak:.3f} m/s; '
               f'MAX_ACT_VEL = {DeformEnv.MAX_ACT_VEL:.3f} m/s{flag}')
 
+    # Bound the per-episode max_episode_len to the trajectory length plus
+    # a small zero-velocity tail. This lets us run at low ctrl_freq
+    # without recording 75+ frames of "spare time" filler. The user's
+    # --max_episode_len is the SAFETY UPPER BOUND; we don't exceed it.
+    # The dedo env reads stepnum >= max_episode_len each env.step(), so
+    # mutating after every reset() is safe.
+    _eff_max_ep_len = min(int(len(traj)) + int(extra.episode_tail_frames),
+                          int(extra.max_episode_len))
+    deform.max_episode_len = _eff_max_ep_len
+    if attempts == 1:
+        print(f'[demo] per-episode max_episode_len = {_eff_max_ep_len} '
+              f'(traj_len={len(traj)} + tail={extra.episode_tail_frames}, '
+              f'safety cap={extra.max_episode_len})')
+
     # Per-episode buffers.
     ep_state = {m: [] for m in PRIV_MODES}
     ep_rgb = []
@@ -381,11 +436,35 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     ep_debug_depth = [] if _is_debug_attempt else None
     ep_debug_centroid = [] if _is_debug_attempt else None
     ep_debug_video_frames = [] if _is_debug_attempt else None
+    # Tell the dedo env to capture RGB frames inside make_final_steps
+    # so the debug video shows the gravity settle (where the cloth
+    # actually drapes onto the peg). We reuse the dedo-side hook the
+    # diffusion eval script also uses, then re-stitch the captured
+    # settle frames into 3-panel video frames after env.step() returns.
+    if _is_debug_attempt:
+        deform._record_settle_frames = True
+        deform._settle_render_kwargs = dict(
+            width=extra.debug_render_size,
+            height=extra.debug_render_size)
+        # 1 sub-step = sim_steps_per_action sim ticks. stride=2 keeps the
+        # settle clip short (~7-8 frames at 15 Hz, ~15 at 62.5 Hz) without
+        # losing the drape dynamics.
+        deform._settle_frame_stride = 2
+    else:
+        # Defensive — make sure stale state from a prior debug demo
+        # doesn't bleed in.
+        deform._record_settle_frames = False
     last_action = np.zeros_like(traj[0])
     step = 0
     done = False
     info = {}
     traj_len_for_demo = int(len(traj))  # snapshot before stepping
+    # Panels from the final policy-phase step, reused as the static
+    # right-side panels under the settle-phase sim frames so the viewer
+    # sees the cloth drop in the LEFT panel while the obs-PCD context
+    # stays frozen at the moment make_final_steps started.
+    _last_obs_overlay = None
+    _last_pcd_camera = None
 
     while not done:
         # 1) Capture obs at current state (BEFORE step).
@@ -405,7 +484,9 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         ep_pcd.append(pcd_world)
 
         # Debug-only: depth (for PNG grid), centroid world pos, and one
-        # composed video frame (sim_high_res | obs+PCD-overlay | PCD-topdown).
+        # composed video frame: sim_high_res | obs+PCD overlay | PCD
+        # projected through the SAME camera as the obs (= what the
+        # policy's PCD encoder sees, in screen space).
         if _is_debug_attempt:
             ep_debug_depth.append(depth.copy())
             centroid_w = hole_centroid_world(deform, hole_idx)
@@ -414,14 +495,34 @@ while n_kept < extra.n_demos and attempts < max_attempts:
                 deform, view, proj, centroid_w,
                 size=extra.debug_render_size)
             obs_overlay = overlay_pcd_on_rgb(rgb, pcd_world, view, proj)
-            topdown = pcd_topdown_image(pcd_world,
-                                        size=extra.debug_render_size)
+            pcd_cam = pcd_camera_view_image(
+                pcd_world, view, proj,
+                size=extra.debug_render_size,
+                colormap_by='depth')
             ep_debug_video_frames.append(build_video_frame(
-                sim_panel, obs_overlay, topdown,
+                sim_panel, obs_overlay, pcd_cam,
                 size=extra.debug_render_size))
+            _last_obs_overlay = obs_overlay
+            _last_pcd_camera = pcd_cam
 
-        # 2) Step with normalized waypoint velocity.
-        act_unscaled = traj[step] if step < len(traj) else last_action
+        # 2) Step with normalized waypoint velocity. After the planned
+        # trajectory runs out, command ZERO velocity for the remaining
+        # hold frames. The original `last_action` (final trajectory
+        # velocity) is preserved at high ctrl_freq by an artifact of
+        # `build_traj`'s chunking (the truncated last chunk gives a
+        # near-zero velocity at e.g. 62.5 Hz), but at low ctrl_freq the
+        # truncated chunk is nearly a full second of displacement and
+        # the trailing velocity is large (~2 m/s). That converts the
+        # hold into an aggressive PD pull-through, which works for
+        # in-sim success metrics but is a sim2real anti-pattern: a real
+        # robot dragging the cloth taut against the peg for 5 seconds
+        # is the opposite of what we want a deployable policy to learn.
+        # Zero-action hold matches the natural 62.5 Hz behavior and
+        # leaves the gravity-settle phase to drape the cloth.
+        if step < len(traj):
+            act_unscaled = traj[step]
+        else:
+            act_unscaled = np.zeros_like(traj[0])
         act = np.clip(act_unscaled / DeformEnv.MAX_ACT_VEL,
                       -1.0, 1.0).astype(np.float32)
         ep_act.append(act)
@@ -430,10 +531,21 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         last_action = act_unscaled
         step += 1
 
-    # Debug-only: one extra capture AFTER make_final_steps gravity settle.
-    # env.step() runs make_final_steps internally on the final step when
-    # done fires, so by here `deform` is in its post-settle state.
+    # Debug-only: stitch the dedo-captured settle frames into the video,
+    # then take one final RGB+depth+PCD capture for the PNG grid's
+    # post-settle row.
     if _is_debug_attempt:
+        # 1) Settle frames live in info['settle_frames'] as a list of
+        # high-res RGB arrays from inside make_final_steps. Pair each
+        # with the LAST policy-phase obs+PCD/PCD-camera panels so the
+        # 3-panel layout stays consistent.
+        settle_rgb_frames = (info.get('settle_frames', [])
+                             if isinstance(info, dict) else [])
+        for sf in settle_rgb_frames:
+            ep_debug_video_frames.append(build_video_frame(
+                sf, _last_obs_overlay, _last_pcd_camera,
+                size=extra.debug_render_size))
+        # 2) Post-settle still-frame for the PNG grid (uses obs camera).
         rgb_ps, depth_ps, view_ps, proj_ps = capture_rgb_depth(
             deform, extra.cam_resolution, extra.cam_resolution)
         pcd_ps = depth_to_pcd(depth_ps, view_ps, proj_ps,
@@ -444,16 +556,21 @@ while n_kept < extra.n_demos and attempts < max_attempts:
             'view': view_ps, 'proj': proj_ps,
             'centroid': centroid_ps,
         }
-        # And one more video frame so the mp4 ends on the settled pose.
+        # 3) Final video frame on the fully-settled pose.
         sim_panel_ps = render_sim_with_centroid(
             deform, view_ps, proj_ps, centroid_ps,
             size=extra.debug_render_size)
         obs_overlay_ps = overlay_pcd_on_rgb(rgb_ps, pcd_ps, view_ps, proj_ps)
-        topdown_ps = pcd_topdown_image(pcd_ps,
-                                       size=extra.debug_render_size)
+        pcd_cam_ps = pcd_camera_view_image(
+            pcd_ps, view_ps, proj_ps,
+            size=extra.debug_render_size,
+            colormap_by='depth')
         ep_debug_video_frames.append(build_video_frame(
-            sim_panel_ps, obs_overlay_ps, topdown_ps,
+            sim_panel_ps, obs_overlay_ps, pcd_cam_ps,
             size=extra.debug_render_size))
+        # Reset the dedo-side flag so a subsequent non-debug attempt
+        # doesn't pay the settle-frame capture cost.
+        deform._record_settle_frames = False
     else:
         _post_settle_panel = None
 
