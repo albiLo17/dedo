@@ -116,7 +116,8 @@ class RGBObsEncoder(nn.Module):
     sees the same proprioception channels the PPO baseline does.
     """
 
-    def __init__(self, grip_dim: int = 12, grip_out_dim: int = 12):
+    def __init__(self, grip_dim: int = 12, grip_out_dim: int = 12,
+                 pretrained: bool = False):
         super().__init__()
         try:
             from torchvision.models import resnet18
@@ -125,9 +126,16 @@ class RGBObsEncoder(nn.Module):
                 'torchvision is required for RGBObsEncoder. '
                 'Install with: pip install torchvision==0.19.1') from e
 
-        # `weights=None` keeps Kaiming init; we have no pretrained imagery
-        # that matches dedo's render distribution.
-        backbone = resnet18(weights=None)
+        # pretrained=True loads ImageNet weights so the conv stack starts
+        # with general-purpose visual features. The BN->GN swap below then
+        # re-initializes the normalization layers (BN's gamma/beta/running
+        # stats don't transfer to GN), but the conv weights — which carry
+        # the bulk of the transferable signal — are preserved. This matches
+        # the standard recipe in Chi et al.'s diffusion-policy paper.
+        if pretrained:
+            backbone = resnet18(weights='IMAGENET1K_V1')
+        else:
+            backbone = resnet18(weights=None)
         backbone = _replace_bn_with_gn(backbone, num_groups=16)
         backbone.fc = nn.Identity()
         self.backbone = backbone
@@ -253,7 +261,8 @@ def build_encoder(obs_mode: str, obs_kwargs: dict) -> nn.Module:
     if obs_mode == 'state':
         return StateObsEncoder(state_dim=obs_kwargs['state_dim'])
     if obs_mode == 'rgb':
-        return RGBObsEncoder()
+        return RGBObsEncoder(
+            pretrained=obs_kwargs.get('pretrained', False))
     if obs_mode == 'pcd':
         return PointCloudObsEncoder(
             n_points=obs_kwargs.get('n_points', 512),

@@ -97,6 +97,15 @@ parser.add_argument('--state_key', type=str, default='hole_centroid',
                          '--obs_mode=state. 18-dim hole_centroid is the '
                          'default; larger fields give more info but more '
                          'params to fit.')
+parser.add_argument('--pretrained_rgb', action='store_true',
+                    help='When --obs_mode=rgb, initialize the ResNet-18 '
+                         'backbone from ImageNet weights instead of from '
+                         'Kaiming init. The subsequent BN->GN swap re-'
+                         'initializes the normalization layers, but the '
+                         'conv stack (the bulk of the transferable signal) '
+                         'is preserved. Ignored for state/pcd modes — '
+                         'PointNet++ pretraining options (ShapeNet etc.) '
+                         'transfer poorly to deformable cloth.')
 parser.add_argument('--logdir_root', type=str,
                     default=str(REPO_ROOT / 'logs' / 'hang_obs_exp' /
                                 'diffusion_bc'))
@@ -147,6 +156,39 @@ parser.add_argument('--n_eval_episodes', type=int, default=10,
                          'success_rate at p=0.5 is ~0.16 at n=10, ~0.09 '
                          'at n=30.')
 parser.add_argument('--n_final_eval_episodes', type=int, default=50)
+parser.add_argument('--video_every_evals', type=int, default=1,
+                    help='Capture an eval video every Nth eval pass and '
+                         'log it to wandb + save alongside the logdir. '
+                         '0 = disabled. 1 = every eval pass (default). '
+                         'Each recorded episode adds ~6-10 s of '
+                         'capture+encode time; only the first '
+                         '--n_video_episodes episodes are recorded per '
+                         'eval pass, the remaining ones run unobserved.')
+parser.add_argument('--n_video_episodes', type=int, default=1,
+                    help='Number of episodes to record per video pass. '
+                         'Higher = clearer signal but slower eval.')
+parser.add_argument('--video_render_size', type=int, default=300,
+                    help='Per-frame render H=W (square) for the video. '
+                         'Independent of the policy obs resolution — '
+                         'this is just what the wandb player shows. '
+                         'Matches HangVideoCallback default (PPO runs).')
+parser.add_argument('--video_fps', type=int, default=30)
+parser.add_argument('--settle_frame_stride', type=int, default=5,
+                    help='Sub-sample the post-settle 500 sim-step gravity '
+                         'phase by this stride so the video tail does not '
+                         'balloon. 5 = one frame per 5 sim steps -> 100 '
+                         'settle frames added per recorded episode.')
+parser.add_argument('--save_every_epochs', type=int, default=0,
+                    help='Save a numbered policy_ep<NNNN>.pt checkpoint '
+                         'after each eval pass that lands on this interval, '
+                         'in addition to the always-saved final policy.pt. '
+                         '0 = disabled. Recommended: match '
+                         '--eval_every_epochs so every logged eval point '
+                         'has a recoverable policy. Note: best-eval '
+                         'tracking (policy_best.pt) is ALWAYS enabled '
+                         'regardless of this flag — every eval pass '
+                         'compares against the running best and mirrors '
+                         'the EMA weights to policy_best.pt on improvement.')
 parser.add_argument('--max_episode_len', type=int, default=200)
 parser.add_argument('--eval_cam_resolution', type=int, default=None,
                     help='Camera resolution at eval time. Default = the '
@@ -157,6 +199,19 @@ parser.add_argument('--success_factor', type=float, default=1.2,
                     help='Adaptive success threshold for eval-time '
                          'criterion. Should match the value collect_bc_'
                          'demos.py used; the script warns on mismatch.')
+parser.add_argument('--ctrl_freq', type=float, default=15.0,
+                    help='Control frequency (Hz) for the eval env. By '
+                         'default the demos\' recorded ctrl_freq overrides '
+                         'this (so eval matches collection). For legacy '
+                         'pkls with no ctrl_freq field, this value is used '
+                         'as a fallback. Implemented via '
+                         'sim_steps_per_action = round(sim_freq/ctrl_freq).')
+parser.add_argument('--sim_freq', type=int, default=500,
+                    help='PyBullet physics frequency for the eval env. '
+                         'Default 500 matches dedo. Only used together '
+                         'with --ctrl_freq when demos lack a recorded '
+                         'ctrl_freq, or to confirm parity for demos '
+                         'collected under a non-default sim_freq.')
 
 # Eval-env seed strategy
 parser.add_argument('--eval_seed_offset', type=int, default=9999,
@@ -209,6 +264,8 @@ def build_diffusion_run_suffix(a):
     parts = [f'_{a.obs_mode}']
     if a.obs_mode == 'state' and a.state_key != 'hole_centroid':
         parts.append(f'_{a.state_key}')
+    if a.obs_mode == 'rgb' and a.pretrained_rgb:
+        parts.append('_pre')
     parts.append(f'_lr{_fmt_lr(a.lr)}')
     parts.append(f'_e{a.num_epochs}')
     parts.append(f'_bs{a.batch_size}')
@@ -289,6 +346,12 @@ recorded_success_factors = set()
 # us put it in a set to detect mixed-camera demo dirs.
 recorded_cam_viewmats: set = set()
 recorded_max_act_vels: set = set()  # critical parity invariant; see import block
+recorded_ctrl_freqs: set = set()    # control-freq parity (same kind of invariant
+                                    # as max_act_vel: trajectory was recorded at
+                                    # this Hz; eval env must match or actions
+                                    # play back at the wrong speed)
+recorded_sim_freqs: set = set()
+recorded_sim_steps_per_action: set = set()
 needs_grip = args.obs_mode in ('rgb', 'pcd')  # state already has grip
 n_missing_grip = 0
 
@@ -346,6 +409,14 @@ for fname in demo_paths:
         recorded_cam_viewmats.add(tuple(float(x) for x in d['cam_viewmat']))
     if 'max_act_vel' in d:
         recorded_max_act_vels.add(float(d['max_act_vel']))
+    # round to 4 dp so 15.151515... and 15.15151515 don't trigger a false
+    # mismatch across demos recorded with the same intent.
+    if 'ctrl_freq' in d:
+        recorded_ctrl_freqs.add(round(float(d['ctrl_freq']), 4))
+    if 'sim_freq' in d:
+        recorded_sim_freqs.add(int(d['sim_freq']))
+    if 'sim_steps_per_action' in d:
+        recorded_sim_steps_per_action.add(int(d['sim_steps_per_action']))
     ep_ends.append(sum(len(a) for a in act_buf))
 
 if not obs_buf:
@@ -439,6 +510,53 @@ else:
         f'every demo\'s actions were normalized by a different value, '
         f'so the training data mixes incompatible action scales. '
         f'Re-collect into a clean directory with a single --max_act_vel.')
+
+
+# ---------------------------------------------------------------------------
+# Pick the eval env's ctrl_freq (sim_freq + sim_steps_per_action). Same parity
+# story as MAX_ACT_VEL: demos were recorded at a specific Hz, and the eval env
+# must replay actions at the same Hz or trajectories advance at the wrong
+# speed (and at high ctrl_freq the gripper can't keep up with the lift phase
+# in the time budget). Prefer demo-recorded values; fall back to CLI flags
+# for legacy pkls.
+# ---------------------------------------------------------------------------
+if len(recorded_sim_steps_per_action) > 1:
+    raise RuntimeError(
+        f'[data] demos use mixed sim_steps_per_action values '
+        f'{sorted(recorded_sim_steps_per_action)}. Demos at different '
+        f'control frequencies advance through the recorded waypoint plan '
+        f'at different speeds — training data is incompatible. '
+        f'Re-collect into a clean directory at a single --ctrl_freq.')
+if len(recorded_sim_freqs) > 1:
+    raise RuntimeError(
+        f'[data] demos use mixed sim_freq values '
+        f'{sorted(recorded_sim_freqs)}. Re-collect into a clean directory.')
+
+if recorded_sim_steps_per_action and recorded_sim_freqs:
+    eval_sim_steps_per_action = next(iter(recorded_sim_steps_per_action))
+    eval_sim_freq = next(iter(recorded_sim_freqs))
+    eval_ctrl_freq = eval_sim_freq / eval_sim_steps_per_action
+    print(f'[data] eval ctrl_freq (from demos) = {eval_ctrl_freq:.3f} Hz '
+          f'(sim_freq={eval_sim_freq}, steps/action='
+          f'{eval_sim_steps_per_action})')
+    if recorded_ctrl_freqs:
+        _saved_freq = next(iter(recorded_ctrl_freqs))
+        if abs(_saved_freq - eval_ctrl_freq) > 1e-3:
+            print(f'[data] WARN: demo ctrl_freq field {_saved_freq} Hz '
+                  f'disagrees with sim_freq/sim_steps_per_action '
+                  f'({eval_ctrl_freq:.3f} Hz). Using the derived value.')
+else:
+    # Legacy pkls without ctrl_freq metadata — fall back to CLI flags.
+    eval_sim_freq = int(args.sim_freq)
+    eval_sim_steps_per_action = max(
+        1, int(round(args.sim_freq / args.ctrl_freq)))
+    eval_ctrl_freq = eval_sim_freq / eval_sim_steps_per_action
+    print(f'[data] no ctrl_freq in demos (legacy pkls); using CLI '
+          f'--ctrl_freq={args.ctrl_freq} -> eval ctrl_freq='
+          f'{eval_ctrl_freq:.3f} Hz (sim_freq={eval_sim_freq}, '
+          f'steps/action={eval_sim_steps_per_action}). If demos were '
+          f'collected at a different ctrl_freq, eval will be inconsistent. '
+          f'Re-collect to be safe.')
 
 
 # =============================================================================
@@ -605,7 +723,7 @@ dataloader = DataLoader(
 if args.obs_mode == 'state':
     enc_kwargs = {'state_dim': int(obs_all.shape[-1])}
 elif args.obs_mode == 'rgb':
-    enc_kwargs = {}
+    enc_kwargs = {'pretrained': args.pretrained_rgb}
 elif args.obs_mode == 'pcd':
     # Use the actual n_pts from the saved data (handles both 256 and 512
     # demos cleanly; PointCloudObsEncoder treats it as a fixed input size).
@@ -671,6 +789,8 @@ def _build_eval_env(eval_seed):
         '--total_env_steps=0',
         '--seed', str(eval_seed),
         '--max_episode_len', str(args.max_episode_len),
+        f'--sim_freq={eval_sim_freq}',
+        f'--sim_steps_per_action={eval_sim_steps_per_action}',
         '--cam_viewmat',
         *[f'{x:.6f}' for x in eval_cam_viewmat],
     ]
@@ -746,10 +866,22 @@ def _apply_normalizer_to_seq(samples, normalizer):
 
 
 @torch.no_grad()
-def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval'):
+def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
+                    record_video_episodes: int = 0,
+                    video_label: str = ''):
     """Roll out the EMA policy on `n_episodes` deterministic episodes.
+
     Returns a dict of metrics (success rates per metric, episode reward,
-    episode length)."""
+    episode length).
+
+    If `record_video_episodes > 0`, captures rendered RGB frames for the
+    first N episodes (including the post-settle phase via dedo's
+    `_record_settle_frames` hook), encodes them to a single mp4 in the
+    logdir, and logs it to wandb under `<label>/video`. The remaining
+    `n_episodes - record_video_episodes` rollouts run without capture so
+    the success-rate aggregate isn't biased by the slower recorded
+    episodes.
+    """
     encoder.eval()
     policy.eval()
     # Apply EMA weights to a temp copy for eval; restore after.
@@ -759,10 +891,30 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval'):
     e, dargs = _build_eval_env(eval_seed)
     deform = resolve_deform(e)
 
+    # Per-episode RGB frame buffers populated only for the first
+    # `record_video_episodes` rollouts. Outer list is one entry per
+    # recorded episode; inner list is all frames from that episode
+    # (policy phase + post-settle).
+    recorded_episode_frames = []  # list of list of (H,W,3) uint8
+
     s_hanging = s_topo = s_legacy = 0
     ep_rwds = []
     ep_lens = []
     for ep in range(n_episodes):
+        is_recorded = ep < record_video_episodes
+        ep_frames = []  # filled only if is_recorded
+        # Tell dedo to capture post-settle frames during make_final_steps
+        # (the 500-step gravity phase that runs inside step() when done
+        # fires). Without this hook the video stops at the policy-handoff
+        # frame and the viewer misses the actual hanging outcome.
+        if is_recorded:
+            deform._record_settle_frames = True
+            deform._settle_render_kwargs = dict(
+                width=args.video_render_size,
+                height=args.video_render_size)
+            deform._settle_frame_stride = args.settle_frame_stride
+        else:
+            deform._record_settle_frames = False
         e.reset()
         hole_idx = get_hole_indices(deform)
         if not hole_idx:
@@ -799,15 +951,35 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval'):
             # 3) Execute chunk open-loop, capture obs each step.
             for a in chunk:
                 a = np.clip(a, -1.0, 1.0).astype(np.float32)
-                _, rwd, done, _ = e.step(a)
+                _, rwd, done, info = e.step(a)
                 ep_rwd += float(rwd)
                 step += 1
+                if is_recorded:
+                    # Pre-settle policy-phase frame. On the terminal step
+                    # (done=True), dedo's make_final_steps already ran
+                    # INSIDE this step() call, and settle_frames is in
+                    # `info` — we append those below after the loop. We
+                    # still capture this one frame to mark the policy
+                    # handoff.
+                    ep_frames.append(deform.render(
+                        mode='rgb_array',
+                        width=args.video_render_size,
+                        height=args.video_render_size))
                 new_obs = _capture_obs_for_policy(
                     deform, args.obs_mode, args.state_key,
                     hole_idx, corner_idx)
                 obs_deque.append(new_obs)
                 if done or step >= args.max_episode_len:
                     break
+        # Append the post-settle (gravity-phase) frames captured by
+        # dedo inside make_final_steps. `info['settle_frames']` exists
+        # iff `_record_settle_frames` was True at the terminal step.
+        if is_recorded:
+            settle_frames = info.get('settle_frames', []) if isinstance(
+                info, dict) else []
+            ep_frames.extend(settle_frames)
+            recorded_episode_frames.append(ep_frames)
+            deform._record_settle_frames = False  # turn off for next ep
 
         # Score this episode with all three metrics for cross-comparison.
         s_hanging += int(check_hanging_on_peg(
@@ -821,6 +993,24 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval'):
         print(f'  [{label} ep {ep+1}/{n_episodes}] '
               f'rwd={ep_rwd:6.1f}  len={step:3d}  '
               f'h={s_hanging}/{ep+1} t={s_topo}/{ep+1} l={s_legacy}/{ep+1}')
+
+    # Encode the captured episodes into one mp4 (concat). One file per
+    # eval pass is plenty — separate episodes can be told apart by the
+    # gripper-anchor reset between them.
+    video_path = None
+    if recorded_episode_frames:
+        flat_frames = [f for ep in recorded_episode_frames for f in ep]
+        video_filename = (f'{label}{("_" + video_label) if video_label else ""}'
+                          f'.mp4')
+        video_path = os.path.join(logdir, video_filename)
+        try:
+            _write_mp4(flat_frames, video_path, fps=args.video_fps)
+            print(f'  [video] wrote {video_path} '
+                  f'({len(flat_frames)} frames, '
+                  f'{len(recorded_episode_frames)} episodes)')
+        except Exception as _video_err:
+            print(f'  [video] WARN: mp4 encode failed: {_video_err!r}')
+            video_path = None
 
     e.close()
     # Restore non-EMA weights.
@@ -847,6 +1037,11 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval'):
         f'{label}/mean_episode_len': float(np.mean(ep_lens)),
         f'{label}/n_episodes': n_episodes,
     }
+    # Stash the on-disk video path for the caller (so it can wandb.log
+    # the wandb.Video with the right epoch-tagged caption alongside the
+    # numeric metrics, in a single wandb.log call).
+    if video_path is not None:
+        metrics[f'{label}/_video_path'] = video_path
     return metrics
 
 
@@ -861,6 +1056,11 @@ with open(os.path.join(logdir, 'config.json'), 'w') as f:
         'collection_cam_resolution': collection_cam_res,
         'collection_pcd_n_points': collection_pcd_n_pts,
         'recorded_success_factors': sorted(recorded_success_factors),
+        'recorded_ctrl_freqs': sorted(recorded_ctrl_freqs),
+        'eval_ctrl_freq': float(eval_ctrl_freq),
+        'eval_sim_freq': int(eval_sim_freq),
+        'eval_sim_steps_per_action': int(eval_sim_steps_per_action),
+        'eval_max_act_vel': float(DeformEnv.MAX_ACT_VEL),
         'state_dim': int(obs_all.shape[-1]) if args.obs_mode == 'state' else None,
         'action_dim': int(acts_all.shape[-1]),
         'n_dataset_windows': len(dataset),
@@ -868,10 +1068,104 @@ with open(os.path.join(logdir, 'config.json'), 'w') as f:
 
 
 # =============================================================================
+# Checkpoint helper. EMA-swap is centralized here so periodic / best / final
+# saves all use the same code path. The helper saves the EMA-weighted policy
+# and encoder; live (training) weights are restored on exit so the next
+# training step continues from the unaveraged params (EMA is just a smoothed
+# shadow, not the train trajectory).
+# =============================================================================
+_CKPT_METADATA_TEMPLATE = {
+    'obs_mode': args.obs_mode,
+    'obs_horizon': args.obs_horizon,
+    'pred_horizon': args.pred_horizon,
+    'action_horizon': args.action_horizon,
+    'num_diffusion_iters': args.num_diffusion_iters,
+    'action_dim': int(acts_all.shape[-1]),
+    'state_dim': int(obs_all.shape[-1]) if args.obs_mode == 'state' else None,
+    'pcd_n_points': collection_pcd_n_pts,
+    'state_key': args.state_key,
+    # The eval env reads these from the demo pkl, but stashing them in the
+    # ckpt too means a deploy script can rebuild the env without the demos.
+    'eval_cam_viewmat': list(eval_cam_viewmat),
+    'eval_cam_resolution': int(eval_cam_resolution),
+    'max_act_vel': float(DeformEnv.MAX_ACT_VEL),
+    # Eval-time ctrl_freq the env was built under. Demos were recorded
+    # at the same Hz, so this lets a deploy script rebuild a parity env
+    # without needing the demo pkls.
+    'ctrl_freq': float(eval_ctrl_freq),
+    'sim_freq': int(eval_sim_freq),
+    'sim_steps_per_action': int(eval_sim_steps_per_action),
+}
+
+
+def _save_ema_checkpoint(path, epoch=None, eval_metrics=None):
+    """Snapshot EMA weights to disk, restoring live weights on exit.
+    All save paths (periodic, best, final) go through this helper so the
+    on-disk format is uniform: load with torch.load(path) -> dict ready
+    to feed into policy.load_state_dict / encoder.load_state_dict.
+    """
+    ema_state_local = [p.detach().clone() for p in trainables]
+    ema.copy_to(trainables)
+    ckpt = {
+        'policy_state_dict': policy.state_dict(),
+        'encoder_state_dict': encoder.state_dict(),
+        **_CKPT_METADATA_TEMPLATE,
+    }
+    if epoch is not None:
+        ckpt['epoch'] = int(epoch)
+    if eval_metrics is not None:
+        ckpt['eval_metrics'] = dict(eval_metrics)
+    torch.save(ckpt, path)
+    for p, saved in zip(trainables, ema_state_local):
+        p.data.copy_(saved)
+
+
+# =============================================================================
+# Video helper. Encodes a list of (H, W, 3) uint8 RGB frames to an
+# mp4 that wandb / browsers can play back. Mirrors HangVideoCallback's
+# convention exactly:
+#   - libx264 codec via imageio_ffmpeg's bundled static ffmpeg
+#   - yuv420p pixel format (required for browser <video> tags)
+#   - +faststart so playback starts before the whole file downloads
+# cv2's mp4v fourcc produces an MPEG-4 Simple Profile stream that the
+# wandb HTML5 player can't decode — videos would sit on "loading" forever.
+# =============================================================================
+def _write_mp4(frames, path: str, fps: int = 30) -> None:
+    if not frames:
+        return
+    import imageio  # imageio_ffmpeg is a transitive dep of imageio
+    writer = imageio.get_writer(
+        path, fps=fps, codec='libx264', quality=8,
+        macro_block_size=2, pixelformat='yuv420p',
+        ffmpeg_params=['-movflags', '+faststart'])
+    for frame in frames:
+        writer.append_data(np.ascontiguousarray(frame))
+    writer.close()
+
+
+# Save the obs normalizer once now. It's fitted on the full demo pool at
+# startup and never updated during training, so a single file alongside the
+# logdir is enough — any periodic / best / final ckpt can be loaded with
+# this same normalizer pkl.
+with open(os.path.join(logdir, 'obs_normalizer.pkl'), 'wb') as f:
+    pickle.dump(obs_normalizer.state_dict(), f)
+print(f'[init] wrote obs_normalizer.pkl alongside the logdir')
+
+
+# =============================================================================
 # Train loop
 # =============================================================================
 print(f'\n=== Training (epochs={args.num_epochs}, '
       f'batches/epoch={len(dataloader)}) ===')
+
+# Best-eval tracking. The "primary" metric is whichever one
+# --success_metric selects (alias eval/success_rate). On every eval pass,
+# if the current rate beats the running best, mirror the EMA weights to
+# policy_best.pt — so a crash or premature kill still leaves you with
+# the best-performing snapshot to deploy from.
+best_eval_success = float('-inf')
+best_eval_epoch = -1
+best_ckpt_path = os.path.join(logdir, 'policy_best.pt')
 
 step_counter = 0
 for epoch in range(args.num_epochs):
@@ -904,61 +1198,116 @@ for epoch in range(args.num_epochs):
     # Mid-training eval.
     if (args.eval_every_epochs > 0
             and (epoch + 1) % args.eval_every_epochs == 0):
+        # Index of this eval pass (1-based). Used both for the
+        # video_every_evals modulo check and as a label inside the mp4
+        # filename so successive videos don't overwrite each other.
+        eval_pass_idx = (epoch + 1) // args.eval_every_epochs
+        record_n = (args.n_video_episodes
+                    if (args.video_every_evals > 0
+                        and eval_pass_idx % args.video_every_evals == 0)
+                    else 0)
         print(f'  [eval @ epoch {epoch+1}] running '
-              f'{args.n_eval_episodes} episodes...')
+              f'{args.n_eval_episodes} episodes'
+              f'{f" (recording first {record_n})" if record_n else ""}...')
         eval_metrics = evaluate_policy(
             n_episodes=args.n_eval_episodes,
             eval_seed=args.seed + args.eval_seed_offset,
-            label='eval')
+            label='eval',
+            record_video_episodes=record_n,
+            video_label=f'ep{epoch+1:04d}')
+        # Pop the video path BEFORE printing / wandb-logging so the
+        # numeric metrics dict stays clean (wandb.log uses the path to
+        # build a wandb.Video object instead of stringifying it).
+        video_path = eval_metrics.pop('eval/_video_path', None)
         for k, v in eval_metrics.items():
             print(f'    {k}: {v}')
         if args.use_wandb:
-            wandb.log({**eval_metrics, 'train/epoch': epoch + 1})
+            log_dict = {**eval_metrics, 'train/epoch': epoch + 1}
+            if video_path:
+                log_dict['eval/video'] = wandb.Video(
+                    video_path, fps=args.video_fps,
+                    caption=f'epoch {epoch+1} | '
+                            f'success_rate={eval_metrics["eval/success_rate"]:.2f}')
+            wandb.log(log_dict)
+
+        # --- Periodic numbered checkpoint (opt-in via --save_every_epochs).
+        # Saves AFTER the eval so the eval_metrics get embedded in the ckpt
+        # dict and a deploy script can see what eval rate this snapshot
+        # achieved without consulting the wandb run.
+        if (args.save_every_epochs > 0
+                and (epoch + 1) % args.save_every_epochs == 0):
+            periodic_path = os.path.join(
+                logdir, f'policy_ep{epoch+1:04d}.pt')
+            _save_ema_checkpoint(
+                periodic_path, epoch=epoch + 1, eval_metrics=eval_metrics)
+            print(f'  [ckpt] saved periodic {os.path.basename(periodic_path)}')
+
+        # --- Best-eval tracking (always on). Compare the primary success
+        # rate (eval/success_rate, which aliases the user's --success_metric)
+        # against the running max; mirror to policy_best.pt on improvement.
+        cur_eval_succ = float(eval_metrics.get(
+            'eval/success_rate', float('-inf')))
+        if cur_eval_succ > best_eval_success:
+            best_eval_success = cur_eval_succ
+            best_eval_epoch = epoch + 1
+            _save_ema_checkpoint(
+                best_ckpt_path, epoch=epoch + 1, eval_metrics=eval_metrics)
+            print(f'  [ckpt] NEW BEST: eval/success_rate='
+                  f'{cur_eval_succ:.3f} @ epoch {epoch+1} '
+                  f'-> policy_best.pt')
+            if args.use_wandb:
+                wandb.log({'best/eval_success_rate': best_eval_success,
+                           'best/epoch': best_eval_epoch,
+                           'train/epoch': epoch + 1})
 
 
 # =============================================================================
-# Save final checkpoint (EMA weights)
-# =============================================================================
-ckpt_path = os.path.join(logdir, 'policy.pt')
-# Capture EMA weights into a regular state dict for clean loading.
-ema_state = [p.detach().clone() for p in trainables]
-ema.copy_to(trainables)
-torch.save({
-    'policy_state_dict': policy.state_dict(),
-    'encoder_state_dict': encoder.state_dict(),
-    'obs_mode': args.obs_mode,
-    'obs_horizon': args.obs_horizon,
-    'pred_horizon': args.pred_horizon,
-    'action_horizon': args.action_horizon,
-    'num_diffusion_iters': args.num_diffusion_iters,
-    'action_dim': int(acts_all.shape[-1]),
-    'state_dim': int(obs_all.shape[-1]) if args.obs_mode == 'state' else None,
-    'pcd_n_points': collection_pcd_n_pts,
-    'state_key': args.state_key,
-}, ckpt_path)
-with open(os.path.join(logdir, 'obs_normalizer.pkl'), 'wb') as f:
-    pickle.dump(obs_normalizer.state_dict(), f)
-print(f'\n[ckpt] saved {ckpt_path}')
-
-# Restore live weights so the final eval (below) uses EMA.
-# (We already copied EMA in; just keep the restore-to-live for parity
-# with mid-training eval flow if anything later runs.)
-
-# =============================================================================
-# Final eval — EMA weights, more episodes for tight SE.
+# Final eval — EMA weights, more episodes for tight SE. Runs FIRST so the
+# final policy.pt save below can embed the final_metrics in the ckpt dict
+# (deploy scripts will know what eval rate this checkpoint achieved without
+# loading the wandb run).
 # =============================================================================
 print(f'\n=== Final eval ({args.n_final_eval_episodes} episodes) ===')
+# Always record at least one video at the end of training so deploy
+# decisions don't depend on the wandb mid-training videos.
+final_record_n = max(args.n_video_episodes, 1) \
+    if args.video_every_evals > 0 else 0
 final_metrics = evaluate_policy(
     n_episodes=args.n_final_eval_episodes,
     eval_seed=args.seed + args.eval_seed_offset + 1,
-    label='final_eval')
+    label='final_eval',
+    record_video_episodes=final_record_n,
+    video_label='final')
+final_video_path = final_metrics.pop('final_eval/_video_path', None)
 print('\nFinal eval:')
 for k, v in sorted(final_metrics.items()):
     print(f'  {k}: {v}')
 if args.use_wandb:
-    wandb.log(final_metrics)
-    wandb.finish()
+    log_dict = dict(final_metrics)
+    if final_video_path:
+        log_dict['final_eval/video'] = wandb.Video(
+            final_video_path, fps=args.video_fps,
+            caption=f'final | '
+                    f'success_rate={final_metrics["final_eval/success_rate"]:.2f}')
+    wandb.log(log_dict)
 
-# Restore live (non-EMA) weights post-eval just in case anything else runs.
-for p, saved in zip(trainables, ema_state):
-    p.data.copy_(saved)
+
+# =============================================================================
+# Save final checkpoint (EMA weights). Note: policy_best.pt may be a
+# different epoch's snapshot if a mid-training eval scored higher than the
+# final eval — that's the whole point of best-tracking. Both files are
+# valid; deploy from whichever the workflow prefers.
+# =============================================================================
+final_ckpt_path = os.path.join(logdir, 'policy.pt')
+_save_ema_checkpoint(
+    final_ckpt_path, epoch=args.num_epochs, eval_metrics=final_metrics)
+print(f'\n[ckpt] saved final {final_ckpt_path}')
+if best_eval_epoch > 0:
+    print(f'[ckpt] best mid-training eval/success_rate='
+          f'{best_eval_success:.3f} at epoch {best_eval_epoch} '
+          f'-> policy_best.pt')
+else:
+    print(f'[ckpt] no mid-training eval ran (--eval_every_epochs=0); '
+          f'policy_best.pt was NOT written.')
+if args.use_wandb:
+    wandb.finish()

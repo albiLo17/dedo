@@ -36,6 +36,10 @@ Saves to <demos_dir>/demo_NNN.pkl. Pkl schema (one episode per file):
     'pcd_n_points':   int,
     'cam_viewmat':    list[float] (6),
     'hole_radius':    float,
+    'max_act_vel':    float,
+    'ctrl_freq':      float,   # actual achieved Hz (sim_freq / steps_per_action)
+    'sim_freq':       int,
+    'sim_steps_per_action': int,
   }
 
 Compatible reader: experiments/hang_obs_exp/scripts/train_diffusion_bc.py.
@@ -74,6 +78,10 @@ from _bc_obs_helpers import (  # noqa: E402
     get_hole_indices, get_hole_loops, measure_hole_radius,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     resolve_deform)
+from _debug_viz import (  # noqa: E402
+    hole_centroid_world, overlay_pcd_on_rgb, pcd_topdown_image,
+    render_sim_with_centroid, build_video_frame, write_video_mp4,
+    save_grid_png, save_actions_plot, summarize_action_stream)
 
 from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
     build_privileged_obs, identify_cloth_corners)
@@ -152,7 +160,68 @@ parser.add_argument('--cam_viewmat', type=float, nargs=6,
                          'visible at most timesteps. Same view is used '
                          'for both RGB and PCD obs, so the two '
                          'modalities receive equivalent info.')
+parser.add_argument('--ctrl_freq', type=float, default=15.0,
+                    help='Control frequency in Hz (one env.step every '
+                         '1/ctrl_freq seconds of sim time). Implemented '
+                         'by setting sim_steps_per_action = round(sim_freq '
+                         '/ ctrl_freq). 15 Hz is the default — slower than '
+                         'dedo\'s 62.5 Hz default so each recorded action '
+                         'spans more sim time and the resulting trajectory '
+                         'has fewer / coarser steps (better fit for '
+                         'diffusion policy receding-horizon control). The '
+                         'actual achieved freq is saved into each demo pkl '
+                         'as `ctrl_freq`, so a downstream training script '
+                         'can verify parity. Pass --sim_freq to change the '
+                         'physics step rate (default 500 Hz); 500/15=33.33, '
+                         'so the rounded sim_steps_per_action=33 yields an '
+                         'actual ctrl_freq of ~15.15 Hz.')
+parser.add_argument('--sim_freq', type=int, default=500,
+                    help='PyBullet physics frequency. Default 500 matches '
+                         'dedo. Adjust only if ctrl_freq doesn\'t round '
+                         'cleanly — e.g. sim_freq=450 with ctrl_freq=15 '
+                         'gives sim_steps_per_action=30 (exact 15 Hz). '
+                         'Lower sim_freq risks soft-body instability.')
+parser.add_argument('--debug_viz_first_n', type=int, default=3,
+                    help='Generate debug visualization artifacts for the '
+                         'first N KEPT demos (PNG grid + MP4 video + action '
+                         'stats plot). Saves under <demos_dir>/debug_viz/. '
+                         '0 disables. Cost: ~5-10 s overhead per debug '
+                         'demo (high-res sim render + matplotlib).')
+parser.add_argument('--debug_viz_every', type=int, default=0,
+                    help='Also generate debug viz for every Nth kept demo '
+                         '(in addition to --debug_viz_first_n). 0 disables. '
+                         'Useful with large n_demos to spot-check '
+                         'mid-collection: --debug_viz_every 25 -> ~6 viz '
+                         'demos for a 150-demo run.')
+parser.add_argument('--debug_render_size', type=int, default=300,
+                    help='Per-panel size (H=W) for the video frames\' '
+                         'high-res sim panel. 300 keeps the mp4 small and '
+                         'each panel readable; bump to 480 for slides.')
+parser.add_argument('--debug_fps', type=int, default=15,
+                    help='Video frame rate. Matches the default ctrl_freq '
+                         'so playback runs at sim wall-clock speed. Bump '
+                         'to 30 for smoother scrubbing.')
+parser.add_argument('--debug_n_grid_samples', type=int, default=5,
+                    help='Number of in-trajectory timesteps sampled for '
+                         'the PNG grid (post-settle frame is added as an '
+                         'extra row). 5 + 1 = 6 rows is a comfortable '
+                         'PNG height.')
 extra = parser.parse_args()
+
+
+# Derive sim_steps_per_action from ctrl_freq. Round to nearest int and
+# report the actual achieved freq so the user knows what gets saved.
+_steps_per_action = max(1, int(round(extra.sim_freq / extra.ctrl_freq)))
+_actual_ctrl_freq = extra.sim_freq / _steps_per_action
+if abs(_actual_ctrl_freq - extra.ctrl_freq) / extra.ctrl_freq > 0.05:
+    print(f'[init] WARN: requested ctrl_freq={extra.ctrl_freq} Hz rounds '
+          f'to sim_steps_per_action={_steps_per_action} -> actual '
+          f'ctrl_freq={_actual_ctrl_freq:.3f} Hz (>5% deviation). Pick a '
+          f'--sim_freq that divides ctrl_freq more cleanly to fix.')
+else:
+    print(f'[init] ctrl_freq={extra.ctrl_freq} Hz -> '
+          f'sim_steps_per_action={_steps_per_action} '
+          f'(actual {_actual_ctrl_freq:.3f} Hz, sim_freq={extra.sim_freq})')
 
 os.makedirs(extra.demos_dir, exist_ok=True)
 
@@ -167,6 +236,8 @@ sys.argv = [
     '--total_env_steps=0',
     '--seed', str(extra.seed),
     '--max_episode_len', str(extra.max_episode_len),
+    f'--sim_freq={extra.sim_freq}',
+    f'--sim_steps_per_action={_steps_per_action}',
     '--cam_viewmat',
     *[str(x) for x in extra.cam_viewmat],
 ]
@@ -209,6 +280,28 @@ def _next_demo_id():
 
 
 # ---------------------------------------------------------------------------
+# Debug visualization scheduling. We pre-compute which kept demo indices
+# (0-based, counting from this run) get full viz: PNG grid + MP4 video +
+# action stats plot. The collector buffers high-res renders + depth +
+# centroid coords only for these demos so non-debug demos stay cheap.
+# ---------------------------------------------------------------------------
+_debug_enabled = (extra.debug_viz_first_n > 0 or extra.debug_viz_every > 0)
+_debug_dir = os.path.join(extra.demos_dir, 'debug_viz') if _debug_enabled else None
+if _debug_dir is not None:
+    os.makedirs(_debug_dir, exist_ok=True)
+
+
+def _should_debug(kept_index_zero_based: int) -> bool:
+    """`kept_index_zero_based` is "this is the Nth kept demo of this run"."""
+    if kept_index_zero_based < extra.debug_viz_first_n:
+        return True
+    if extra.debug_viz_every > 0 and \
+       (kept_index_zero_based + 1) % extra.debug_viz_every == 0:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main collection loop.
 # ---------------------------------------------------------------------------
 print(f'\n=== BC demo collection ===')
@@ -218,7 +311,18 @@ print(f'  only_success:    {extra.only_success}  ({extra.success_metric})')
 print(f'  cam_resolution:  {extra.cam_resolution}')
 print(f'  pcd_n_points:    {extra.pcd_n_points}')
 print(f'  MAX_ACT_VEL:     {DeformEnv.MAX_ACT_VEL}')
+print(f'  ctrl_freq:       {_actual_ctrl_freq:.3f} Hz '
+      f'(sim_freq={extra.sim_freq}, steps/action={_steps_per_action})')
+if _debug_enabled:
+    print(f'  debug_viz:       first {extra.debug_viz_first_n} kept'
+          f'{f" + every {extra.debug_viz_every}th" if extra.debug_viz_every > 0 else ""}'
+          f' -> {_debug_dir}')
+else:
+    print(f'  debug_viz:       disabled')
 print(f'  starting demo_id at: {_next_demo_id()}\n')
+
+# Action-stat aggregation across all kept demos (printed at end of run).
+_action_stats_kept: list = []
 
 n_kept = 0
 n_dropped_failed = 0
@@ -269,10 +373,19 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     ep_grip = []  # 12-dim gripper_pos_vel, /WBOX-normalized (matches PixelObsWrapper / PointCloudObsWrapper convention so RGB & PCD BC see the same proprioception the PPO baselines see).
     ep_act = []
     ep_rwd = []
+    # Decide upfront whether this attempt is a debug-instrumented demo.
+    # If this attempt becomes the next kept demo, it would be kept-index
+    # `n_kept` (zero-based). Build the extra buffers eagerly so we don't
+    # need to re-run the episode after the success check.
+    _is_debug_attempt = _debug_enabled and _should_debug(n_kept)
+    ep_debug_depth = [] if _is_debug_attempt else None
+    ep_debug_centroid = [] if _is_debug_attempt else None
+    ep_debug_video_frames = [] if _is_debug_attempt else None
     last_action = np.zeros_like(traj[0])
     step = 0
     done = False
     info = {}
+    traj_len_for_demo = int(len(traj))  # snapshot before stepping
 
     while not done:
         # 1) Capture obs at current state (BEFORE step).
@@ -287,8 +400,25 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         ep_grip.append(grip)
         rgb, depth, view, proj = capture_rgb_depth(
             deform, extra.cam_resolution, extra.cam_resolution)
+        pcd_world = depth_to_pcd(depth, view, proj, extra.pcd_n_points)
         ep_rgb.append(rgb)
-        ep_pcd.append(depth_to_pcd(depth, view, proj, extra.pcd_n_points))
+        ep_pcd.append(pcd_world)
+
+        # Debug-only: depth (for PNG grid), centroid world pos, and one
+        # composed video frame (sim_high_res | obs+PCD-overlay | PCD-topdown).
+        if _is_debug_attempt:
+            ep_debug_depth.append(depth.copy())
+            centroid_w = hole_centroid_world(deform, hole_idx)
+            ep_debug_centroid.append(centroid_w)
+            sim_panel = render_sim_with_centroid(
+                deform, view, proj, centroid_w,
+                size=extra.debug_render_size)
+            obs_overlay = overlay_pcd_on_rgb(rgb, pcd_world, view, proj)
+            topdown = pcd_topdown_image(pcd_world,
+                                        size=extra.debug_render_size)
+            ep_debug_video_frames.append(build_video_frame(
+                sim_panel, obs_overlay, topdown,
+                size=extra.debug_render_size))
 
         # 2) Step with normalized waypoint velocity.
         act_unscaled = traj[step] if step < len(traj) else last_action
@@ -299,6 +429,33 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         ep_rwd.append(float(rwd))
         last_action = act_unscaled
         step += 1
+
+    # Debug-only: one extra capture AFTER make_final_steps gravity settle.
+    # env.step() runs make_final_steps internally on the final step when
+    # done fires, so by here `deform` is in its post-settle state.
+    if _is_debug_attempt:
+        rgb_ps, depth_ps, view_ps, proj_ps = capture_rgb_depth(
+            deform, extra.cam_resolution, extra.cam_resolution)
+        pcd_ps = depth_to_pcd(depth_ps, view_ps, proj_ps,
+                              extra.pcd_n_points)
+        centroid_ps = hole_centroid_world(deform, hole_idx)
+        _post_settle_panel = {
+            'rgb': rgb_ps, 'depth': depth_ps, 'pcd': pcd_ps,
+            'view': view_ps, 'proj': proj_ps,
+            'centroid': centroid_ps,
+        }
+        # And one more video frame so the mp4 ends on the settled pose.
+        sim_panel_ps = render_sim_with_centroid(
+            deform, view_ps, proj_ps, centroid_ps,
+            size=extra.debug_render_size)
+        obs_overlay_ps = overlay_pcd_on_rgb(rgb_ps, pcd_ps, view_ps, proj_ps)
+        topdown_ps = pcd_topdown_image(pcd_ps,
+                                       size=extra.debug_render_size)
+        ep_debug_video_frames.append(build_video_frame(
+            sim_panel_ps, obs_overlay_ps, topdown_ps,
+            size=extra.debug_render_size))
+    else:
+        _post_settle_panel = None
 
     # 3) At terminal step, evaluate ALL THREE success metrics.
     success_hanging = check_hanging_on_peg(
@@ -353,17 +510,115 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         'cam_viewmat': list(extra.cam_viewmat),
         'hole_radius': float(hole_radius),
         'max_act_vel': float(DeformEnv.MAX_ACT_VEL),
+        # Control-frequency parity. The trajectory was built at this
+        # ctrl_freq and each row of `acts` advances 1/ctrl_freq seconds
+        # of sim time. A training/eval env at a different ctrl_freq
+        # would interpret the same action stream at a different speed.
+        # train_diffusion_bc.py reads these to patch its eval env.
+        'ctrl_freq': float(_actual_ctrl_freq),
+        'sim_freq': int(extra.sim_freq),
+        'sim_steps_per_action': int(_steps_per_action),
     }
     with open(out_path, 'wb') as f:
         pickle.dump(payload, f)
 
+    # Action-distribution stats (active = scripted-trajectory frames,
+    # hold = post-trajectory `last_action` frames). Tracked for every
+    # kept demo so the run summary can report aggregate hold ratios.
+    act_stats = summarize_action_stream(
+        np.asarray(ep_act, dtype=np.float32), traj_len_for_demo)
+    _action_stats_kept.append(act_stats)
+
     n_kept += 1
     pkl_mb = os.path.getsize(out_path) / 1e6
     print(f'[demo] attempt {attempts} (kept {n_kept}/{extra.n_demos})  '
-          f'len={len(ep_act)}  rwd={ep_reward_total:.1f}  '
+          f'len={act_stats["ep_len"]}  '
+          f'active={act_stats["n_active"]} hold={act_stats["n_hold"]} '
+          f'({act_stats["hold_frac"]*100:.0f}% hold)  '
+          f'rwd={ep_reward_total:.1f}  '
           f'h={success_hanging} t={success_topological} '
           f'l={success_legacy}  saved {os.path.basename(out_path)} '
           f'({pkl_mb:.1f} MB)')
+
+    # Emit debug viz artifacts. Done after the pkl is on disk so the
+    # filenames line up: demo_NNN.pkl <-> debug_viz/demo_NNN_*.{png,mp4}.
+    if _is_debug_attempt and _post_settle_panel is not None:
+        # PNG grid: sample N evenly-spaced timesteps from the captured
+        # rgb/depth buffer, plus the post-settle panel as a final row.
+        n_steps = len(ep_rgb)
+        sample_ix = np.linspace(0, n_steps - 1, extra.debug_n_grid_samples,
+                                dtype=np.int64).tolist()
+        rows = []
+        for ix in sample_ix:
+            n_valid = int((ep_debug_depth[ix] < 0.999).sum())
+            rows.append({
+                'label': f'step {ix}/{n_steps - 1}',
+                'rgb': ep_rgb[ix],
+                'depth': ep_debug_depth[ix],
+                'pcd': ep_pcd[ix],
+                'view': deform._cam_viewmat,
+                'proj': None,  # filled below — same proj for all rows
+                'n_valid': n_valid,
+                'in_frame': None,  # cloth-in-frame fraction not
+                                   # cheaply available post-hoc; skip
+            })
+        # proj_matrix is identical across rows (capture_rgb_depth reuses
+        # the same fov + aspect), so grab one from the helper.
+        from _bc_obs_helpers import proj_matrix as _proj_matrix
+        _shared_proj = _proj_matrix()
+        for r in rows:
+            r['proj'] = _shared_proj
+        rows.append({
+            'label': 'post-settle',
+            'rgb': _post_settle_panel['rgb'],
+            'depth': _post_settle_panel['depth'],
+            'pcd': _post_settle_panel['pcd'],
+            'view': _post_settle_panel['view'],
+            'proj': _post_settle_panel['proj'],
+            'n_valid': int((_post_settle_panel['depth'] < 0.999).sum()),
+            'in_frame': None,
+        })
+        grid_path = os.path.join(
+            _debug_dir, f'demo_{demo_id:03d}_grid.png')
+        cam_str = (f'dist={extra.cam_viewmat[0]}, '
+                   f'pitch={extra.cam_viewmat[1]}, '
+                   f'yaw={extra.cam_viewmat[2]}, '
+                   f'target=({extra.cam_viewmat[3]}, '
+                   f'{extra.cam_viewmat[4]}, {extra.cam_viewmat[5]})')
+        succ_str = f'h={int(success_hanging)}/t={int(success_topological)}/l={int(success_legacy)}'
+        save_grid_png(
+            rows, grid_path,
+            title=(f'demo_{demo_id:03d}  |  cam: {cam_str}  |  '
+                   f'ctrl_freq={_actual_ctrl_freq:.2f} Hz  |  '
+                   f'success {succ_str}  |  '
+                   f'len={act_stats["ep_len"]} active={act_stats["n_active"]} '
+                   f'hold={act_stats["n_hold"]} '
+                   f'({act_stats["hold_frac"]*100:.0f}%)'))
+
+        # MP4 of the per-step combined frames.
+        video_path = os.path.join(
+            _debug_dir, f'demo_{demo_id:03d}_video.mp4')
+        try:
+            write_video_mp4(ep_debug_video_frames, video_path,
+                            fps=extra.debug_fps)
+        except Exception as _e:
+            print(f'  [debug_viz] WARN: video write failed: {_e!r}')
+
+        # Per-demo action stats plot (||a|| + per-component traces).
+        acts_path = os.path.join(
+            _debug_dir, f'demo_{demo_id:03d}_actions.png')
+        save_actions_plot(
+            np.asarray(ep_act, dtype=np.float32),
+            traj_len_for_demo, acts_path,
+            title=(f'demo_{demo_id:03d}  actions  |  '
+                   f'len={act_stats["ep_len"]} '
+                   f'(active={act_stats["n_active"]}, '
+                   f'hold={act_stats["n_hold"]})  '
+                   f'peak|a|={act_stats["peak_abs_a"]:.2f}  '
+                   f'mean||a||={act_stats["mean_norm_a"]:.2f}'))
+        print(f'  [debug_viz] wrote {os.path.basename(grid_path)}, '
+              f'{os.path.basename(video_path)}, '
+              f'{os.path.basename(acts_path)}')
 
 
 env.close()
@@ -371,6 +626,38 @@ elapsed = time.time() - start_time
 print(f'\nDone. kept={n_kept}, dropped={n_dropped_failed}, '
       f'attempts={attempts}, elapsed={elapsed:.0f}s '
       f'({elapsed/max(n_kept,1):.1f}s/demo)')
+
+# Aggregate action stats across kept demos. Helpful for "is this dataset
+# 50% padding or 75%?" at a glance.
+if _action_stats_kept:
+    _lens = np.array([s['ep_len'] for s in _action_stats_kept])
+    _actives = np.array([s['n_active'] for s in _action_stats_kept])
+    _holds = np.array([s['n_hold'] for s in _action_stats_kept])
+    _hold_fracs = np.array([s['hold_frac'] for s in _action_stats_kept])
+    _peaks = np.array([s['peak_abs_a'] for s in _action_stats_kept])
+    _stationary_fracs = np.array([s['stationary_frac']
+                                  for s in _action_stats_kept])
+    print(f'\n=== Action-stat summary (across {len(_action_stats_kept)} '
+          f'kept demos) ===')
+    print(f'  episode length     : mean={_lens.mean():.1f}  '
+          f'min={_lens.min()}  max={_lens.max()}')
+    print(f'  active steps       : mean={_actives.mean():.1f}  '
+          f'min={_actives.min()}  max={_actives.max()}')
+    print(f'  hold steps         : mean={_holds.mean():.1f}  '
+          f'min={_holds.min()}  max={_holds.max()}')
+    print(f'  hold fraction      : mean={_hold_fracs.mean()*100:.1f}%  '
+          f'min={_hold_fracs.min()*100:.1f}%  '
+          f'max={_hold_fracs.max()*100:.1f}%')
+    print(f'  stationary frac    : mean={_stationary_fracs.mean()*100:.1f}%  '
+          f'(||a|| < 0.05 — true near-zero actions, not "hold")')
+    print(f'  peak |a| / demo    : mean={_peaks.mean():.2f}  '
+          f'min={_peaks.min():.2f}  max={_peaks.max():.2f}  '
+          f'(1.0 = saturated)')
+    if _peaks.max() >= 0.99:
+        n_sat = int((_peaks >= 0.99).sum())
+        print(f'  NOTE: {n_sat}/{len(_peaks)} demo(s) have peak |a| ≥ 0.99 — '
+              f'actions saturated. Bump --max_act_vel to avoid.')
+
 if n_kept < extra.n_demos:
     print(f'WARNING: target {extra.n_demos} not reached. Either increase '
           f'--n_demos, raise the attempt cap, or relax --only_success / '
