@@ -192,13 +192,33 @@ class PointCloudObsEncoder(nn.Module):
                 has_cuda = False
         self._has_cuda = has_cuda
 
+        # Ball-query radii tuned for our HangProcCloth scene scale.
+        #
+        # ObsNormalizer fits ONE global mean+scale across the full demo
+        # pool: mean-centers then divides by max(half-range over xyz),
+        # so normalized points fit roughly in [-1, 1]^3. Empirically on
+        # our HangProcCloth dataset the scale is ~6 m (dominated by the
+        # vertical extent — peg base z=0 to cloth top z=12), and the
+        # CLOTH itself only occupies ~0.20-0.30 of each normalized axis
+        # while the cloth-hole loop spans only ~0.05-0.10.
+        #
+        # The canonical PointNet++ SSG radii (0.2 / 0.4) are designed
+        # for unit-cube-filling objects (e.g. ShapeNet). On our data
+        # those radii would cover the entire cloth at layer 1 and the
+        # entire scene at layer 2 — the multi-scale hierarchy collapses
+        # to "two global features." We tune them down so layer 1
+        # captures local geometry (hole-edge curvature, wrinkles),
+        # layer 2 captures cloth-wide regional structure, and layer 3
+        # (group_all) captures the cloth-vs-peg relationship globally.
+        _R1, _R2 = 0.05, 0.15
+
         if has_cuda:
             from pointnet2_ops.pointnet2_modules import PointnetSAModule
             self.sa1 = PointnetSAModule(
-                npoint=128, radius=0.2, nsample=32,
+                npoint=128, radius=_R1, nsample=32,
                 mlp=[0, 64, 64, 128], use_xyz=True, bn=True)
             self.sa2 = PointnetSAModule(
-                npoint=32, radius=0.4, nsample=32,
+                npoint=32, radius=_R2, nsample=32,
                 mlp=[128, 128, 128, 256], use_xyz=True, bn=True)
             self.sa3 = PointnetSAModule(
                 npoint=None, radius=None, nsample=None,
@@ -206,10 +226,10 @@ class PointCloudObsEncoder(nn.Module):
         else:
             from third_party.pointnet2_utils import PointNetSetAbstraction
             self.sa1 = PointNetSetAbstraction(
-                npoint=128, radius=0.2, nsample=32,
+                npoint=128, radius=_R1, nsample=32,
                 in_channel=3, mlp=[64, 64, 128], group_all=False)
             self.sa2 = PointNetSetAbstraction(
-                npoint=32, radius=0.4, nsample=32,
+                npoint=32, radius=_R2, nsample=32,
                 in_channel=128 + 3, mlp=[128, 128, 256], group_all=False)
             self.sa3 = PointNetSetAbstraction(
                 npoint=None, radius=None, nsample=None,
