@@ -42,7 +42,7 @@ from dedo.utils.mesh_utils import get_mesh_data
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import RetryResetEnv, compute_per_episode_max_len  # noqa: E402
 from _bc_obs_helpers import (  # noqa: E402
-    capture_rgb_depth,
+    capture_rgb_depth, proj_matrix,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     measure_hole_radius, get_hole_indices, get_hole_loops,
     resolve_deform)
@@ -50,6 +50,21 @@ from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
     build_privileged_obs, identify_cloth_corners)
 from _diffusion_policy import (  # noqa: E402
     DiffusionPolicy, build_encoder, ObsNormalizer, ActionNormalizer)
+
+
+def write_mp4(frames, path, fps=30):
+    """libx264 / yuv420p / +faststart mp4. Same encoding as
+    train_diffusion_bc.py's _write_mp4 (browser-playable, wandb-compatible)."""
+    if not frames:
+        return
+    import imageio
+    writer = imageio.get_writer(
+        path, fps=fps, codec='libx264', quality=8,
+        macro_block_size=2, pixelformat='yuv420p',
+        ffmpeg_params=['-movflags', '+faststart'])
+    for f in frames:
+        writer.append_data(f)
+    writer.close()
 
 
 def parse_args():
@@ -80,8 +95,27 @@ def parse_args():
     p.add_argument('--n_episodes', type=int, default=30)
     p.add_argument('--eval_seed', type=int, default=2026 + 9999,
                    help='Matches train_diffusion_bc.py: '
-                        'seed + eval_seed_offset(9999).')
+                        'seed + eval_seed_offset(9999). Override to see '
+                        'a different cloth distribution than the '
+                        'training-time eval set.')
     p.add_argument('--success_factor', type=float, default=1.2)
+    # ----- Video options -----
+    p.add_argument('--n_video_episodes', type=int, default=0,
+                   help='Record an mp4 for the first N episodes of the '
+                        'rollout. 0 = no video. Each episode gets its own '
+                        'mp4 named eval_ep<NNN>_<success_metric>.mp4 in '
+                        '--video_dir.')
+    p.add_argument('--video_dir', type=str, default=None,
+                   help='Directory to write per-episode mp4s. Default = '
+                        'a "videos" subdir alongside the ckpt.')
+    p.add_argument('--video_render_size', type=int, default=512,
+                   help='Per-frame H=W (square) for the recorded videos. '
+                        '512 is a good balance of quality and disk size. '
+                        'Independent of the policy obs camera resolution.')
+    p.add_argument('--video_fps', type=int, default=30)
+    p.add_argument('--settle_frame_stride', type=int, default=2,
+                   help='Sub-sample the post-settle gravity-phase frames. '
+                        'Matches collect_bc_demos.py debug-video default.')
     return p.parse_args()
 
 
@@ -212,6 +246,34 @@ def main():
     e.seed(args.eval_seed)
     deform = resolve_deform(e)
 
+    # --- Video setup --------------------------------------------------------
+    # Monkey-patch deform.render() to use the obs-camera projection (fov=60)
+    # so the recorded videos look like collect_bc_demos.py's debug videos.
+    # This affects only the recorded mp4 frames; obs-camera renders use a
+    # separate path (capture_rgb_depth).
+    record_videos = args.n_video_episodes > 0
+    if record_videos:
+        import types as _types
+        import pybullet as _pb
+        _MATCHED_PROJ = proj_matrix()
+
+        def _matched_render(self, mode='rgb_array', width=300, height=300):
+            assert mode == 'rgb_array'
+            _, _, rgba, _, _ = self.sim.getCameraImage(
+                width=width, height=height,
+                renderer=_pb.ER_BULLET_HARDWARE_OPENGL,
+                viewMatrix=self._cam_viewmat,
+                projectionMatrix=_MATCHED_PROJ)
+            return np.asarray(rgba)[:, :, :3]
+
+        deform.render = _types.MethodType(_matched_render, deform)
+
+        if args.video_dir is None:
+            args.video_dir = str(ckpt_path.parent / 'videos')
+        os.makedirs(args.video_dir, exist_ok=True)
+        print(f'[init] recording {args.n_video_episodes} eval videos '
+              f'to {args.video_dir}')
+
     # --- Helpers (mirror train_diffusion_bc._capture_obs_for_policy) ------
     def capture_obs(hole_idx, corner_idx):
         if obs_mode == 'state':
@@ -252,7 +314,20 @@ def main():
     per_ep_maxes = []
     with torch.no_grad():
         for ep in range(args.n_episodes):
+            is_recorded = record_videos and ep < args.n_video_episodes
+            ep_frames = []
             e.reset()
+            # Enable settle-frame capture AFTER reset so the flag isn't
+            # clobbered by env initialization (same ordering as
+            # collect_bc_demos.py).
+            if is_recorded:
+                deform._record_settle_frames = True
+                deform._settle_render_kwargs = dict(
+                    width=args.video_render_size,
+                    height=args.video_render_size)
+                deform._settle_frame_stride = args.settle_frame_stride
+            else:
+                deform._record_settle_frames = False
 
             hole_idx = get_hole_indices(deform)
             if not hole_idx:
@@ -303,10 +378,21 @@ def main():
                     a = np.clip(a, -1.0, 1.0).astype(np.float32)
                     _, _, done, info = e.step(a)
                     step += 1
+                    if is_recorded:
+                        ep_frames.append(deform.render(
+                            mode='rgb_array',
+                            width=args.video_render_size,
+                            height=args.video_render_size))
                     new_obs = capture_obs(hole_idx, corner_idx)
                     obs_deque.append(new_obs)
                     if done or step >= per_ep_max:
                         break
+            # Settle phase frames captured by dedo inside make_final_steps.
+            if is_recorded:
+                settle_frames = (info.get('settle_frames', [])
+                                 if isinstance(info, dict) else [])
+                ep_frames.extend(settle_frames)
+                deform._record_settle_frames = False
 
             h = int(check_hanging_on_peg(
                 deform, hole_idx, hole_radius, args.success_factor))
@@ -317,8 +403,20 @@ def main():
             s_topo += int(t)
             s_legacy += l
             ep_lens.append(step)
+            video_msg = ''
+            if is_recorded and ep_frames:
+                fname = (f'eval_ep{ep+1:03d}_seed{args.eval_seed}_'
+                         f'l{l}_h{h}_t{int(t)}.mp4')
+                fpath = os.path.join(args.video_dir, fname)
+                try:
+                    write_mp4(ep_frames, fpath, fps=args.video_fps)
+                    video_msg = (f'  [video] {fname} '
+                                 f'({len(ep_frames)} frames)')
+                except Exception as _err:
+                    video_msg = f'  [video] WARN: {_err!r}'
             print(f'  [ep {ep+1}/{args.n_episodes}] len={step:3d}  '
-                  f'h={s_hanging}/{ep+1} t={s_topo}/{ep+1} l={s_legacy}/{ep+1}')
+                  f'h={s_hanging}/{ep+1} t={s_topo}/{ep+1} l={s_legacy}/{ep+1}'
+                  f'{video_msg}')
 
     e.close()
 

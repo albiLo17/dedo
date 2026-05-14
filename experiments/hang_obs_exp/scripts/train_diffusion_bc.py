@@ -164,9 +164,16 @@ parser.add_argument('--video_every_evals', type=int, default=1,
                          'capture+encode time; only the first '
                          '--n_video_episodes episodes are recorded per '
                          'eval pass, the remaining ones run unobserved.')
-parser.add_argument('--n_video_episodes', type=int, default=1,
+parser.add_argument('--n_video_episodes', type=int, default=3,
                     help='Number of episodes to record per video pass. '
-                         'Higher = clearer signal but slower eval.')
+                         'They get concatenated into a single mp4 — '
+                         'different clothes within a single eval pass '
+                         'because env.reset() advances the procgen sampler. '
+                         '(The eval seed is locked across passes, so '
+                         'episode 1 of every video shows the same cloth, '
+                         'good for tracking learning on a fixed example. '
+                         'Higher N shows variety; 3 is the sweet spot '
+                         'between cloth variety and eval wall-clock.)')
 parser.add_argument('--video_render_size', type=int, default=300,
                     help='Per-frame render H=W (square) for the video. '
                          'Independent of the policy obs resolution — '
