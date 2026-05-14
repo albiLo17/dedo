@@ -332,8 +332,16 @@ succ_key = succ_key_map[args.success_metric]
 # RGB and PCD modes load it as a separate auxiliary input so the encoder
 # can concatenate visual features with proprioception (matches
 # PixelObsWrapper / PointCloudObsWrapper convention).
+#
+# RGB and PCD modes additionally load a 3-dim `goal` vector (hanger
+# pose), parallel to grip. State mode's privileged vector already has
+# goal embedded in its last 3 dims — adding it as a separate auxiliary
+# input to the visual modes equalizes goal information across the
+# three-way comparison so the only modality-specific knowledge gap is
+# hole-centroid extraction (the actual privileged advantage).
 obs_buf: list = []
 grip_buf: list = []
+goal_buf: list = []
 act_buf: list = []
 ep_ends: list = []      # cumulative one-past-end indices
 n_skipped = 0
@@ -353,7 +361,9 @@ recorded_ctrl_freqs: set = set()    # control-freq parity (same kind of invarian
 recorded_sim_freqs: set = set()
 recorded_sim_steps_per_action: set = set()
 needs_grip = args.obs_mode in ('rgb', 'pcd')  # state already has grip
+needs_goal = args.obs_mode in ('rgb', 'pcd')  # state already has goal
 n_missing_grip = 0
+n_missing_goal = 0
 
 for fname in demo_paths:
     path = os.path.join(args.demo_path, fname)
@@ -398,6 +408,15 @@ for fname in demo_paths:
             grip_arr = np.zeros((len(acts), 12), dtype=np.float32)
             n_missing_grip += 1
         grip_buf.append(np.asarray(grip_arr, dtype=np.float32))
+    # Auxiliary hanger-goal vector (only for RGB/PCD; state mode has it
+    # baked into the last 3 dims of its 18-dim vector already).
+    if needs_goal:
+        goal_arr = d['obs'].get('goal')
+        if goal_arr is None:
+            # Legacy pkl without goal — fall back to zeros and warn.
+            goal_arr = np.zeros((len(acts), 3), dtype=np.float32)
+            n_missing_goal += 1
+        goal_buf.append(np.asarray(goal_arr, dtype=np.float32))
     # Track metadata used for eval-env construction.
     if 'cam_resolution' in d:
         recorded_cam_resolutions.add(int(d['cam_resolution']))
@@ -429,6 +448,8 @@ obs_all = np.concatenate(obs_buf, axis=0)
 acts_all = np.concatenate(act_buf, axis=0)
 grip_all = (np.concatenate(grip_buf, axis=0)
             if needs_grip and grip_buf else None)
+goal_all = (np.concatenate(goal_buf, axis=0)
+            if needs_goal and goal_buf else None)
 episode_ends = np.asarray(ep_ends, dtype=np.int64)
 print(f'[data] kept {len(obs_buf)}/{n_total} demos  '
       f'(skipped {n_skipped})')
@@ -439,6 +460,13 @@ if grip_all is not None:
     if n_missing_grip > 0:
         print(f'[data] WARN: {n_missing_grip} demo pkl(s) missing the '
               f'"grip" key. Used zero-grip fallback for those demos — '
+              f're-collect with the updated collect_bc_demos.py to fix.')
+if goal_all is not None:
+    print(f'[data] goal shape = {goal_all.shape}  '
+          f'(hanger pose; concat with visual+grip features in encoder)')
+    if n_missing_goal > 0:
+        print(f'[data] WARN: {n_missing_goal} demo pkl(s) missing the '
+              f'"goal" key. Used zero-goal fallback for those demos — '
               f're-collect with the updated collect_bc_demos.py to fix.')
 print(f'[data] act  shape = {acts_all.shape}')
 
@@ -601,22 +629,25 @@ class DiffusionBCDataset(Dataset):
 
     For obs_mode='rgb', obs_seq is a dict
         {'image': uint8 (obs_horizon, H, W, 3),
-         'grip':  float32 (obs_horizon, 12)}.
+         'grip':  float32 (obs_horizon, 12),
+         'goal':  float32 (obs_horizon,  3)}.
 
     For obs_mode='pcd', obs_seq is a dict
         {'pcd':  float32 (obs_horizon, n_pts, 3),
-         'grip': float32 (obs_horizon, 12)}.
+         'grip': float32 (obs_horizon, 12),
+         'goal': float32 (obs_horizon,  3)}.
 
     Normalization is applied at sample time. Action_seq is always a
     (pred_horizon, action_dim) ndarray, already normalized to [-1, 1] at
     collection time (the ActionNormalizer is a no-op).
     """
 
-    def __init__(self, obs_all, grip_all, acts_all, episode_ends,
+    def __init__(self, obs_all, grip_all, goal_all, acts_all, episode_ends,
                  obs_horizon, pred_horizon, action_horizon, obs_mode,
                  obs_normalizer, act_normalizer):
         self.obs_all = obs_all
         self.grip_all = grip_all  # None for state-mode
+        self.goal_all = goal_all  # None for state-mode
         self.acts_all = acts_all
         # pad_after = action_horizon - 1 matches the pusht reference
         # (diffusion_policy_state_pusht_demo.py:731). Each padded window
@@ -662,12 +693,15 @@ class DiffusionBCDataset(Dataset):
         if self.obs_mode == 'state':
             return self.obs_normalizer.apply(obs_seq), act_seq
 
-        # RGB / PCD: build a dict-typed sample with grip alongside.
+        # RGB / PCD: build a dict-typed sample with grip + goal alongside.
         grip_slice = self.grip_all[bs:be]
         grip_seq = self._pad(grip_slice, self.pred_horizon, ss, se)
         grip_seq = grip_seq[:self.obs_horizon]
+        goal_slice = self.goal_all[bs:be]
+        goal_seq = self._pad(goal_slice, self.pred_horizon, ss, se)
+        goal_seq = goal_seq[:self.obs_horizon]
         primary_key = 'image' if self.obs_mode == 'rgb' else 'pcd'
-        sample = {primary_key: obs_seq, 'grip': grip_seq}
+        sample = {primary_key: obs_seq, 'grip': grip_seq, 'goal': goal_seq}
         return self.obs_normalizer.apply(sample), act_seq
 
 
@@ -703,7 +737,7 @@ def _to_device(obs, device):
 
 
 dataset = DiffusionBCDataset(
-    obs_all, grip_all, acts_all, episode_ends,
+    obs_all, grip_all, goal_all, acts_all, episode_ends,
     obs_horizon=args.obs_horizon, pred_horizon=args.pred_horizon,
     action_horizon=args.action_horizon, obs_mode=args.obs_mode,
     obs_normalizer=obs_normalizer, act_normalizer=act_normalizer)
@@ -816,8 +850,8 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
     time (UN-normalized — the obs_normalizer is applied next).
 
     state mode: returns a single ndarray (state_dim,).
-    rgb / pcd:  returns a dict {primary, grip} with the same keys the
-                training dataset returns.
+    rgb / pcd:  returns a dict {primary, grip, goal} with the same keys
+                the training dataset returns.
     """
     if obs_mode == 'state':
         return build_privileged_obs(
@@ -827,16 +861,24 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
     # and collect_bc_demos.py: 12-dim, /WBOX-normalized, clipped to [-2, 2].
     grip = np.asarray(deform.get_grip_obs(), dtype=np.float32)
     grip = np.clip(grip / 20.0, -2.0, 2.0)  # WORKSPACE_BOX_SIZE = 20
+    # Hanger goal pose (/WBOX-normalized). Same field collect_bc_demos.py
+    # saves into every demo pkl under obs['goal'] — given to RGB/PCD
+    # alongside grip so the eval-time obs matches training exactly.
+    goal = np.asarray(deform.goal_pos[0], dtype=np.float32) / 20.0
 
     if obs_mode == 'rgb':
-        rgb, _, _, _ = capture_rgb_depth(
+        rgb, _, _, _, _ = capture_rgb_depth(
             deform, eval_cam_resolution, eval_cam_resolution)
-        return {'image': rgb, 'grip': grip}
+        return {'image': rgb, 'grip': grip, 'goal': goal}
     if obs_mode == 'pcd':
-        _, depth, view, proj = capture_rgb_depth(
+        from _bc_obs_helpers import cloth_only_pcd as _cloth_only_pcd
+        _, depth, seg, view, proj = capture_rgb_depth(
             deform, eval_cam_resolution, eval_cam_resolution)
-        pcd = depth_to_pcd(depth, view, proj, collection_pcd_n_pts)
-        return {'pcd': pcd, 'grip': grip}
+        # Match collection-time filtering: keep only cloth-seg points so
+        # eval-time PCD has the same distribution the encoder trained on.
+        pcd = _cloth_only_pcd(depth, seg, view, proj,
+                              deform.deform_id, collection_pcd_n_pts)
+        return {'pcd': pcd, 'grip': grip, 'goal': goal}
     raise AssertionError
 
 

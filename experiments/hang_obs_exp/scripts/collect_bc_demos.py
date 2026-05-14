@@ -74,7 +74,7 @@ from dedo.demo_preset import build_traj, merge_traj
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
 from _bc_obs_helpers import (  # noqa: E402
-    capture_rgb_depth, depth_to_pcd,
+    capture_rgb_depth, depth_to_pcd, cloth_only_pcd,
     get_hole_indices, get_hole_loops, measure_hole_radius,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     resolve_deform)
@@ -426,6 +426,7 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     ep_rgb = []
     ep_pcd = []
     ep_grip = []  # 12-dim gripper_pos_vel, /WBOX-normalized (matches PixelObsWrapper / PointCloudObsWrapper convention so RGB & PCD BC see the same proprioception the PPO baselines see).
+    ep_goal = []  # 3-dim hanger goal position, /WBOX-normalized (matches privileged obs). Saved per-step so RGB and PCD encoders can take it as auxiliary conditioning — gives all 3 modalities equivalent goal info, isolating the privileged advantage to the hole-centroid extraction only.
     ep_act = []
     ep_rwd = []
     # Decide upfront whether this attempt is a debug-instrumented demo.
@@ -477,9 +478,22 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         grip = np.asarray(deform.get_grip_obs(), dtype=np.float32)
         grip = np.clip(grip / 20.0, -2.0, 2.0)  # 20.0 = DeformEnv.WORKSPACE_BOX_SIZE
         ep_grip.append(grip)
-        rgb, depth, view, proj = capture_rgb_depth(
+        # Hanger goal world-pos, /WBOX-normalized. Matches the privileged
+        # obs's last 3 dims so RGB/PCD encoders that concat this to their
+        # grip projection see the same goal vector the privileged state
+        # vector embeds — fair-comparison invariant.
+        goal_w = np.asarray(deform.goal_pos[0], dtype=np.float32) / 20.0
+        ep_goal.append(goal_w)
+        rgb, depth, seg, view, proj = capture_rgb_depth(
             deform, extra.cam_resolution, extra.cam_resolution)
-        pcd_world = depth_to_pcd(depth, view, proj, extra.pcd_n_points)
+        # Cloth-only PCD: filter pixels by pybullet segmentation mask so
+        # the encoder spends 100% of its 2048-point budget on the cloth
+        # surface instead of ~30-40% on the static peg/pole/flag/base.
+        # The peg's geometry is constant across episodes, so removing it
+        # only loses redundant info while concentrating point density on
+        # the deformable surface the policy needs to reason about.
+        pcd_world = cloth_only_pcd(
+            depth, seg, view, proj, deform.deform_id, extra.pcd_n_points)
         ep_rgb.append(rgb)
         ep_pcd.append(pcd_world)
 
@@ -546,10 +560,11 @@ while n_kept < extra.n_demos and attempts < max_attempts:
                 sf, _last_obs_overlay, _last_pcd_camera,
                 size=extra.debug_render_size))
         # 2) Post-settle still-frame for the PNG grid (uses obs camera).
-        rgb_ps, depth_ps, view_ps, proj_ps = capture_rgb_depth(
+        rgb_ps, depth_ps, seg_ps, view_ps, proj_ps = capture_rgb_depth(
             deform, extra.cam_resolution, extra.cam_resolution)
-        pcd_ps = depth_to_pcd(depth_ps, view_ps, proj_ps,
-                              extra.pcd_n_points)
+        pcd_ps = cloth_only_pcd(
+            depth_ps, seg_ps, view_ps, proj_ps,
+            deform.deform_id, extra.pcd_n_points)
         centroid_ps = hole_centroid_world(deform, hole_idx)
         _post_settle_panel = {
             'rgb': rgb_ps, 'depth': depth_ps, 'pcd': pcd_ps,
@@ -609,6 +624,14 @@ while n_kept < extra.n_demos and attempts < max_attempts:
             # an auxiliary input; the privileged state modes already have
             # it embedded in their first 12 dims so they don't need it.
             'grip': np.asarray(ep_grip, dtype=np.float32),
+            # 3-dim hanger goal pose (/WBOX-normalized). Same value the
+            # privileged obs embeds in its last 3 dims; saving it
+            # separately so RGB/PCD encoders can take it as auxiliary
+            # conditioning. Constant within an episode for HangProcCloth
+            # (peg is at a fixed world pose), so for memory we still
+            # save the per-step value to keep the schema parallel with
+            # grip — downstream encoders just read one entry per step.
+            'goal': np.asarray(ep_goal, dtype=np.float32),
         },
         'acts': np.asarray(ep_act, dtype=np.float32),
         'rewards': np.asarray(ep_rwd, dtype=np.float32),

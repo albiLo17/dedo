@@ -166,7 +166,7 @@ PROJ = _make_proj_matrix()
 
 def _capture(deform, width, height):
     """Render RGB + depth via OUR view/proj (not deform_env._cam_viewmat)."""
-    _, _, rgb_raw, depth_buf, _ = deform.sim.getCameraImage(
+    _, _, rgb_raw, depth_buf, _seg = deform.sim.getCameraImage(
         width=width, height=height,
         viewMatrix=VIEW, projectionMatrix=PROJ,
         renderer=pybullet.ER_BULLET_HARDWARE_OPENGL)

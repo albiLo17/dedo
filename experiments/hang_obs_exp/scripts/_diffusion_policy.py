@@ -102,21 +102,41 @@ class _GripProjection(nn.Module):
         return self.proj(grip)
 
 
+class _GoalProjection(nn.Module):
+    """Small MLP that projects the 3-dim hanger goal vector. RGB and PCD
+    encoders concatenate this with their primary visual feature so the
+    diffusion U-Net's global conditioning vector includes the same goal
+    info the privileged state vector embeds — equal-footing comparison."""
+
+    def __init__(self, goal_dim: int = 3, out_dim: int = 8):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(goal_dim, out_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.out_dim = out_dim
+
+    def forward(self, goal: torch.Tensor) -> torch.Tensor:
+        return self.proj(goal)
+
+
 class RGBObsEncoder(nn.Module):
-    """ResNet-18 (GroupNorm) on RGB + small grip projection.
+    """ResNet-18 (GroupNorm) on RGB + grip projection + goal projection.
 
     Input is a dict:
         {'image': (B*To, H, W, 3) uint8 OR (B*To, 3, H, W) float32,
-         'grip':  (B*To, 12) float32 in roughly [-1, 1] (already /WBOX-
-                  normalized at collection time)}
+         'grip':  (B*To, 12) float32 in roughly [-1, 1] (/WBOX-normalized
+                  at collection time),
+         'goal':  (B*To,  3) float32 in roughly [-1, 1] (/WBOX-normalized
+                  hanger pose; matches the last 3 dims of the privileged
+                  state vector — given to RGB/PCD so all three modalities
+                  see identical goal info)}
 
-    Output: (B*To, 512 + grip_out_dim) — image features concat with
-    projected gripper proprioception. This is the same factoring SB3's
-    MultiInputPolicy uses for the PixelObsWrapper baseline, so RGB BC
-    sees the same proprioception channels the PPO baseline does.
+    Output: (B*To, 512 + grip_out_dim + goal_out_dim).
     """
 
     def __init__(self, grip_dim: int = 12, grip_out_dim: int = 12,
+                 goal_dim: int = 3, goal_out_dim: int = 8,
                  pretrained: bool = False):
         super().__init__()
         try:
@@ -140,19 +160,27 @@ class RGBObsEncoder(nn.Module):
         backbone.fc = nn.Identity()
         self.backbone = backbone
         self.grip_proj = _GripProjection(grip_dim, grip_out_dim)
-        self.feat_dim = 512 + grip_out_dim
+        self.goal_proj = _GoalProjection(goal_dim, goal_out_dim)
+        self.grip_dim = grip_dim
+        self.goal_dim = goal_dim
+        self.feat_dim = 512 + grip_out_dim + goal_out_dim
 
     def forward(self, obs) -> torch.Tensor:
-        # `obs` may be a dict {'image', 'grip'} or, for backward compat
-        # with the no-grip caller path, a single tensor (in which case
-        # grip is treated as zeros).
+        # `obs` may be a dict {'image', 'grip', 'goal'} or, for backward
+        # compat with single-tensor callers, just an image (grip and goal
+        # are then treated as zeros — used by older deploy paths).
         if isinstance(obs, dict):
             image = obs['image']
             grip = obs['grip']
+            goal = obs.get('goal')
+            if goal is None:
+                goal = torch.zeros(image.shape[0], self.goal_dim,
+                                   device=image.device, dtype=torch.float32)
         else:
             image = obs
-            grip = torch.zeros(image.shape[0],
-                               self.grip_proj.proj[0].in_features,
+            grip = torch.zeros(image.shape[0], self.grip_dim,
+                               device=image.device, dtype=torch.float32)
+            goal = torch.zeros(image.shape[0], self.goal_dim,
                                device=image.device, dtype=torch.float32)
         if image.dtype == torch.uint8:
             image = image.float() / 255.0
@@ -160,25 +188,28 @@ class RGBObsEncoder(nn.Module):
             image = image.permute(0, 3, 1, 2).contiguous()
         img_feat = self.backbone(image)
         grip_feat = self.grip_proj(grip.float())
-        return torch.cat([img_feat, grip_feat], dim=-1)
+        goal_feat = self.goal_proj(goal.float())
+        return torch.cat([img_feat, grip_feat, goal_feat], dim=-1)
 
 
 class PointCloudObsEncoder(nn.Module):
-    """SSG PointNet++ (CUDA or pure-Python backend) + grip projection.
+    """SSG PointNet++ (CUDA or pure-Python backend) + grip + goal projection.
 
     Input is a dict:
         {'pcd':  (B*To, n_points, 3) float32 (normalized to ~unit cube
-                 by the dataset normalizer),
-         'grip': (B*To, 12) float32 in roughly [-1, 1] (already /WBOX
-                 -normalized at collection time)}
+                 by the dataset normalizer; cloth-only post seg-mask
+                 filtering at collection time),
+         'grip': (B*To, 12) float32 in roughly [-1, 1] (/WBOX-normalized),
+         'goal': (B*To,  3) float32 in roughly [-1, 1] (/WBOX-normalized
+                 hanger pose — matches the privileged state vector's
+                 last 3 dims so all modalities see equivalent goal info)}
 
-    Output: (B*To, pcd_feat_dim + grip_out_dim) — pcd features concat
-    with projected gripper proprioception. Same factoring as PPO's
-    pointnet2_extractor so PCD BC sees the same channels.
+    Output: (B*To, pcd_feat_dim + grip_out_dim + goal_out_dim).
     """
 
     def __init__(self, n_points: int = 512, pcd_feat_dim: int = 256,
-                 grip_dim: int = 12, grip_out_dim: int = 12):
+                 grip_dim: int = 12, grip_out_dim: int = 12,
+                 goal_dim: int = 3, goal_out_dim: int = 8):
         super().__init__()
         import os
         force_pure = os.environ.get(
@@ -194,23 +225,25 @@ class PointCloudObsEncoder(nn.Module):
 
         # Ball-query radii tuned for our HangProcCloth scene scale.
         #
-        # ObsNormalizer fits ONE global mean+scale across the full demo
-        # pool: mean-centers then divides by max(half-range over xyz),
-        # so normalized points fit roughly in [-1, 1]^3. Empirically on
-        # our HangProcCloth dataset the scale is ~6 m (dominated by the
-        # vertical extent — peg base z=0 to cloth top z=12), and the
-        # CLOTH itself only occupies ~0.20-0.30 of each normalized axis
-        # while the cloth-hole loop spans only ~0.05-0.10.
+        # Collection-time seg-mask filtering keeps ONLY cloth points in
+        # the PCD; the peg/pole/flag/base are dropped. ObsNormalizer
+        # then mean-centers and divides by max(half-range over xyz),
+        # putting normalized cloth points roughly in [-1, 1]^3.
         #
-        # The canonical PointNet++ SSG radii (0.2 / 0.4) are designed
-        # for unit-cube-filling objects (e.g. ShapeNet). On our data
-        # those radii would cover the entire cloth at layer 1 and the
-        # entire scene at layer 2 — the multi-scale hierarchy collapses
-        # to "two global features." We tune them down so layer 1
-        # captures local geometry (hole-edge curvature, wrinkles),
-        # layer 2 captures cloth-wide regional structure, and layer 3
-        # (group_all) captures the cloth-vs-peg relationship globally.
-        _R1, _R2 = 0.05, 0.15
+        # With cloth-only points, the global normalization scale is
+        # dominated by the *envelope of cloth motion across the demo
+        # pool* (cloth moves through ~3 m vertically + ~2-3 m laterally
+        # as the gripper threads it). A single cloth at any one frame
+        # occupies roughly 0.3-0.5 of each normalized axis, with the
+        # hole loop spanning ~0.10-0.15.
+        #
+        # Canonical PointNet++ SSG radii (0.2 / 0.4) are designed for
+        # unit-cube-filling objects (e.g. ShapeNet). On cloth-only data
+        # the cloth fills ~half the normalized space, so 0.1 / 0.3
+        # gives layer 1 local-cloth resolution (hole-edge curvature,
+        # wrinkles), layer 2 cloth-wide regional structure (cloth pose),
+        # and layer 3 group_all captures the global shape.
+        _R1, _R2 = 0.1, 0.3
 
         if has_cuda:
             from pointnet2_ops.pointnet2_modules import PointnetSAModule
@@ -246,18 +279,27 @@ class PointCloudObsEncoder(nn.Module):
         _replace_bn_with_gn(self.sa3, num_groups=8)
 
         self.grip_proj = _GripProjection(grip_dim, grip_out_dim)
+        self.goal_proj = _GoalProjection(goal_dim, goal_out_dim)
         self.n_points = n_points
         self.grip_dim = grip_dim
-        self.feat_dim = pcd_feat_dim + grip_out_dim
+        self.goal_dim = goal_dim
+        self.feat_dim = pcd_feat_dim + grip_out_dim + goal_out_dim
 
     def forward(self, obs) -> torch.Tensor:
         if isinstance(obs, dict):
             pcd = obs['pcd']
             grip = obs['grip'].float()
+            goal = obs.get('goal')
+            if goal is None:
+                goal = torch.zeros(pcd.shape[0], self.goal_dim,
+                                   device=pcd.device, dtype=torch.float32)
         else:
-            # Backward compat: single-tensor input is the pcd alone, grip zeroed.
+            # Backward compat: single-tensor input is pcd alone; grip
+            # and goal zeroed.
             pcd = obs
             grip = torch.zeros(pcd.shape[0], self.grip_dim,
+                               device=pcd.device, dtype=torch.float32)
+            goal = torch.zeros(pcd.shape[0], self.goal_dim,
                                device=pcd.device, dtype=torch.float32)
         pcd = pcd.float()
 
@@ -273,7 +315,8 @@ class PointCloudObsEncoder(nn.Module):
             _, l3_feat = self.sa3(l2_xyz, l2_feat)
         pcd_feat = l3_feat.squeeze(-1)
         grip_feat = self.grip_proj(grip)
-        return torch.cat([pcd_feat, grip_feat], dim=-1)
+        goal_feat = self.goal_proj(goal.float())
+        return torch.cat([pcd_feat, grip_feat, goal_feat], dim=-1)
 
 
 def build_encoder(obs_mode: str, obs_kwargs: dict) -> nn.Module:
@@ -624,7 +667,13 @@ class ObsNormalizer:
             mean = self.stats['mean']
             scale = float(self.stats['scale']) or 1.0
             pcd_norm = ((obs['pcd'] - mean) / scale).astype(np.float32)
-            return {'pcd': pcd_norm, 'grip': obs['grip']}
+            # Preserve all auxiliary inputs (grip, goal, …) — the
+            # normalizer only acts on the primary PCD tensor.
+            out = {'pcd': pcd_norm}
+            for k, v in obs.items():
+                if k != 'pcd':
+                    out[k] = v
+            return out
         raise AssertionError
 
     def state_dict(self) -> dict:

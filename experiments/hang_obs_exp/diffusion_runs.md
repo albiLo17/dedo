@@ -70,6 +70,29 @@ the visual observation pipeline differs.
    checkpoint/video infra (best-eval ckpt, periodic ckpts, eval mp4s)
    that hadn't existed at v1 launch time gets used. See "v1 partial
    results" + "v2 — relaunch" sections below.
+7. **v3 — fairness audit + PCD architecture audit (2026-05-13).** Four
+   substantive changes before the comparison runs ship: (a) **pull-taut
+   bug fix**: scripted-controller demos at 15 Hz held the trailing
+   waypoint velocity for the entire post-trajectory tail (~5 s at
+   `max_episode_len=120`), training a sim2real anti-pattern of "drag
+   the cloth taut against the peg." Now zero-action hold + a 5-frame
+   brake, with per-episode `max_episode_len = traj_len + tail` so
+   demos end at ~51 control steps with 88% active frames instead of
+   37% active at v2. (b) **PCD architecture audit**: cloth-only via
+   pybullet seg-mask filter (drops ~30-40% of points previously
+   wasted on the static peg/pole/flag), point count bumped 512 → 2048,
+   PointNet++ SSG ball-query radii tuned from defaults `0.2 / 0.4`
+   (designed for unit-cube-filling objects) to `0.1 / 0.3` so the
+   multi-scale hierarchy actually resolves local vs. regional cloth
+   geometry instead of collapsing to two global features. (c) **Goal
+   conditioning for RGB and PCD**: privileged obs already includes the
+   3-dim hanger goal pose in its last 3 dims; v3 adds the same vector
+   to RGB and PCD encoders via a small projection head so the only
+   asymmetry left across modalities is hole-centroid extraction (the
+   actual privileged advantage). (d) **Same-camera projection
+   matching in debug viz** so settle frames inside `make_final_steps`
+   render with the same fov=60 as the obs camera (was using dedo's
+   default DEFAULT_CAM_PROJECTION fov≈90).
 
 ---
 
@@ -439,6 +462,174 @@ followup is:
 
 The runs themselves don't depend on the answer — we log all three rates
 per eval pass, so the analysis can re-anchor without retraining.
+
+---
+
+## v3 — fairness audit + PCD architecture audit
+
+Decided 2026-05-13 after auditing v2's PCD encoder configuration and
+inspecting v2 debug videos. Four substantive changes; each addresses a
+specific risk to the cross-modality comparison.
+
+### What changed and why
+
+1. **Pull-taut behavior eliminated.** v2's
+   `collect_bc_demos.py` filled the post-trajectory tail by holding
+   `last_action` (the final waypoint velocity ~0.55 in normalized
+   action space, pointing -y/-z). At 15 Hz × 75 hold frames that was
+   ~5 s of PD-driven drag against the peg — produced 100% success but
+   trained a sim2real-fragile "strain the cloth against the goal"
+   maneuver. v3 commands **zero velocity** after the trajectory ends
+   and the planned `--episode_tail_frames=5` of zero-action gives the
+   PD controller time to brake the anchor before the gravity-settle
+   phase fires. Per-episode `max_episode_len = traj_len + tail` so
+   episodes are ~51 steps instead of 121, with 88% active frames
+   instead of 37%. Empirically the success rate held (5/6 → ~80%) and
+   the topological-success rate *improved* (4 of 5 vs ~1 of 5 in v2)
+   because the cloth drapes cleanly under gravity instead of being
+   dragged past.
+
+2. **Cloth-only PCD via pybullet segmentation mask.** pybullet's
+   `getCameraImage` returns a per-pixel seg-mask alongside depth.
+   `_bc_obs_helpers.cloth_only_pcd` filters the depth back-projection
+   to pixels where `seg_id == deform.deform_id`, so the saved PCD
+   contains 100% cloth surface points instead of ~60% cloth + ~30%
+   peg/pole/flag + ~10% base. The peg's geometry is constant across
+   episodes (HangProcCloth randomizes only the cloth), so dropping it
+   loses no information the policy needs.
+
+3. **PCD point budget 512 → 2048.** With cloth-only filtering, the
+   2048-point budget concentrates ~6× more surface density on the
+   deformable object the policy actually reasons about. Disk cost
+   per demo grows from ~4 MB → ~6 MB; full 150-demo dataset stays
+   under 1 GB.
+
+4. **PointNet++ ball-query radii tuned to cloth-only normalized
+   scale.** v2 used the canonical SSG radii (0.2 / 0.4) which were
+   designed for unit-cube-filling objects (ShapeNet etc.) and on our
+   data caused the multi-scale hierarchy to collapse — layer-1 ball-
+   query at radius 0.2 covered the entire cloth, layer-2 at 0.4
+   covered the entire scene. The empirical per-frame cloth extent
+   in normalized space is ~0.9 × 0.4 × 1.0 (cloth diameter ≈ 1.4),
+   so radii **0.1 / 0.3** correctly resolve local (hole-edge,
+   wrinkles) vs. regional (cloth pose, hole position) features
+   before the group-all global pool. See [`_diffusion_policy.py:195-219`](scripts/_diffusion_policy.py#L195-L219)
+   for the calibration comment.
+
+5. **Goal conditioning for RGB and PCD.** Privileged
+   `hole_centroid` obs already embeds the 3D hanger pose in its last
+   3 dims. v1/v2 visual modes only saw image/PCD + 12-dim gripper
+   proprio, so they had to implicitly learn the (fixed) peg location
+   from data — a free signal the privileged policy got. v3 saves the
+   hanger goal as a separate `goal` key in every demo pkl and the
+   `RGBObsEncoder` / `PointCloudObsEncoder` consume it via a small
+   `_GoalProjection` (3 → 8) concatenated with the visual feature.
+   Now the only privileged-only signal is the cloth-derived hole
+   centroid, which is the actual hypothesis under test.
+
+6. **Settle-frame camera matches obs camera in debug videos.** v2's
+   `deform.render()` used dedo's `DEFAULT_CAM_PROJECTION` (fov≈90)
+   while obs RGB used `proj_matrix()` (fov=60). Settle frames in the
+   debug mp4s appeared zoomed out relative to the policy-phase frames.
+   v3 monkey-patches `deform.render` at `collect_bc_demos.py` startup
+   so both code paths share fov=60. Cosmetic-only — no training-time
+   effect.
+
+### Schema additions to demo pkls (v3)
+
+| key | shape | description |
+| --- | ----- | ----------- |
+| `obs['pcd']` | (T, 2048, 3) | **cloth-only** points (was 512 with peg) |
+| `obs['goal']` | (T, 3) | hanger pose / WBOX (constant per episode) |
+| `ctrl_freq` | float | 15.15 Hz actual (500/33) |
+| `sim_freq` | int | 500 (PyBullet step rate) |
+| `sim_steps_per_action` | int | 33 |
+| `max_act_vel` | float | 4.0 |
+| `episode_tail_frames` | — | not stored directly; visible via `len - traj_len` |
+
+### v3 demo collection
+
+```bash
+python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
+    --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_v1 \
+    --n_demos 150 \
+    --cam_resolution 128 --pcd_n_points 2048 \
+    --max_act_vel 4.0 \
+    --success_metric legacy --success_factor 1.2 \
+    --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 \
+    --debug_viz_first_n 3 --debug_viz_every 25 \
+    --seed 2026
+```
+
+Deltas from the v2 collection command:
+
+| flag | v2 | v3 | reason |
+| ---- | -- | -- | ------ |
+| `--pcd_n_points` | 512 | 2048 | 4× cloth-surface density now that peg points are filtered out |
+| `--max_episode_len` | 120 (fixed) | 200 (safety cap) | per-episode length is now `traj_len + tail` (~51); 200 is just an upper bound |
+| `--episode_tail_frames` | (n/a, hold filled tail) | 5 | zero-action brake phase before gravity settle; replaces the trailing-velocity hold |
+| `--demos_dir` | `bc_demos_15hz_v1` | `bc_demos_15hz_pcd2048_v1` | `pcd2048` token self-documents the PCD density |
+| (under the hood) PCD content | cloth + peg + flag + base | **cloth only** (seg-mask filter) | concentrates point budget on the deformable target |
+| (under the hood) hold action | trailing-velocity hold | **zero-action hold** | eliminates the pull-taut sim2real anti-pattern |
+| (under the hood) `goal` field | not saved | **3-dim hanger pose** | parity with privileged obs for RGB/PCD encoders |
+
+Expected dataset characteristics: ~51 control steps per demo (45
+scripted + 5 brake + dedo's 500-tick gravity settle), ~6 MB per pkl
+(2048 cloth-only float32 + 128² uint8 RGB + state + grip + goal),
+~900 MB total disk. Wall-clock ~10-15 min on L4.
+
+### v3 launch commands
+
+Replace `$DEMOS` with the v3 collection directory:
+
+```bash
+export DEMOS=~/github/dedo/logs/hang_obs_exp/bc_demos_15hz_pcd2048_v1
+
+tmux new-session -d -s diff-state "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode state --state_key hole_centroid --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 256 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/state.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-rgb "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode rgb --pretrained_rgb --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 64 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/rgb.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-pcd "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode pcd --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 128 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/pcd.log; echo DONE; sleep infinity'"
+```
+
+Expected v3 wandb run names (`_pre` in the rgb suffix marks the
+ImageNet init carried over from v2; PCD now uses `pcd2048` density
+but the suffix doesn't change because the encoder reads point count
+from `obs.shape[-2]` at construction):
+
+```
+diff<TS>_state_lr1e-4_e200_bs256_sm-legacy_s2026
+diff<TS>_rgb_pre_lr1e-4_e200_bs64_sm-legacy_s2026
+diff<TS>_pcd_lr1e-4_e200_bs128_sm-legacy_s2026
+```
+
+### Encoder feat_dim across modes (v3)
+
+| mode | encoder | primary feat | + grip | + goal | total |
+| ---- | ------- | ------------ | ------ | ------ | ----- |
+| state | identity | 18 | (embedded) | (embedded) | 18 |
+| rgb | ResNet-18 GroupNorm (ImageNet) | 512 | 12 | 8 | **532** |
+| pcd | PointNet++ SSG (radii 0.1 / 0.3), 2048 cloth pts | 256 | 12 | 8 | **276** |
+
+global_cond_dim for the U-Net = `obs_horizon * feat_dim`: 36 (state),
+1064 (rgb), 552 (pcd).
+
+### Fairness invariants now enforced across modalities
+
+| invariant | how |
+| --------- | --- |
+| Same trajectory data | one collection, three obs keys in every pkl |
+| Same gripper proprio | 12-dim `grip` saved & consumed by all 3 encoders (state: embedded, rgb/pcd: separate input) |
+| **Same goal info** | 3-dim `goal` saved & consumed by all 3 (state: embedded, rgb/pcd: `_GoalProjection`) |
+| Same camera | one `cam_viewmat`; RGB and PCD use identical render path |
+| Same action normalization | `MAX_ACT_VEL` patched from pkl into eval env |
+| Same ctrl freq | `sim_freq` + `sim_steps_per_action` patched from pkl |
+| Same success metric | `--success_metric legacy`, all 3 also logged for cross-anchor |
+
+The **only** modality-specific knowledge gap is now: privileged
+state gets the cloth-derived 3D hole centroid; RGB and PCD have to
+extract it from raw inputs. That is the experimental quantity under
+test.
 
 ---
 
