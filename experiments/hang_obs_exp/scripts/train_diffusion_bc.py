@@ -360,6 +360,12 @@ recorded_ctrl_freqs: set = set()    # control-freq parity (same kind of invarian
                                     # play back at the wrong speed)
 recorded_sim_freqs: set = set()
 recorded_sim_steps_per_action: set = set()
+# Per-demo episode lengths. Demos are collected with deform.max_episode_len
+# set per-episode to (traj_len + episode_tail_frames) — typically ~51 ctrl
+# steps at 15 Hz — so the training distribution covers only this window.
+# Eval must terminate inside (or very close to) the same window or the
+# policy runs OOD for the tail of every episode and drifts arbitrarily.
+recorded_episode_lengths: list = []
 needs_grip = args.obs_mode in ('rgb', 'pcd')  # state already has grip
 needs_goal = args.obs_mode in ('rgb', 'pcd')  # state already has goal
 n_missing_grip = 0
@@ -399,6 +405,7 @@ for fname in demo_paths:
         continue
     obs_buf.append(np.asarray(obs))
     act_buf.append(np.asarray(acts, dtype=np.float32))
+    recorded_episode_lengths.append(int(len(acts)))
     # Auxiliary gripper proprioception (only for RGB/PCD; state mode has
     # it baked into its 18-dim vector already).
     if needs_grip:
@@ -585,6 +592,38 @@ else:
           f'steps/action={eval_sim_steps_per_action}). If demos were '
           f'collected at a different ctrl_freq, eval will be inconsistent. '
           f'Re-collect to be safe.')
+
+
+# ---------------------------------------------------------------------------
+# Pick the eval-time max_episode_len. Demos are collected with
+# deform.max_episode_len = traj_len + episode_tail_frames per-episode (see
+# collect_bc_demos.py), so the training distribution only covers control
+# steps 0..(max demo length). If the eval env runs longer, the policy
+# operates OOD for the tail of every episode — for HangProcCloth this
+# manifests as cumulative force impulses pulling the anchors laterally
+# until the cloth ends up taut between gripper and peg.
+#
+# Use (longest training demo + small buffer) so even the slowest in-
+# distribution rollout can brake before terminating, but cap at
+# args.max_episode_len so a CLI-set ceiling still wins.
+# ---------------------------------------------------------------------------
+_EVAL_EP_LEN_BUFFER = 5  # ~333 ms at 15 Hz; plenty of brake-and-handoff slack
+if recorded_episode_lengths:
+    _max_demo_len = max(recorded_episode_lengths)
+    _mean_demo_len = sum(recorded_episode_lengths) / len(recorded_episode_lengths)
+    eval_max_episode_len = min(
+        int(_max_demo_len + _EVAL_EP_LEN_BUFFER),
+        int(args.max_episode_len))
+    print(f'[data] eval max_episode_len = {eval_max_episode_len} '
+          f'(longest demo={_max_demo_len}, mean={_mean_demo_len:.1f}, '
+          f'buffer=+{_EVAL_EP_LEN_BUFFER}, safety cap={args.max_episode_len})')
+    if eval_max_episode_len < args.max_episode_len:
+        print(f'[data] (eval is tighter than --max_episode_len so training-'
+              f'distribution OOD tail is avoided)')
+else:
+    eval_max_episode_len = int(args.max_episode_len)
+    print(f'[data] no per-demo episode lengths recorded; eval '
+          f'max_episode_len = {eval_max_episode_len} (from --max_episode_len)')
 
 
 # =============================================================================
@@ -822,7 +861,7 @@ def _build_eval_env(eval_seed):
         '--num_envs=0',
         '--total_env_steps=0',
         '--seed', str(eval_seed),
-        '--max_episode_len', str(args.max_episode_len),
+        '--max_episode_len', str(eval_max_episode_len),
         f'--sim_freq={eval_sim_freq}',
         f'--sim_steps_per_action={eval_sim_steps_per_action}',
         '--cam_viewmat',
@@ -958,6 +997,13 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         else:
             deform._record_settle_frames = False
         e.reset()
+        # Belt-and-suspenders: also set the attribute directly on the deform
+        # object in case any env-reset path re-initializes it from a stale
+        # default. The sys.argv-routed value at gym.make is the primary path;
+        # this just guarantees per-episode termination matches the training
+        # distribution even if a future refactor breaks the construction-time
+        # plumbing.
+        deform.max_episode_len = eval_max_episode_len
         hole_idx = get_hole_indices(deform)
         if not hole_idx:
             # Skip degenerate clothes — count as failure to keep n_episodes honest.
@@ -978,7 +1024,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         ep_rwd = 0.0
         step = 0
         done = False
-        while not done and step < args.max_episode_len:
+        while not done and step < eval_max_episode_len:
             # 1) Apply obs normalizer per frame, stack to (1, To, *), run policy.
             normed = _apply_normalizer_to_seq(
                 list(obs_deque), obs_normalizer)
@@ -1011,7 +1057,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
                     deform, args.obs_mode, args.state_key,
                     hole_idx, corner_idx)
                 obs_deque.append(new_obs)
-                if done or step >= args.max_episode_len:
+                if done or step >= eval_max_episode_len:
                     break
         # Append the post-settle (gravity-phase) frames captured by
         # dedo inside make_final_steps. `info['settle_frames']` exists
@@ -1103,6 +1149,11 @@ with open(os.path.join(logdir, 'config.json'), 'w') as f:
         'eval_sim_freq': int(eval_sim_freq),
         'eval_sim_steps_per_action': int(eval_sim_steps_per_action),
         'eval_max_act_vel': float(DeformEnv.MAX_ACT_VEL),
+        'eval_max_episode_len': int(eval_max_episode_len),
+        'demo_episode_lengths_min': (int(min(recorded_episode_lengths))
+                                     if recorded_episode_lengths else None),
+        'demo_episode_lengths_max': (int(max(recorded_episode_lengths))
+                                     if recorded_episode_lengths else None),
         'state_dim': int(obs_all.shape[-1]) if args.obs_mode == 'state' else None,
         'action_dim': int(acts_all.shape[-1]),
         'n_dataset_windows': len(dataset),

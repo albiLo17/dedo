@@ -70,21 +70,22 @@ the visual observation pipeline differs.
    checkpoint/video infra (best-eval ckpt, periodic ckpts, eval mp4s)
    that hadn't existed at v1 launch time gets used. See "v1 partial
    results" + "v2 — relaunch" sections below.
-7. **v3 — fairness audit + PCD architecture audit (2026-05-13).** Four
-   substantive changes before the comparison runs ship: (a) **pull-taut
-   bug fix**: scripted-controller demos at 15 Hz held the trailing
-   waypoint velocity for the entire post-trajectory tail (~5 s at
-   `max_episode_len=120`), training a sim2real anti-pattern of "drag
-   the cloth taut against the peg." Now zero-action hold + a 5-frame
-   brake, with per-episode `max_episode_len = traj_len + tail` so
-   demos end at ~51 control steps with 88% active frames instead of
-   37% active at v2. (b) **PCD architecture audit**: cloth-only via
-   pybullet seg-mask filter (drops ~30-40% of points previously
-   wasted on the static peg/pole/flag), point count bumped 512 → 2048,
-   PointNet++ SSG ball-query radii tuned from defaults `0.2 / 0.4`
-   (designed for unit-cube-filling objects) to `0.1 / 0.3` so the
-   multi-scale hierarchy actually resolves local vs. regional cloth
-   geometry instead of collapsing to two global features. (c) **Goal
+7. **v3 — fairness, PCD audit, data scale, chunking fix
+   (2026-05-13).** Eight substantive changes before the comparison
+   runs ship: (a) **pull-taut bug fix**: scripted-controller demos at
+   15 Hz held the trailing waypoint velocity for the entire
+   post-trajectory tail (~5 s at `max_episode_len=120`), training a
+   sim2real anti-pattern of "drag the cloth taut against the peg."
+   Now zero-action hold + a 5-frame brake, with per-episode
+   `max_episode_len = traj_len + tail` so demos end at ~51 control
+   steps with 88% active frames instead of 37% active at v2. (b) **PCD
+   architecture audit**: cloth-only via pybullet seg-mask filter
+   (drops ~30-40% of points previously wasted on the static
+   peg/pole/flag), point count bumped 512 → 2048, PointNet++ SSG
+   ball-query radii tuned from defaults `0.2 / 0.4` (designed for
+   unit-cube-filling objects) to `0.1 / 0.3` so the multi-scale
+   hierarchy actually resolves local vs. regional cloth geometry
+   instead of collapsing to two global features. (c) **Goal
    conditioning for RGB and PCD**: privileged obs already includes the
    3-dim hanger goal pose in its last 3 dims; v3 adds the same vector
    to RGB and PCD encoders via a small projection head so the only
@@ -92,7 +93,18 @@ the visual observation pipeline differs.
    actual privileged advantage). (d) **Same-camera projection
    matching in debug viz** so settle frames inside `make_final_steps`
    render with the same fov=60 as the obs camera (was using dedo's
-   default DEFAULT_CAM_PROJECTION fov≈90).
+   default DEFAULT_CAM_PROJECTION fov≈90). (e) **Demo scale 150 →
+   1000**: v2 eval (with brake-tail demos already applied) showed
+   state stalled at 0.5 vs v1's 1.0 — the gap cleanly tracks the 4×
+   drop in obs-action pairs (~7k v2 at 15 Hz × 51 steps vs ~30k v1
+   at 30 Hz × 200 steps), not the design redesign itself. v3 collects
+   1000 demos for ~50k pairs (beyond v1 scale), since visual modes have
+   more headroom to absorb data than identity-encoder state. (f)
+   **`action_horizon` 8 → 4**: at 15 Hz, an 8-step chunk is 533 ms of
+   open-loop execution (v1 at 30 Hz had 267 ms), and with ~51-step
+   episodes that's only ~6 obs-conditioned decisions per rollout vs
+   v1's ~25. Drop to 4 to restore decision density; keep
+   `pred_horizon=16` for diffusion planning depth.
 
 ---
 
@@ -465,11 +477,16 @@ per eval pass, so the analysis can re-anchor without retraining.
 
 ---
 
-## v3 — fairness audit + PCD architecture audit
+## v3 — fairness, PCD audit, data scale, chunking fix
 
-Decided 2026-05-13 after auditing v2's PCD encoder configuration and
-inspecting v2 debug videos. Four substantive changes; each addresses a
-specific risk to the cross-modality comparison.
+Decided 2026-05-13 after auditing v2's PCD encoder configuration,
+inspecting v2 debug videos, **and** seeing v2's eval curves stall well
+short of v1 even with v3-style brake-tail demos already in place (state
+0.5 vs v1's 1.0; pcd peak ~0.13 with subsequent overfit drop; rgb
+floored). Eight substantive changes; each addresses a specific risk to
+the cross-modality comparison. Items 1–6 were the original v3 fairness
++ architecture pass; items 7–8 were added after the v2 eval read
+revealed the data scale + chunking issues.
 
 ### What changed and why
 
@@ -535,6 +552,33 @@ specific risk to the cross-modality comparison.
    so both code paths share fov=60. Cosmetic-only — no training-time
    effect.
 
+7. **Demo scale 150 → 1000.** The v2 eval runs (which already had the
+   v3 brake-tail fix applied — only items 2–8 here postdate them) saw
+   state stall at ~0.5 success vs v1's 1.0, pcd peak at ~0.13 then
+   overfit-decay, rgb_pre floor near 0. Tracing back to data: at 15 Hz
+   × ~51-step demos, 150 demos produces ~7k obs-action pairs vs v1's
+   ~30k at 30 Hz × 200-step demos. **4× less training data is the
+   dominant variable**, not anything inherent to the 15 Hz / brake-tail
+   redesign. The loss curve confirms: all six v2 runs flattened by step
+   ~50 to a noise floor ~0.015–0.02 regardless of obs mode, the textbook
+   small-dataset memorization fingerprint. v3 collects **1000 demos**
+   for ~50k pairs — beyond v1 scale, since visual modes (RGB, PCD) have
+   more headroom to absorb data than the 18-dim identity-encoder state
+   baseline does. Disk cost ~6 GB; collection wall-clock ~75–90 min on
+   L4 (linear in demo count, still cheap relative to per-mode training).
+
+8. **`action_horizon` 8 → 4 at 15 Hz.** At 15 Hz, an 8-step
+   open-loop chunk spans 533 ms vs v1's 267 ms at 30 Hz (8 / 30).
+   Compounded with v3's ~51-step episodes, that left the policy with
+   only ~6 obs-conditioned decision points per rollout vs v1's ~25.
+   Fine-grained threading is precisely the regime where re-anchoring
+   to fresh observations matters — small denoising errors that v1 could
+   correct twice per second, v2 had to live with for half a second.
+   v3 sets `--action_horizon 4` to restore the per-second decision
+   density v1 had, while keeping `pred_horizon=16` so the diffusion
+   model still plans over a 1067 ms horizon (DP-paper recipe: predict
+   more than you execute, throw away the tail).
+
 ### Schema additions to demo pkls (v3)
 
 | key | shape | description |
@@ -551,13 +595,13 @@ specific risk to the cross-modality comparison.
 
 ```bash
 python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
-    --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_v1 \
-    --n_demos 150 \
+    --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_v1 \
+    --n_demos 1000 \
     --cam_resolution 128 --pcd_n_points 2048 \
     --max_act_vel 4.0 \
     --success_metric legacy --success_factor 1.2 \
     --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 \
-    --debug_viz_first_n 3 --debug_viz_every 25 \
+    --debug_viz_first_n 3 --debug_viz_every 100 \
     --seed 2026
 ```
 
@@ -565,10 +609,12 @@ Deltas from the v2 collection command:
 
 | flag | v2 | v3 | reason |
 | ---- | -- | -- | ------ |
+| `--n_demos` | 150 | **1000** | restore data scale lost to the 15 Hz × shorter-episode redesign; ~50k pairs vs v2's ~7k, beyond v1's ~30k |
 | `--pcd_n_points` | 512 | 2048 | 4× cloth-surface density now that peg points are filtered out |
 | `--max_episode_len` | 120 (fixed) | 200 (safety cap) | per-episode length is now `traj_len + tail` (~51); 200 is just an upper bound |
 | `--episode_tail_frames` | (n/a, hold filled tail) | 5 | zero-action brake phase before gravity settle; replaces the trailing-velocity hold |
-| `--demos_dir` | `bc_demos_15hz_v1` | `bc_demos_15hz_pcd2048_v1` | `pcd2048` token self-documents the PCD density |
+| `--debug_viz_every` | 25 | 100 | scaled with demo count — at 1000 demos, every-25 was ~40 mp4s; every-100 gives ~10 spot-check videos |
+| `--demos_dir` | `bc_demos_15hz_v1` | `bc_demos_15hz_pcd2048_n1000_v1` | `pcd2048_n1000` tokens self-document density + demo count |
 | (under the hood) PCD content | cloth + peg + flag + base | **cloth only** (seg-mask filter) | concentrates point budget on the deformable target |
 | (under the hood) hold action | trailing-velocity hold | **zero-action hold** | eliminates the pull-taut sim2real anti-pattern |
 | (under the hood) `goal` field | not saved | **3-dim hanger pose** | parity with privileged obs for RGB/PCD encoders |
@@ -576,31 +622,46 @@ Deltas from the v2 collection command:
 Expected dataset characteristics: ~51 control steps per demo (45
 scripted + 5 brake + dedo's 500-tick gravity settle), ~6 MB per pkl
 (2048 cloth-only float32 + 128² uint8 RGB + state + grip + goal),
-~900 MB total disk. Wall-clock ~10-15 min on L4.
+**~6 GB total disk for 1000 demos**. Wall-clock **~75–90 min on L4**.
 
 ### v3 launch commands
 
-Replace `$DEMOS` with the v3 collection directory:
+Three-stage pipeline: collect → train → final eval. Stage 2 needs the
+collection from stage 1 to be on disk first (the training script
+validates demo-dir metadata before building any models). New flags vs
+v2: `--action_horizon 4` (was default 8) to restore decision density
+at 15 Hz; `--num_epochs 300` (was 200) since ~7× more data per epoch
+means saturation lands later in epoch count; `--n_final_eval_episodes
+100` (was 50) for tighter SE on the headline cross-modality numbers
+that the whole experiment exists to compare.
 
 ```bash
-export DEMOS=~/github/dedo/logs/hang_obs_exp/bc_demos_15hz_pcd2048_v1
+# Stage 1 — collect 1000 demos. Wait for this tmux to print DONE
+# (~75–90 min on L4) before launching stage 2.
 
-tmux new-session -d -s diff-state "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode state --state_key hole_centroid --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 256 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/state.log; echo DONE; sleep infinity'"
+tmux new-session -d -s diff-collect "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/collect_bc_demos.py --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_v1 --n_demos 1000 --cam_resolution 128 --pcd_n_points 2048 --max_act_vel 4.0 --success_metric legacy --success_factor 1.2 --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 --debug_viz_first_n 3 --debug_viz_every 100 --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/collect.log; echo DONE; sleep infinity'"
 
-tmux new-session -d -s diff-rgb "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode rgb --pretrained_rgb --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 64 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/rgb.log; echo DONE; sleep infinity'"
+# Stage 2 — train the three modes in parallel.
 
-tmux new-session -d -s diff-pcd "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode pcd --success_metric legacy --success_factor 1.2 --num_epochs 200 --batch_size 128 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 50 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/pcd.log; echo DONE; sleep infinity'"
+export DEMOS=~/github/dedo/logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_v1
+
+tmux new-session -d -s diff-state "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode state --state_key hole_centroid --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 256 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/state.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-rgb "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode rgb --pretrained_rgb --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 64 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/rgb.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-pcd "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode pcd --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 128 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/pcd.log; echo DONE; sleep infinity'"
 ```
 
 Expected v3 wandb run names (`_pre` in the rgb suffix marks the
-ImageNet init carried over from v2; PCD now uses `pcd2048` density
-but the suffix doesn't change because the encoder reads point count
-from `obs.shape[-2]` at construction):
+ImageNet init carried over from v2; `_ah4` marks the shorter action
+chunk; PCD now uses `pcd2048` density but the suffix doesn't change
+because the encoder reads point count from `obs.shape[-2]` at
+construction):
 
 ```
-diff<TS>_state_lr1e-4_e200_bs256_sm-legacy_s2026
-diff<TS>_rgb_pre_lr1e-4_e200_bs64_sm-legacy_s2026
-diff<TS>_pcd_lr1e-4_e200_bs128_sm-legacy_s2026
+diff<TS>_state_lr1e-4_e300_bs256_ah4_sm-legacy_s2026
+diff<TS>_rgb_pre_lr1e-4_e300_bs64_ah4_sm-legacy_s2026
+diff<TS>_pcd_lr1e-4_e300_bs128_ah4_sm-legacy_s2026
 ```
 
 ### Encoder feat_dim across modes (v3)
@@ -750,7 +811,9 @@ pass. See [RUNS.md](RUNS.md) for context.
 3. Sanity-check `eval/success_legacy` vs `eval/success_hanging` per
    mode. If they diverge dramatically, that's a useful artifact for
    the success-metric discussion (RUNS.md "Success-metric discovery").
-4. If the visual modes underperform expectations, the first
-   experimental knob to turn is **dataset size** (collect 300-500
-   demos) rather than architecture — diffusion policy paper consistently
-   shows BC scaling with data when the architecture is correct.
+4. If the visual modes still underperform after v3's 1000-demo
+   baseline, the next experimental knob is **dataset size again**
+   (collect 2000–3000 demos) rather than architecture — diffusion
+   policy paper consistently shows BC scaling with data when the
+   architecture is correct, and v3 itself is the existence proof that
+   stepping up data 4× was the right first move.
