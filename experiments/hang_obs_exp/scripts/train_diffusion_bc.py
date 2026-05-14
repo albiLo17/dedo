@@ -64,7 +64,7 @@ from _helpers import RetryResetEnv, compute_per_episode_max_len  # noqa: E402
 # Reuse the camera and success-check helpers so eval-time RGB/PCD/success
 # match collection-time bit-for-bit.
 from _bc_obs_helpers import (  # noqa: E402
-    capture_rgb_depth, depth_to_pcd,
+    capture_rgb_depth, depth_to_pcd, proj_matrix,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     measure_hole_radius, get_hole_indices, get_hole_loops,
     resolve_deform)
@@ -173,11 +173,12 @@ parser.add_argument('--video_render_size', type=int, default=300,
                          'this is just what the wandb player shows. '
                          'Matches HangVideoCallback default (PPO runs).')
 parser.add_argument('--video_fps', type=int, default=30)
-parser.add_argument('--settle_frame_stride', type=int, default=5,
-                    help='Sub-sample the post-settle 500 sim-step gravity '
-                         'phase by this stride so the video tail does not '
-                         'balloon. 5 = one frame per 5 sim steps -> 100 '
-                         'settle frames added per recorded episode.')
+parser.add_argument('--settle_frame_stride', type=int, default=2,
+                    help='Sub-sample the post-settle gravity-phase frames '
+                         'captured inside make_final_steps. 2 matches '
+                         'collect_bc_demos.py debug-video stride (~7-8 '
+                         'settle frames at 15 Hz / ~15 at 62.5 Hz) so the '
+                         'cloth-drape phase is visible in eval videos.')
 parser.add_argument('--save_every_epochs', type=int, default=0,
                     help='Save a numbered policy_ep<NNNN>.pt checkpoint '
                          'after each eval pass that lands on this interval, '
@@ -1033,6 +1034,28 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
     e, dargs = _build_eval_env(eval_seed)
     deform = resolve_deform(e)
 
+    # Monkey-patch deform.render() to use the obs-camera projection
+    # (fov=60) instead of dedo's DEFAULT_CAM_PROJECTION (fov≈90), so
+    # both policy-phase frames AND make_final_steps settle frames render
+    # through the same projection. Mirrors collect_bc_demos.py exactly —
+    # view matrix is already correct (deform._cam_viewmat set at env
+    # construction); this only fixes the projection.
+    if record_video_episodes > 0:
+        import types as _types
+        import pybullet as _pb
+        _MATCHED_PROJ = proj_matrix()
+
+        def _matched_render(self, mode='rgb_array', width=300, height=300):
+            assert mode == 'rgb_array'
+            _, _, rgba, _, _ = self.sim.getCameraImage(
+                width=width, height=height,
+                renderer=_pb.ER_BULLET_HARDWARE_OPENGL,
+                viewMatrix=self._cam_viewmat,
+                projectionMatrix=_MATCHED_PROJ)
+            return np.asarray(rgba)[:, :, :3]
+
+        deform.render = _types.MethodType(_matched_render, deform)
+
     # Per-episode RGB frame buffers populated only for the first
     # `record_video_episodes` rollouts. Outer list is one entry per
     # recorded episode; inner list is all frames from that episode
@@ -1045,10 +1068,16 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
     for ep in range(n_episodes):
         is_recorded = ep < record_video_episodes
         ep_frames = []  # filled only if is_recorded
+        e.reset()
         # Tell dedo to capture post-settle frames during make_final_steps
         # (the 500-step gravity phase that runs inside step() when done
-        # fires). Without this hook the video stops at the policy-handoff
-        # frame and the viewer misses the actual hanging outcome.
+        # fires). MUST be set AFTER e.reset() — collect_bc_demos.py uses
+        # the same ordering. Setting before reset would let the env
+        # construction path overwrite the flag with the __init__ default
+        # (False), so make_final_steps would skip the settle capture and
+        # info['settle_frames'] would be missing. With this ordering the
+        # flag is fresh-set on the deform every episode and persists
+        # through env.step()'s call to make_final_steps.
         if is_recorded:
             deform._record_settle_frames = True
             deform._settle_render_kwargs = dict(
@@ -1057,7 +1086,6 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             deform._settle_frame_stride = args.settle_frame_stride
         else:
             deform._record_settle_frames = False
-        e.reset()
         hole_idx = get_hole_indices(deform)
         if not hole_idx:
             # Skip degenerate clothes — count as failure to keep n_episodes honest.
