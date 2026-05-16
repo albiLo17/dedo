@@ -358,6 +358,17 @@ def _quat_mul(q1, q2):
     ], dtype=np.float64)
 
 
+def _wxyz_to_rotation_matrix(wxyz):
+    """Convert a viser-convention wxyz unit quaternion to a 3x3 rotation matrix."""
+    w, x, y, z = (float(wxyz[0]), float(wxyz[1]),
+                  float(wxyz[2]), float(wxyz[3]))
+    return np.array([
+        [1 - 2*(y*y + z*z),     2*(x*y - w*z),     2*(x*z + w*y)],
+        [    2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x)],
+        [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
+
+
 def _build_export_step_dict(step_idx, left_pos_sim, left_orn_sim,
                              left_vel_sim, right_pos_sim,
                              right_orn_sim, right_vel_sim,
@@ -835,11 +846,18 @@ def _load_exported_traj(path):
         if pcd is not None:
             print(f'[inspect]   cloth pcd: {pcd.shape[1]} pts/frame '
                   f'x {nsteps} frames')
+        cam_meta = {
+            field: data[field]
+            for field in ('cam_extrinsics_sim', 'cam_extrinsics_real',
+                          'sim_to_real', 'cam_intrinsics')
+            if field in data
+        }
         return {
             'kind': 'sim',
             'ee_left':  ee_left,
             'ee_right': ee_right,
             'goal': goal, 'pcd': pcd,
+            'cam_meta': cam_meta or None,
             'summary': f'{n} steps (policy-eval, sim frame) | {succ}',
         }
 
@@ -913,14 +931,49 @@ if extra.export_traj:
 cam_traj = None
 _cam_pose_pos = np.asarray(extra.cam_pos, dtype=np.float64)
 _cam_pose_wxyz = np.asarray(extra.cam_wxyz, dtype=np.float64)
+_cam_meta: dict = {}    # populated from pkl fields: cam_extrinsics_*, sim_to_real, cam_intrinsics
+_s2r: dict | None = None  # sim_to_real sub-dict from pkl (used in GUI + main loop)
+_cam_real_world_pos: np.ndarray | None = None   # camera pos in Franka world frame
 if extra.cam_traj:
     cam_traj = _load_exported_traj(extra.cam_traj)
     if cam_traj is not None:
         print(f"[inspect] loaded CAMERA-FRAME trajectory: "
               f"{cam_traj['summary']}")
-        print(f'[inspect]   cam pose: pos={_cam_pose_pos.tolist()} '
-              f'wxyz={_cam_pose_wxyz.tolist()} (sim-world coords; '
-              f'origin scales with sim_scale)')
+        _cam_meta = cam_traj.get('cam_meta') or {}
+        _s2r = _cam_meta.get('sim_to_real')
+        # Auto-populate cam pose from pkl (overrides CLI --cam_pos/--cam_wxyz defaults).
+        _ext_sim = _cam_meta.get('cam_extrinsics_sim')
+        if _ext_sim:
+            _cam_pose_pos  = np.asarray(_ext_sim['position_sim'],  dtype=np.float64)
+            _cam_pose_wxyz = np.asarray(_ext_sim['quat_wxyz_sim'], dtype=np.float64)
+            print(f'[inspect]   cam pose auto-loaded from pkl: '
+                  f'pos={_cam_pose_pos.tolist()} wxyz={_cam_pose_wxyz.tolist()}')
+        else:
+            print(f'[inspect]   cam pose (CLI): pos={_cam_pose_pos.tolist()} '
+                  f'wxyz={_cam_pose_wxyz.tolist()} (sim-world coords)')
+        if _s2r:
+            print(f'[inspect]   pkl sim_to_real: scale={_s2r["scale"]}  '
+                  f'offset={_s2r["offset_xyz"]}  '
+                  f'rot_z={_s2r["rotation_z_deg"]}°')
+
+# Real-world camera frame (from pkl's cam_extrinsics_real). Placed under
+# /real_workspace so it sits in Franka world coords and can be directly
+# compared against the Franka arm workspace meshes.
+_ext_real = _cam_meta.get('cam_extrinsics_real')
+if _ext_real:
+    _cam_real_world_pos  = np.asarray(_ext_real['position_real'],  dtype=np.float64)
+    _cam_real_world_wxyz = np.asarray(_ext_real['quat_wxyz_real'], dtype=np.float64)
+    server.scene.add_frame(
+        '/real_workspace/cam_real',
+        position=tuple(float(x) for x in _cam_real_world_pos),
+        wxyz=tuple(float(x) for x in _cam_real_world_wxyz),
+        show_axes=True, axes_length=0.12, axes_radius=0.007)
+    server.scene.add_label(
+        '/real_workspace/cam_real/label', text='real camera',
+        position=(0.0, 0.0, 0.0))
+    print(f'[inspect] real camera frame placed at '
+          f'{_cam_real_world_pos.tolist()} m (Franka world frame)')
+
 
 # Slightly darker than the workspace box colors so the trajectories
 # stand out against them.
@@ -1161,6 +1214,39 @@ def update_cam_replay(frame, sim_s):
         server.scene.add_point_cloud(
             '/sim_scene/cam/pcd', points=pts, colors=col,
             point_size=max(1e-4, 0.015 * sim_s))
+
+
+def update_cam_residual(frame):
+    """Back-project the camframe pcd to world and compare with the world-frame
+    pcd to get a quantitative alignment residual (mean / max mm). Mirrors the
+    check in verify_camframe.py. Updates gui_cam_residual; no-op if the widget
+    or either rollout is absent."""
+    if gui_cam_residual is None:
+        return
+    it_w = _imp_traj   # world-frame rollout  — obs['pcd'] in sim-world coords
+    it_c = _cam_traj   # camera-frame rollout — obs['pcd'] in camera coords
+    if it_w is None or it_c is None:
+        gui_cam_residual.value = '— (need --export_traj + --cam_traj)'
+        return
+    pc_w = it_w.get('pcd')
+    pc_c = it_c.get('pcd')
+    if pc_w is None or pc_c is None:
+        gui_cam_residual.value = '— (no pcd in rollouts)'
+        return
+    n_frames = min(pc_w.shape[0], pc_c.shape[0])
+    f = int(np.clip(frame, 0, n_frames - 1))
+    pts_w = np.asarray(pc_w[f], dtype=np.float64)   # (N, 3) world-frame
+    pts_c = np.asarray(pc_c[f], dtype=np.float64)   # (N, 3) camera-frame
+    if pts_w.shape != pts_c.shape:
+        gui_cam_residual.value = (
+            f'— (shape mismatch: {pts_w.shape} vs {pts_c.shape})')
+        return
+    R_cam_to_world = _wxyz_to_rotation_matrix(_cam_pose_wxyz)
+    # p_world = R_cam_to_world @ p_cam + cam_pos  (sim-native coords)
+    pts_back = pts_c @ R_cam_to_world.T + _cam_pose_pos
+    d = np.linalg.norm(pts_back - pts_w, axis=1)
+    gui_cam_residual.value = (
+        f'frame {f}  mean={d.mean()*1000:.2f} mm  max={d.max()*1000:.2f} mm')
 
 
 # --------------------------------------------------------------------------
@@ -1800,12 +1886,19 @@ def _(_event):
 # frame hides the whole subtree (pcd + EE + goal + axes) regardless of
 # the per-tick child re-adds.
 chk_cam_show = None
+gui_cam_residual = None
+gui_slider_mismatch = None
 if _cam_enabled:
     chk_cam_show = server.gui.add_checkbox(
         'Show camframe overlay', initial_value=_cam_visible,
         hint='The --cam_traj rollout rendered through the sim camera '
              'pose. Should sit exactly on the sim-world import if the '
              'camera-frame conversion is correct.')
+    gui_cam_residual = server.gui.add_text(
+        'Cam align residual', initial_value='—', disabled=True,
+        hint='Per-frame mean/max distance (mm) between the camframe pcd '
+             'back-projected to world and the original world pcd. '
+             '≈0 means the camera-frame transform is correct.')
 
     @chk_cam_show.on_update
     def _(event):
@@ -1816,6 +1909,61 @@ if _cam_enabled:
                 _cam_root_handle.visible = _cam_visible
             except Exception:
                 pass
+
+    # ----- Camera frame info (from pkl) --------------------------------
+    # Build display strings from the pkl metadata loaded earlier.
+    if _s2r:
+        _off = _s2r['offset_xyz']
+        _s2r_disp = (f"scale={_s2r['scale']}  "
+                     f"offset=[{_off[0]:.4f}, {_off[1]:.4f}, {_off[2]:.4f}]  "
+                     f"rot_z={_s2r['rotation_z_deg']}°")
+    else:
+        _s2r_disp = '(not in pkl)'
+
+    if _cam_real_world_pos is not None:
+        _p = _cam_real_world_pos
+        _cam_pos_real_disp = f'[{_p[0]:.3f}, {_p[1]:.3f}, {_p[2]:.3f}] m'
+    else:
+        _cam_pos_real_disp = '(not in pkl)'
+
+    _ci = _cam_meta.get('cam_intrinsics')
+    if _ci:
+        _cam_intr_disp = (f"fov={_ci.get('fov_deg','?')}°  "
+                          f"res={_ci.get('resolution','?')}px  "
+                          f"fx={_ci.get('fx_px','?'):.1f}px")
+    else:
+        _cam_intr_disp = '(not in pkl)'
+
+    with server.gui.add_folder('Camera frame info (from pkl)'):
+        server.gui.add_text('Pkl sim→real', initial_value=_s2r_disp,
+                            disabled=True,
+                            hint='sim_to_real params stored in the --cam_traj pkl.')
+        server.gui.add_text('Camera pos (real world)', initial_value=_cam_pos_real_disp,
+                            disabled=True,
+                            hint='Camera origin in the Franka world frame '
+                                 '(shown as the "real camera" frame under /real_workspace).')
+        server.gui.add_text('Cam intrinsics', initial_value=_cam_intr_disp,
+                            disabled=True)
+        gui_slider_mismatch = server.gui.add_text(
+            'Sliders vs pkl', initial_value='—', disabled=True,
+            hint='Compares the current Sim→Real sliders against the '
+                 'values recorded in the pkl. "OK" means they match '
+                 'exactly; any deviation is shown per-parameter.')
+        if _s2r:
+            btn_sync_s2r = server.gui.add_button(
+                'Sync sliders to pkl sim→real',
+                hint='Sets sim_scale, offset_x/y/z, and yaw to exactly '
+                     'match the sim_to_real values stored in the pkl.')
+
+            @btn_sync_s2r.on_click
+            def _(_event):
+                sld_sim_scale.value = float(_s2r['scale'])
+                sld_sim_x.value = float(_s2r['offset_xyz'][0])
+                sld_sim_y.value = float(_s2r['offset_xyz'][1])
+                sld_sim_z.value = float(_s2r['offset_xyz'][2])
+                sld_sim_yaw.value = float(_s2r['rotation_z_deg'])
+                _apply_sim_offset()
+                print(f'[inspect] synced sliders to pkl sim_to_real: {_s2r_disp}')
 
 
 # Live ZED real-camera cloud controls. Pose sliders are read per-tick by
@@ -2157,6 +2305,7 @@ try:
                 _imp_last_t = now
             update_imported_replay(imp_frame, cur_S)
             update_cam_replay(imp_frame, cur_S)
+            update_cam_residual(imp_frame)
             try:
                 if int(sld_imp_frame.value) != imp_frame:
                     sld_imp_frame.value = imp_frame
@@ -2165,6 +2314,23 @@ try:
             _imp_tag = ('PLAY' if imp_playing else 'PAUSE')
             gui_imp_status.value = (
                 f'[{_imp_tag}] frame {imp_frame}/{imp_n - 1}')
+
+        # Slider vs pkl mismatch indicator (updates live as sliders move).
+        if gui_slider_mismatch is not None and _s2r is not None:
+            _tol = 1e-4
+            _mm = []
+            if abs(float(sld_sim_scale.value) - _s2r['scale']) > _tol:
+                _mm.append(f"scale:{float(sld_sim_scale.value):.4f}≠{_s2r['scale']}")
+            if abs(float(sld_sim_x.value) - _s2r['offset_xyz'][0]) > _tol:
+                _mm.append(f"x:{float(sld_sim_x.value):.4f}≠{_s2r['offset_xyz'][0]:.4f}")
+            if abs(float(sld_sim_y.value) - _s2r['offset_xyz'][1]) > _tol:
+                _mm.append(f"y:{float(sld_sim_y.value):.4f}≠{_s2r['offset_xyz'][1]:.4f}")
+            if abs(float(sld_sim_z.value) - _s2r['offset_xyz'][2]) > _tol:
+                _mm.append(f"z:{float(sld_sim_z.value):.4f}≠{_s2r['offset_xyz'][2]:.4f}")
+            if abs(float(sld_sim_yaw.value) - _s2r['rotation_z_deg']) > 0.05:
+                _mm.append(f"yaw:{float(sld_sim_yaw.value):.1f}°≠{_s2r['rotation_z_deg']:.1f}°")
+            gui_slider_mismatch.value = ('OK — matches pkl'
+                                         if not _mm else 'MISMATCH: ' + ', '.join(_mm))
 
         # Live ZED real cloud (re-rendered every tick so it tracks pose
         # slider edits + new frames from the publisher).

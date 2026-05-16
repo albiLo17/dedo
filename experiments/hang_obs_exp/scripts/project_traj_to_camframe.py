@@ -20,13 +20,27 @@ What gets transformed:
 All other keys are copied verbatim.  A 'cam_frame = True' flag is added to
 the output pkl so downstream code can detect the transformed format.
 
+Metadata added to output pkl
+-----------------------------
+  cam_extrinsics_sim   — camera pose in the sim world frame
+  cam_intrinsics       — FOV, focal lengths in pixels, principal point
+  sim_to_real          — transform parameters (optional, via --sim_to_real_*)
+  cam_extrinsics_real  — camera pose in the real world frame (only if sim_to_real given)
+
+Sim-to-real transform convention:
+  p_real = R_z(rotation_z_deg) @ (scale * p_sim) + offset_xyz
+  Orientation: R_cam_to_real = R_z(rotation_z_deg) @ R_cam_to_sim
+
 Usage:
   python experiments/hang_obs_exp/scripts/project_traj_to_camframe.py \\
       --pkl logs/hang_obs_exp/eval_trajs/.../traj_ep001_....pkl
 
-  # custom output directory
+  # with sim-to-real transform to also get real-world camera pose
   python experiments/hang_obs_exp/scripts/project_traj_to_camframe.py \\
-      --pkl logs/.../traj_ep001.pkl --out_dir /tmp/cam_frame_trajs
+      --pkl logs/.../traj_ep001.pkl \\
+      --sim_to_real_scale 0.045 \\
+      --sim_to_real_offset 0.5 0.0 -0.039 \\
+      --sim_to_real_rotation_z_deg 90
 """
 from __future__ import annotations
 
@@ -38,7 +52,10 @@ import numpy as np
 import pybullet  # pure-math fns work without a physics server
 
 
-WBOX = 20.0  # grip / goal are stored as world_metres / WBOX
+WBOX   = 20.0   # grip / goal are stored as world_metres / WBOX
+_FOV   = 60.0   # matches proj_matrix() in _bc_obs_helpers.py
+_NEAR  = 0.1
+_FAR   = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +89,72 @@ def _world_to_cam_transform(cam_viewmat):
     R = (R_flip @ V[:3, :3]).astype(np.float64)
     t = (R_flip @ V[:3, 3]).astype(np.float64)
     return R, t
+
+
+def _cam_extrinsics_sim(cam_viewmat):
+    """Return dict with camera position and orientation in the sim world frame."""
+    R, t = _world_to_cam_transform(cam_viewmat)
+    R_cam_to_sim = R.T                        # cam → sim world
+    pos_sim      = -R.T @ t                   # camera origin in sim world (metres)
+    from scipy.spatial.transform import Rotation as _Rot
+    q_xyzw = _Rot.from_matrix(R_cam_to_sim).as_quat()
+    return {
+        'position_sim':  pos_sim.tolist(),
+        'R_cam_to_sim':  R_cam_to_sim.tolist(),
+        'quat_xyzw_sim': q_xyzw.tolist(),
+        'quat_wxyz_sim': [q_xyzw[3], *q_xyzw[:3]],
+    }
+
+
+def _cam_intrinsics(resolution):
+    """Camera intrinsics matching _bc_obs_helpers.proj_matrix()."""
+    fov_rad = np.radians(_FOV)
+    # principal point at image centre (square image)
+    cx = cy = resolution / 2.0
+    # focal length in pixels from vertical FOV
+    f = cx / np.tan(fov_rad / 2.0)
+    return {
+        'fov_deg':    _FOV,
+        'near':       _NEAR,
+        'far':        _FAR,
+        'resolution': resolution,
+        'fx_px':      round(f, 4),
+        'fy_px':      round(f, 4),
+        'cx_px':      cx,
+        'cy_px':      cy,
+        # 3x3 K matrix (row-major)
+        'K': [[f, 0, cx],
+              [0, f, cy],
+              [0, 0, 1]],
+    }
+
+
+def _cam_extrinsics_real(cam_viewmat, scale, offset_xyz, rotation_z_deg):
+    """Return dict with camera pose in the real world frame.
+
+    Sim-to-real:  p_real = R_z(rotation_z_deg) @ (scale * p_sim) + offset_xyz
+    Orientation:  R_cam_to_real = R_z(rotation_z_deg) @ R_cam_to_sim
+    """
+    R, t = _world_to_cam_transform(cam_viewmat)
+    R_cam_to_sim = R.T
+    pos_sim      = -R.T @ t
+
+    angle  = np.radians(rotation_z_deg)
+    c, s   = np.cos(angle), np.sin(angle)
+    R_z    = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    offset = np.asarray(offset_xyz, dtype=np.float64)
+
+    pos_real      = R_z @ (scale * pos_sim) + offset
+    R_cam_to_real = R_z @ R_cam_to_sim
+
+    from scipy.spatial.transform import Rotation as _Rot
+    q_xyzw = _Rot.from_matrix(R_cam_to_real).as_quat()
+    return {
+        'position_real':  pos_real.tolist(),
+        'R_cam_to_real':  R_cam_to_real.tolist(),
+        'quat_xyzw_real': q_xyzw.tolist(),
+        'quat_wxyz_real': [q_xyzw[3], *q_xyzw[:3]],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +205,12 @@ def _xf_acts(acts, R):
 # Top-level transform
 # ---------------------------------------------------------------------------
 
-def transform_traj(data, R, t):
-    """Return a copy of `data` with all spatial fields in camera frame."""
+def transform_traj(data, R, t, sim_to_real=None):
+    """Return a copy of `data` with all spatial fields in camera frame.
+
+    sim_to_real: optional dict with keys scale, offset_xyz, rotation_z_deg.
+                 When provided, cam_extrinsics_real is added to the output.
+    """
     t_wbox = (t / WBOX).astype(np.float32)
 
     obs = dict(data['obs'])
@@ -131,10 +218,25 @@ def transform_traj(data, R, t):
     obs['goal'] = _xf_positions(np.asarray(obs['goal'], dtype=np.float32), R, t_wbox)
     obs['grip'] = _xf_grip(np.asarray(obs['grip'], dtype=np.float32), R, t_wbox)
 
+    cam_viewmat = data['cam_viewmat']
+    resolution  = data.get('cam_resolution', 128)
+
     out = dict(data)
-    out['obs']       = obs
-    out['acts']      = _xf_acts(np.asarray(data['acts'], dtype=np.float32), R)
-    out['cam_frame'] = True
+    out['obs']                = obs
+    out['acts']               = _xf_acts(np.asarray(data['acts'], dtype=np.float32), R)
+    out['cam_frame']          = True
+    out['cam_extrinsics_sim'] = _cam_extrinsics_sim(cam_viewmat)
+    out['cam_intrinsics']     = _cam_intrinsics(resolution)
+
+    if sim_to_real is not None:
+        out['sim_to_real'] = sim_to_real
+        out['cam_extrinsics_real'] = _cam_extrinsics_real(
+            cam_viewmat,
+            sim_to_real['scale'],
+            sim_to_real['offset_xyz'],
+            sim_to_real['rotation_z_deg'],
+        )
+
     return out
 
 
@@ -175,6 +277,14 @@ def main():
     ap.add_argument('--pkl', required=True, help='Input trajectory pkl')
     ap.add_argument('--out_dir', default=None,
                     help='Output directory (default: same dir as --pkl)')
+    # Optional sim-to-real transform
+    ap.add_argument('--sim_to_real_scale', type=float, default=0.045,
+                    help='Uniform scale from sim to real (default: 0.045)')
+    ap.add_argument('--sim_to_real_offset', type=float, nargs=3,
+                    metavar=('X', 'Y', 'Z'), default=[0.5, 0.0, -0.039],
+                    help='Translation offset in real world metres after rotation (default: 0.5 0.0 -0.039)')
+    ap.add_argument('--sim_to_real_rotation_z_deg', type=float, default=90.0,
+                    help='Rotation about Z axis from sim to real world in degrees (default: 90)')
     args = ap.parse_args()
 
     pkl_path = Path(args.pkl)
@@ -194,10 +304,33 @@ def main():
     print(f't (world → cam, metres): {t.round(4)}')
     print()
 
-    out = transform_traj(data, R, t)
+    sim_to_real = {
+        'scale':          args.sim_to_real_scale,
+        'offset_xyz':     args.sim_to_real_offset,
+        'rotation_z_deg': args.sim_to_real_rotation_z_deg,
+    }
+
+    out = transform_traj(data, R, t, sim_to_real=sim_to_real)
 
     print('Sanity checks:')
     _sanity_check(data, out, R, t, cam_viewmat)
+    print()
+
+    print('Camera extrinsics (sim world):')
+    ex_sim = out['cam_extrinsics_sim']
+    print(f'  position : {[round(v, 4) for v in ex_sim["position_sim"]]}')
+    print(f'  quat wxyz: {[round(v, 4) for v in ex_sim["quat_wxyz_sim"]]}')
+
+    print('Camera intrinsics:')
+    intr = out['cam_intrinsics']
+    print(f'  fov={intr["fov_deg"]}°  resolution={intr["resolution"]}  '
+          f'f={intr["fx_px"]}px  cx=cy={intr["cx_px"]}px')
+
+    if 'cam_extrinsics_real' in out:
+        print('Camera extrinsics (real world):')
+        ex_real = out['cam_extrinsics_real']
+        print(f'  position : {[round(v, 4) for v in ex_real["position_real"]]}')
+        print(f'  quat wxyz: {[round(v, 4) for v in ex_real["quat_wxyz_real"]]}')
     print()
 
     with open(out_path, 'wb') as f:
