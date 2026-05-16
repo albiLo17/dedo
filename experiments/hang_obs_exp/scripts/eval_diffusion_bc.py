@@ -45,7 +45,7 @@ from _bc_obs_helpers import (  # noqa: E402
     capture_rgb_depth, proj_matrix,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     measure_hole_radius, get_hole_indices, get_hole_loops,
-    resolve_deform)
+    resolve_deform, patch_deform_render_to_obs_camera)
 from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
     build_privileged_obs, identify_cloth_corners)
 from _diffusion_policy import (  # noqa: E402
@@ -151,6 +151,9 @@ def main():
     eval_sim_steps_per_action = int(ckpt['sim_steps_per_action'])
     eval_ctrl_freq = float(ckpt.get('ctrl_freq',
                                     eval_sim_freq / eval_sim_steps_per_action))
+    # Hanger-goal randomization the ckpt was trained under. Legacy ckpts
+    # without this field default to 0 (v3-and-earlier fixed-goal behavior).
+    eval_randomize_goal_radius = float(ckpt.get('randomize_goal_radius', 0.0))
 
     # Tail frames: CLI override wins, then ckpt metadata, then default 5
     # (matches collect_bc_demos.py default).
@@ -173,6 +176,8 @@ def main():
     print(f'[init] MAX_ACT_VEL={eval_max_act_vel} '
           f'sim_freq={eval_sim_freq} '
           f'sim_steps_per_action={eval_sim_steps_per_action}')
+    print(f'[init] randomize_goal_radius={eval_randomize_goal_radius} m'
+          f'{" (off — fixed goal)" if eval_randomize_goal_radius <= 0 else ""}')
 
     # CRITICAL parity patch — same as train_diffusion_bc.py does at startup.
     _orig_mav = DeformEnv.MAX_ACT_VEL
@@ -232,6 +237,7 @@ def main():
         f'--sim_steps_per_action={eval_sim_steps_per_action}',
         '--cam_viewmat',
         *[f'{x:.6f}' for x in eval_cam_viewmat],
+        f'--randomize_goal_radius={eval_randomize_goal_radius}',
     ]
     try:
         dargs, _ = get_args_parser()
@@ -245,29 +251,16 @@ def main():
     e = RetryResetEnv(e)
     e.seed(args.eval_seed)
     deform = resolve_deform(e)
+    # Always patch deform.render() to use the obs-camera projection
+    # (fov=60) so any recorded mp4 frames + settle frames inside
+    # make_final_steps match what the policy actually saw at training
+    # time. Unconditional even when recording is off: keeps the invariant
+    # robust if a future caller adds a render call.
+    patch_deform_render_to_obs_camera(deform)
 
     # --- Video setup --------------------------------------------------------
-    # Monkey-patch deform.render() to use the obs-camera projection (fov=60)
-    # so the recorded videos look like collect_bc_demos.py's debug videos.
-    # This affects only the recorded mp4 frames; obs-camera renders use a
-    # separate path (capture_rgb_depth).
     record_videos = args.n_video_episodes > 0
     if record_videos:
-        import types as _types
-        import pybullet as _pb
-        _MATCHED_PROJ = proj_matrix()
-
-        def _matched_render(self, mode='rgb_array', width=300, height=300):
-            assert mode == 'rgb_array'
-            _, _, rgba, _, _ = self.sim.getCameraImage(
-                width=width, height=height,
-                renderer=_pb.ER_BULLET_HARDWARE_OPENGL,
-                viewMatrix=self._cam_viewmat,
-                projectionMatrix=_MATCHED_PROJ)
-            return np.asarray(rgba)[:, :, :3]
-
-        deform.render = _types.MethodType(_matched_render, deform)
-
         if args.video_dir is None:
             args.video_dir = str(ckpt_path.parent / 'videos')
         os.makedirs(args.video_dir, exist_ok=True)

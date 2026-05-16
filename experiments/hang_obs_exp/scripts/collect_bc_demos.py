@@ -77,7 +77,7 @@ from _bc_obs_helpers import (  # noqa: E402
     capture_rgb_depth, depth_to_pcd, cloth_only_pcd,
     get_hole_indices, get_hole_loops, measure_hole_radius,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
-    resolve_deform)
+    resolve_deform, patch_deform_render_to_obs_camera)
 from _debug_viz import (  # noqa: E402
     hole_centroid_world, overlay_pcd_on_rgb, pcd_camera_view_image,
     render_sim_with_centroid, build_video_frame, write_video_mp4,
@@ -147,6 +147,17 @@ parser.add_argument('--max_act_vel', type=float, default=10.0,
                          '(action range better utilized) but will saturate '
                          'and break demos if set below the trajectory peak '
                          '(~1.5-3 m/s in the lift phase).')
+parser.add_argument('--randomize_goal_radius', type=float, default=0.0,
+                    help='Half-extent (meters) of a uniform xy box around the '
+                         'nominal hanger pose. When >0, every reset() samples '
+                         '(dx, dy) ~ Uniform[-r, +r]^2 and shifts the hanger + '
+                         'tallrod + goal_pos by the same delta, so the policy '
+                         'has to use the goal-conditioning input rather than '
+                         'memorizing a fixed peg location. Default 0 keeps '
+                         'the v3 fixed-goal behavior. The chosen value is '
+                         'saved per pkl as `randomize_goal_radius` and the '
+                         'training script enforces strict parity across the '
+                         'demo dir.')
 parser.add_argument('--cam_viewmat', type=float, nargs=6,
                     default=[14.0, -5.0, 45.0, 0.0, 0.0, 5.5],
                     help='dedo cam_viewmat: dist pitch yaw tx ty tz. '
@@ -256,6 +267,7 @@ sys.argv = [
     f'--sim_steps_per_action={_steps_per_action}',
     '--cam_viewmat',
     *[str(x) for x in extra.cam_viewmat],
+    f'--randomize_goal_radius={extra.randomize_goal_radius}',
 ]
 args, _ = get_args_parser()
 args_postprocess(args)
@@ -274,6 +286,14 @@ env = gym.make(args.env, args=args)
 env = RetryResetEnv(env)
 env.seed(extra.seed)
 deform = resolve_deform(env)
+# Patch deform.render() unconditionally so debug-video + settle frames
+# render through the obs-camera projection (fov=60) instead of dedo's
+# fov≈90 default. The view matrix already comes from args.cam_viewmat.
+# Done here so anything below that calls deform.render() (debug viz,
+# future hooks) is correct by default, not gated on _debug_enabled.
+patch_deform_render_to_obs_camera(deform)
+print('[init] patched deform.render() to use obs-camera projection '
+      '(fov=60) — eval-video + settle frames match obs-camera renders')
 
 np.random.seed(extra.seed)
 
@@ -306,30 +326,10 @@ _debug_dir = os.path.join(extra.demos_dir, 'debug_viz') if _debug_enabled else N
 if _debug_dir is not None:
     os.makedirs(_debug_dir, exist_ok=True)
 
-# Monkey-patch deform.render() so the dedo-side settle-frame captures
-# inside make_final_steps use the SAME projection matrix as our obs
-# RGB camera (fov=60, near=0.1, far=30). Without this, settle frames
-# look zoomed out (~90° fov from DEFAULT_CAM_PROJECTION) relative to
-# the policy-phase sim panel in the debug video. View matrix is
-# already identical (both use deform._cam_viewmat), so this only
-# affects the projection — no camera-pose shift.
-if _debug_enabled:
-    import types as _types
-    from _bc_obs_helpers import proj_matrix as _bc_proj_matrix
-    _MATCHED_PROJ = _bc_proj_matrix()
-
-    def _matched_render(self, mode='rgb_array', width=300, height=300):
-        assert mode == 'rgb_array'
-        _, _, rgba, _, _ = self.sim.getCameraImage(
-            width=width, height=height,
-            renderer=pybullet.ER_BULLET_HARDWARE_OPENGL,
-            viewMatrix=self._cam_viewmat,
-            projectionMatrix=_MATCHED_PROJ)
-        return np.asarray(rgba)[:, :, :3]
-
-    deform.render = _types.MethodType(_matched_render, deform)
-    print('[init] patched deform.render() to use obs-camera projection '
-          '(fov=60) so debug-video settle frames match policy-phase frames')
+# Render-projection patch is applied unconditionally at env construction
+# above (see patch_deform_render_to_obs_camera). Debug-video + settle
+# frames in make_final_steps therefore always use the obs-camera fov=60,
+# regardless of --debug_viz_first_n / --debug_viz_every settings.
 
 
 def _should_debug(kept_index_zero_based: int) -> bool:
@@ -354,6 +354,8 @@ print(f'  pcd_n_points:    {extra.pcd_n_points}')
 print(f'  MAX_ACT_VEL:     {DeformEnv.MAX_ACT_VEL}')
 print(f'  ctrl_freq:       {_actual_ctrl_freq:.3f} Hz '
       f'(sim_freq={extra.sim_freq}, steps/action={_steps_per_action})')
+print(f'  randomize_goal:  radius={extra.randomize_goal_radius} m'
+      f'{" (off — fixed goal)" if extra.randomize_goal_radius <= 0 else ""}')
 if _debug_enabled:
     print(f'  debug_viz:       first {extra.debug_viz_first_n} kept'
           f'{f" + every {extra.debug_viz_every}th" if extra.debug_viz_every > 0 else ""}'
@@ -658,6 +660,14 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         'ctrl_freq': float(_actual_ctrl_freq),
         'sim_freq': int(extra.sim_freq),
         'sim_steps_per_action': int(_steps_per_action),
+        # Per-episode hanger goal randomization. Recorded so the training
+        # script can enforce parity across the demo dir, and so eval-time
+        # env construction matches the distribution the policy trained on.
+        # The actual sampled (dx, dy) for THIS episode is recoverable from
+        # obs['goal'][0] vs the nominal (0, 0, 8.2)/WBOX; we store the
+        # radius (the distribution parameter) here, not the per-episode
+        # draw.
+        'randomize_goal_radius': float(extra.randomize_goal_radius),
     }
     with open(out_path, 'wb') as f:
         pickle.dump(payload, f)
