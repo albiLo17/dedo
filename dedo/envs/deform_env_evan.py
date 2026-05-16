@@ -42,7 +42,7 @@ class DeformEnv(gym.Env):
     STEPS_AFTER_DONE = 500     # steps after releasing anchors at the end
     FORCE_REWARD_MULT = 1e-4   # scaling for the force penalties
     FINAL_REWARD_MULT = 400    # multiply the final reward (for sparse rewards)
-    SUCESS_REWARD_TRESHOLD = 2.5  # approx. threshold for task success/failure
+    SUCESS_REWARD_TRESHOLD = 7.5  # approx. threshold for task success/failure
 
     def __init__(self, args):
         self.args = args
@@ -237,22 +237,6 @@ class DeformEnv(gym.Env):
             pin_fixed(sim, deform_id,
                       DEFORM_INFO[deform_obj]['deform_fixed_anchor_vertex_ids'])
 
-        # HangProcCloth-only: sample a per-episode (dx, dy) shift for the
-        # hanger goal so the cloth has to thread a different peg location
-        # each reset. The shift is applied to BOTH rigid bodies (hanger
-        # cross-piece AND tallrod vertical support, so the peg structure
-        # stays physically coherent) AND to the goal_pos (so the reward
-        # function, the scripted controller, and obs['goal'] all retarget
-        # automatically — every downstream consumer already reads
-        # self.goal_pos[0]). Uses np.random, so a prior env.seed() call
-        # makes the dxy reproducible across collection/eval.
-        goal_dxy = np.zeros(2, dtype=np.float32)
-        randomize_r = float(getattr(args, 'randomize_goal_radius', 0.0))
-        if scene_name == 'hangcloth' and randomize_r > 0.0:
-            goal_dxy = np.random.uniform(
-                -randomize_r, randomize_r, size=2).astype(np.float32)
-        self._last_goal_dxy = goal_dxy
-
         # Load rigid objects.
         rigid_ids = []
         for name, kwargs in SCENE_INFO[scene_name]['entities'].items():
@@ -260,26 +244,14 @@ class DeformEnv(gym.Env):
             texture_file = None
             if 'useTexture' in kwargs and kwargs['useTexture']:
                 texture_file = self.get_texture_path(args.rigid_texture_file)
-            # Apply the same dxy shift to hanger + tallrod for hangcloth.
-            base_position = list(kwargs['basePosition'])
-            if scene_name == 'hangcloth':
-                base_position[0] = float(base_position[0]) + float(goal_dxy[0])
-                base_position[1] = float(base_position[1]) + float(goal_dxy[1])
             id = load_rigid_object(
                 sim, os.path.join(data_path, name), kwargs['globalScaling'],
-                base_position, kwargs['baseOrientation'],
+                kwargs['basePosition'], kwargs['baseOrientation'],
                 kwargs.get('mass', 0.0), texture_file, rgba_color)
             rigid_ids.append(id)
 
         # Mark the goal and store intermediate info for reward computations.
         goal_poses = SCENE_INFO[scene_name]['goal_pos']
-        if scene_name == 'hangcloth' and randomize_r > 0.0:
-            goal_poses = [
-                [float(p[0]) + float(goal_dxy[0]),
-                 float(p[1]) + float(goal_dxy[1]),
-                 float(p[2])]
-                for p in goal_poses
-            ]
         if args.viz and debug:
             for i, goal_pos in enumerate(goal_poses):
                 print(f'goal_pos{i}', goal_pos)

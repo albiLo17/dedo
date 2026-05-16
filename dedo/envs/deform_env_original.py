@@ -88,14 +88,6 @@ class DeformEnv(gym.Env):
             print('Created DeformEnv with obs', self.observation_space.shape,
                   'act', self.action_space.shape)
 
-        # Optional: render frames during make_final_steps (the post-policy
-        # settle phase) so external video loggers can show the cloth falling.
-        # Toggled by an external callback before/after each eval episode;
-        # default off to avoid render cost during training.
-        self._record_settle_frames = False
-        self._settle_render_kwargs = dict(width=300, height=300)
-        self._settle_frame_stride = 1  # every Nth recorded sub-step
-
         # Point cloud observation initilization
         self.pcd_mode = args.pcd
         if args.pcd:
@@ -237,22 +229,6 @@ class DeformEnv(gym.Env):
             pin_fixed(sim, deform_id,
                       DEFORM_INFO[deform_obj]['deform_fixed_anchor_vertex_ids'])
 
-        # HangProcCloth-only: sample a per-episode (dx, dy) shift for the
-        # hanger goal so the cloth has to thread a different peg location
-        # each reset. The shift is applied to BOTH rigid bodies (hanger
-        # cross-piece AND tallrod vertical support, so the peg structure
-        # stays physically coherent) AND to the goal_pos (so the reward
-        # function, the scripted controller, and obs['goal'] all retarget
-        # automatically — every downstream consumer already reads
-        # self.goal_pos[0]). Uses np.random, so a prior env.seed() call
-        # makes the dxy reproducible across collection/eval.
-        goal_dxy = np.zeros(2, dtype=np.float32)
-        randomize_r = float(getattr(args, 'randomize_goal_radius', 0.0))
-        if scene_name == 'hangcloth' and randomize_r > 0.0:
-            goal_dxy = np.random.uniform(
-                -randomize_r, randomize_r, size=2).astype(np.float32)
-        self._last_goal_dxy = goal_dxy
-
         # Load rigid objects.
         rigid_ids = []
         for name, kwargs in SCENE_INFO[scene_name]['entities'].items():
@@ -260,26 +236,14 @@ class DeformEnv(gym.Env):
             texture_file = None
             if 'useTexture' in kwargs and kwargs['useTexture']:
                 texture_file = self.get_texture_path(args.rigid_texture_file)
-            # Apply the same dxy shift to hanger + tallrod for hangcloth.
-            base_position = list(kwargs['basePosition'])
-            if scene_name == 'hangcloth':
-                base_position[0] = float(base_position[0]) + float(goal_dxy[0])
-                base_position[1] = float(base_position[1]) + float(goal_dxy[1])
             id = load_rigid_object(
                 sim, os.path.join(data_path, name), kwargs['globalScaling'],
-                base_position, kwargs['baseOrientation'],
+                kwargs['basePosition'], kwargs['baseOrientation'],
                 kwargs.get('mass', 0.0), texture_file, rgba_color)
             rigid_ids.append(id)
 
         # Mark the goal and store intermediate info for reward computations.
         goal_poses = SCENE_INFO[scene_name]['goal_pos']
-        if scene_name == 'hangcloth' and randomize_r > 0.0:
-            goal_poses = [
-                [float(p[0]) + float(goal_dxy[0]),
-                 float(p[1]) + float(goal_dxy[1]),
-                 float(p[2])]
-                for p in goal_poses
-            ]
         if args.viz and debug:
             for i, goal_pos in enumerate(goal_poses):
                 print(f'goal_pos{i}', goal_pos)
@@ -395,10 +359,6 @@ class DeformEnv(gym.Env):
         # Get next obs, reward, done.
         next_obs, done = self.get_obs()
         reward = self.get_reward()
-        # Snapshot the per-step (un-multiplied) reward at the terminal frame,
-        # so wrappers can shape on the policy-handoff pose BEFORE the gravity
-        # settle in make_final_steps mutates the cloth.
-        pre_settle_reward = reward
         if done:  # if terminating early use reward from current step for rest
             reward *= (self.max_episode_len - self.stepnum)
         done = (done or self.stepnum >= self.max_episode_len)
@@ -407,9 +367,6 @@ class DeformEnv(gym.Env):
         if done:
             # Compute final reward by releasing anchors to let the object fall.
             info = self.make_final_steps()
-            info['pre_settle_reward'] = pre_settle_reward
-            info['pre_settle_dist_m'] = (
-                -pre_settle_reward * DeformEnv.WORKSPACE_BOX_SIZE)
             last_rwd = self.get_reward() * DeformEnv.FINAL_REWARD_MULT
             info['is_success'] = np.abs(last_rwd) < self.SUCESS_REWARD_TRESHOLD
             reward += last_rwd
@@ -445,9 +402,6 @@ class DeformEnv(gym.Env):
         change_anchor_color_gray(self.sim, self.anchor_ids[0])
         change_anchor_color_gray(self.sim, self.anchor_ids[1])
         info = {'final_obs': []}
-        if self._record_settle_frames:
-            info['settle_frames'] = []
-        sub_step_idx = 0
         for sim_step in range(DeformEnv.STEPS_AFTER_DONE):
             # For lasso pull the string at the end to test lasso loop.
             # For other tasks noop action to let the anchors fall.
@@ -460,11 +414,6 @@ class DeformEnv(gym.Env):
             if sim_step % self.args.sim_steps_per_action == 0:
                 next_obs, _ = self.get_obs()
                 info['final_obs'].append(next_obs)
-                if (self._record_settle_frames and
-                        sub_step_idx % self._settle_frame_stride == 0):
-                    info['settle_frames'].append(self.render(
-                        mode='rgb_array', **self._settle_render_kwargs))
-                sub_step_idx += 1
         return info
 
     def get_pcd_obs(self):
