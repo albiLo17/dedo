@@ -38,28 +38,36 @@ def proj_matrix(near=_PCD_NEAR, far=_PCD_FAR, fov=60.0, aspect=1.0):
         fov=fov, aspect=aspect, nearVal=near, farVal=far)
 
 
-def capture_rgb_depth(deform_env, width, height):
+def capture_rgb_depth(deform_env, width, height, return_seg=False):
     """Render RGB + depth using deform_env's cached cam_viewmat.
 
     Returns (rgb uint8 (H,W,3), depth float64 (H,W) ∈ [0,1), view, proj).
-    The view/proj 16-tuples are returned so the back-projector can use
-    identical matrices.
+    When return_seg=True, also returns seg int32 (H,W) as a 5th element,
+    where each pixel value is the PyBullet body unique ID (-1 = background).
     """
     view = deform_env._cam_viewmat
     proj = proj_matrix()
-    _, _, rgb_raw, depth_buf, _ = deform_env.sim.getCameraImage(
+    _, _, rgb_raw, depth_buf, seg_buf = deform_env.sim.getCameraImage(
         width=width, height=height,
         viewMatrix=view, projectionMatrix=proj,
         renderer=pybullet.ER_BULLET_HARDWARE_OPENGL)
     rgb = np.asarray(rgb_raw, dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
     depth = np.asarray(depth_buf, dtype=np.float64).reshape(height, width)
+    if return_seg:
+        seg = np.asarray(seg_buf, dtype=np.int32).reshape(height, width)
+        return rgb, depth, view, proj, seg
     return rgb, depth, view, proj
 
 
-def depth_to_pcd(depth, view, proj, n_points):
+def depth_to_pcd(depth, view, proj, n_points,
+                 seg_mask=None, cloth_id=None):
     """Back-project a non-linear depth buffer to world coords, mask out
     background (depth ≈ 1.0) and NaN, then sub-/over-sample to exactly
     n_points. Returns (n_points, 3) float32 in WORLD meters.
+
+    When seg_mask (H,W) int32 and cloth_id are provided, only pixels whose
+    segmentation ID matches cloth_id are kept, removing the hanger and any
+    other rigid bodies from the point cloud.
     """
     H, W = depth.shape
     v = np.asarray(view, dtype=np.float64).reshape(4, 4, order='F')
@@ -76,6 +84,8 @@ def depth_to_pcd(depth, view, proj, n_points):
     world_h = clip @ inv_vp.T
     world = world_h[:, :3] / world_h[:, 3:4]
     valid = (depth.reshape(-1) < 0.999) & ~np.isnan(world).any(axis=1)
+    if seg_mask is not None and cloth_id is not None:
+        valid &= seg_mask.reshape(-1) == cloth_id
     pts = world[valid]
     n = len(pts)
     if n == 0:

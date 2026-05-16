@@ -5,8 +5,8 @@ setup(name='dedo',
       description='Dynamic Environments with Deformable Objects.',
       packages=['dedo'],
       install_requires=[
-            'numpy', 'gym==0.21.0', 'pybullet>=3.2.5', 'scipy',
+            'numpy', 'gym==0.21.0', 'pybullet==3.2.5', 'scipy',
             'torch', 'stable_baselines3==1.2.0',
             'matplotlib', 'tensorboard', 'tensorboardX', 'moviepy', 'wandb',
-            'pyaml', 'opencv-python', "importlib-metadata<5.0"
+            'pyaml', 'opencv-python', "importlib-metadata<5.0", 'h5py'
       ])
