@@ -139,6 +139,203 @@ def build_hole_aware_waypoints(underlying):
     return {'a': wp_a, 'b': wp_b}
 
 
+# ---------------------------------------------------------------------------
+# Per-episode bag-handle-aware waypoint builder for HangBag-v1.
+#
+# Mirrors build_hole_aware_waypoints, but for tote bags. HangBag bags
+# have TWO handle loops (see DEFORM_INFO['bags/totes/bag*_*.obj']
+# ['deform_true_loop_vertices']) and TWO anchors (one grabbing each
+# handle). Per the user spec, only ONE handle ("primary loop") needs
+# to land on the hook; planning is done in that handle's centroid
+# space.
+#
+# Both anchors translate by the same vector — i.e. they preserve the
+# initial inter-anchor geometry (delta_a, delta_b are offsets from the
+# primary handle centroid at episode start, then re-added to each
+# handle target waypoint). This keeps the bag from being torn while
+# the primary handle is driven to the hook.
+#
+# Phases (in HOOK space):
+#   1. APPROACH — drive the handle centroid to a position just above
+#                 the hook (small z clearance, same xy). This is the
+#                 only long phase — the bag has to traverse from its
+#                 init pose at y≈8, z≈2 to directly above the hook.
+#   2. HOOK     — descend straight down so the handle centroid lands
+#                 on the hook position; the hook ends up inside the
+#                 handle ring. No high hover, no overshoot.
+# ---------------------------------------------------------------------------
+def build_bag_handle_waypoints(underlying, primary_loop_idx=0):
+    from dedo.utils.mesh_utils import get_mesh_data
+
+    if not hasattr(underlying.args, 'deform_true_loop_vertices'):
+        return None
+    loops = underlying.args.deform_true_loop_vertices
+    if len(loops) <= primary_loop_idx:
+        return None
+
+    _, verts = get_mesh_data(underlying.sim, underlying.deform_id)
+    verts = np.array(verts, dtype=np.float32)
+
+    primary_idxs = loops[primary_loop_idx]
+    handle_verts = verts[primary_idxs]
+    handle_verts = handle_verts[~np.isnan(handle_verts).any(axis=1)]
+    if len(handle_verts) == 0:
+        return None
+    handle_centroid = handle_verts.mean(axis=0)
+
+    hook = np.array(underlying.goal_pos[0], dtype=np.float32)
+
+    anc_ids = list(underlying.anchors.keys())
+    grip_a = np.array(underlying.anchors[anc_ids[0]]['pos'], dtype=np.float32)
+    grip_b = np.array(underlying.anchors[anc_ids[1]]['pos'], dtype=np.float32)
+
+    delta_a = grip_a - handle_centroid
+    delta_b = grip_b - handle_centroid
+
+    # Hook (goal) is at e.g. [0, 1.28, 9] in the hangbag scene. Bag
+    # starts at deform_init_pos = [0, 8, 2], so phase 1 must traverse
+    # ~6.7 m in y and lift ~7+ m in z; budget a long first phase.
+    # Phase 2 is a short straight-down descent — small clearance
+    # turning into a clean hook.
+    handle_approach = np.array([hook[0], hook[1], hook[2] + 0.4])
+    handle_hook     = np.array([hook[0], hook[1], hook[2] - 0.1])
+
+    def grip_target(handle_target, delta):
+        return [float(handle_target[0] + delta[0]),
+                float(handle_target[1] + delta[1]),
+                float(handle_target[2] + delta[2])]
+
+    wp_a = [
+        [*grip_target(handle_approach, delta_a), 3.0],
+        [*grip_target(handle_hook,     delta_a), 1.0],
+    ]
+    wp_b = [
+        [*grip_target(handle_approach, delta_b), 3.0],
+        [*grip_target(handle_hook,     delta_b), 1.0],
+    ]
+    return {'a': wp_a, 'b': wp_b}
+
+
+# ---------------------------------------------------------------------------
+# Per-episode hole-aware waypoint builder for ButtonProc-v0/v1.
+#
+# ButtonProc differs from HangBag in two key ways:
+#   1. There are TWO hole loops AND TWO button goals — and the success
+#      metric (deform_env.py:get_reward) takes the mean over both, so
+#      both holes must reach their assigned buttons.
+#   2. The cloth has its FAR edge pinned to the world via
+#      deform_fixed_anchor_vertex_ids. That kills the HangBag-style
+#      "rigid-translate both anchors together" trick, since the
+#      cloth body is constrained on one side. Each movable anchor
+#      drives its own hole independently.
+#
+# Pairing rule: nearest-hole at reset. anchor 0 is paired with the hole
+# whose centroid is closest to it at episode start; anchor 1 gets the
+# other hole. Robust to procedural hole order being random.
+#
+# Phases (per anchor, planned in HOLE space then offset back via the
+# anchor->hole delta at reset):
+#   1. APPROACH (2.0 s): hole_target = goal + [0, +0.3, 0]
+#      — bring the hole right in front of its button in +y.
+#   2. THREAD   (1.5 s): hole_target = goal + [0, -0.3, 0]
+#      — pull past so the button pops through the hole.
+# ---------------------------------------------------------------------------
+def build_button_proc_waypoints(underlying):
+    from dedo.utils.mesh_utils import get_mesh_data
+
+    if not hasattr(underlying.args, 'deform_true_loop_vertices'):
+        return None
+    loops = underlying.args.deform_true_loop_vertices
+    if len(loops) < 2 or len(underlying.goal_pos) < 2:
+        return None
+
+    _, verts = get_mesh_data(underlying.sim, underlying.deform_id)
+    verts = np.array(verts, dtype=np.float32)
+
+    hole_centroids = []
+    for loop_idxs in loops[:2]:
+        loop_verts = verts[loop_idxs]
+        loop_verts = loop_verts[~np.isnan(loop_verts).any(axis=1)]
+        if len(loop_verts) == 0:
+            return None
+        hole_centroids.append(loop_verts.mean(axis=0))
+
+    goals = [np.asarray(underlying.goal_pos[i], dtype=np.float32)
+             for i in range(2)]
+
+    anc_ids = list(underlying.anchors.keys())
+    grip_a = np.array(underlying.anchors[anc_ids[0]]['pos'], dtype=np.float32)
+    grip_b = np.array(underlying.anchors[anc_ids[1]]['pos'], dtype=np.float32)
+
+    # Nearest-hole assignment: anchor 0 -> nearest hole, anchor 1 -> other.
+    d_a0 = float(np.linalg.norm(grip_a - hole_centroids[0]))
+    d_a1 = float(np.linalg.norm(grip_a - hole_centroids[1]))
+    if d_a0 <= d_a1:
+        hole_for_a, goal_for_a = hole_centroids[0], goals[0]
+        hole_for_b, goal_for_b = hole_centroids[1], goals[1]
+    else:
+        hole_for_a, goal_for_a = hole_centroids[1], goals[1]
+        hole_for_b, goal_for_b = hole_centroids[0], goals[0]
+
+    delta_a = grip_a - hole_for_a
+    delta_b = grip_b - hole_for_b
+
+    # Offsets are in HOLE space (added to each goal).
+    #
+    # APPROACH:
+    #   -x by 0.2  → hole is just before the button plane (cloth-side),
+    #                so the button hasn't entered the hole yet but is
+    #                lined up.
+    #   +y by 0.3  → hole is behind the button in y (cloth approaches
+    #                from +y, button protrudes in +y from the torso).
+    #   +z by 0.4  → compensates for cloth sagging under gravity once
+    #                the anchors stop moving.
+    #
+    # THREAD:
+    #   +x by 0.4  → hole is now past the button plane: button clearly
+    #                sits *inside* the handle ring instead of just at
+    #                the cloth plane.
+    #   -y by 0.6  → swept past the button in -y (doubled overshoot
+    #                vs APPROACH).
+    #   +z by 0.4  → maintain the sag correction.
+    approach_off = np.array([-0.2, +0.3, +0.4], dtype=np.float32)
+    thread_off   = np.array([+0.4, -0.6, +0.4], dtype=np.float32)
+    # RELAX: drift back to ~30% of thread overshoot so the cloth
+    # de-stretches with the button still inside the hole, BEFORE the
+    # trajectory ends and the zero-velocity hold begins. Without this,
+    # the highly-stretched cloth at end-of-THREAD recoils against the
+    # velocity controller (deform_damping_stiffness=0.01 is too low to
+    # damp on its own) → high-frequency jitter.
+    relax_off    = thread_off * 0.3
+
+    def waypoints_for(goal, delta):
+        approach = goal + approach_off
+        thread   = goal + thread_off
+        relax    = goal + relax_off
+        return [
+            # Phase timing trades motion speed vs. solver stability:
+            # the cloth is fragile (elastic_stiffness=10), so cutting
+            # too aggressively will produce "spike" artifacts from the
+            # softbody integrator. APPROACH 2.0 + THREAD 1.0 + RELAX 1.2
+            # = 4.2 s total. RELAX uses the longest duration so the
+            # de-stretching is gradual and doesn't slingshot the cloth.
+            [float(approach[0] + delta[0]),
+             float(approach[1] + delta[1]),
+             float(approach[2] + delta[2]), 2.0],
+            [float(thread[0] + delta[0]),
+             float(thread[1] + delta[1]),
+             float(thread[2] + delta[2]), 1.0],
+            [float(relax[0] + delta[0]),
+             float(relax[1] + delta[1]),
+             float(relax[2] + delta[2]), 1.2],
+        ]
+
+    return {
+        'a': waypoints_for(goal_for_a, delta_a),
+        'b': waypoints_for(goal_for_b, delta_b),
+    }
+
+
 def probe_peak_demo_vel(dedo_args, n_probes=3, max_attempts=12):
     """Probe scripted-demo trajectories without stepping the env to find
     the peak |velocity| the waypoint controller demands. Used to size
