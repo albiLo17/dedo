@@ -38,6 +38,47 @@ def proj_matrix(near=_PCD_NEAR, far=_PCD_FAR, fov=60.0, aspect=1.0):
         fov=fov, aspect=aspect, nearVal=near, farVal=far)
 
 
+def patch_deform_render_to_obs_camera(deform_env):
+    """Replace `deform_env.render()` so captured frames use the SAME
+    projection as the obs camera (fov=60, near=0.1, far=30 — i.e.
+    `proj_matrix()`). The view matrix already comes from
+    `deform_env._cam_viewmat` (built from `args.cam_viewmat`) and is
+    unchanged.
+
+    Why this exists: without the patch, `deform_env.render()` uses dedo's
+    `DEFAULT_CAM_PROJECTION` (fov≈90), so any saved video would have a
+    visibly wider field of view than the policy's actual obs camera. The
+    policy was trained on fov=60 RGB / depth, so videos should look the
+    same. This call site also covers `make_final_steps` — pybullet's
+    settle-phase frames go through `self.render()` too, so the post-
+    policy gravity-drape phase ends up consistent with the policy phase.
+
+    Apply this UNCONDITIONALLY at env construction (right after
+    `gym.make`) — it's idempotent, cheap (replaces one method
+    reference), and makes any future render call in this env safe by
+    default. Gating it on a flag like `record_videos > 0` makes the
+    invariant fragile: anyone who adds a debug `deform.render()` later
+    silently gets the wrong fov.
+
+    Returns the patched method (handy if a caller wants to hold onto a
+    direct reference, e.g. for a 3-panel video builder).
+    """
+    import types as _types
+    matched_proj = proj_matrix()
+
+    def _matched_render(self, mode='rgb_array', width=300, height=300):
+        assert mode == 'rgb_array'
+        _, _, rgba, _, _ = self.sim.getCameraImage(
+            width=width, height=height,
+            renderer=pybullet.ER_BULLET_HARDWARE_OPENGL,
+            viewMatrix=self._cam_viewmat,
+            projectionMatrix=matched_proj)
+        return np.asarray(rgba)[:, :, :3]
+
+    deform_env.render = _types.MethodType(_matched_render, deform_env)
+    return deform_env.render
+
+
 def capture_rgb_depth(deform_env, width, height):
     """Render RGB + depth (+ seg mask) using deform_env's cached cam_viewmat.
 

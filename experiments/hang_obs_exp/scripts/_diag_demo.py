@@ -32,12 +32,19 @@ parser.add_argument('--log_every', type=int, default=10,
 parser.add_argument('--success_factor', type=float, default=1.2,
                     help='Adaptive success threshold; pass <0 to disable '
                          'and use dedo\'s fixed 0.125 m.')
+parser.add_argument('--randomize_goal_radius', type=float, default=0.0,
+                    help='Half-extent of the per-episode xy hanger '
+                         'randomization box (meters). 0 keeps the legacy '
+                         'fixed-goal behavior. Useful for stress-testing '
+                         'the scripted controller\'s reach at the corners '
+                         'of the v4 randomization box.')
 extra = parser.parse_args()
 sf = None if extra.success_factor < 0 else float(extra.success_factor)
 
 sys.argv = ['_diag_demo', '--env=HangProcCloth-v1',
             '--cam_resolution=0', '--num_envs=0', '--total_env_steps=0',
-            '--seed', str(extra.seed)]
+            '--seed', str(extra.seed),
+            f'--randomize_goal_radius={extra.randomize_goal_radius}']
 args, _ = get_args_parser()
 args_postprocess(args)
 args.viz = False

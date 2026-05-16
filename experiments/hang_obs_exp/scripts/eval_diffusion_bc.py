@@ -45,7 +45,7 @@ from _bc_obs_helpers import (  # noqa: E402
     capture_rgb_depth, proj_matrix,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     measure_hole_radius, get_hole_indices, get_hole_loops,
-    resolve_deform)
+    resolve_deform, patch_deform_render_to_obs_camera)
 from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
     build_privileged_obs, identify_cloth_corners)
 from _diffusion_policy import (  # noqa: E402
@@ -116,6 +116,18 @@ def parse_args():
     p.add_argument('--settle_frame_stride', type=int, default=2,
                    help='Sub-sample the post-settle gravity-phase frames. '
                         'Matches collect_bc_demos.py debug-video default.')
+    # ----- Trajectory saving -----
+    p.add_argument('--save_traj_dir', type=str, default=None,
+                   help='If set, save successful episode trajectories as pkl '
+                        'files to this directory. Schema matches '
+                        'collect_bc_demos.py (obs dict + acts array + '
+                        'metadata) so replay_demo.py can consume the action '
+                        'sequence directly. Episodes where hanging OR legacy '
+                        'success fires are saved.')
+    p.add_argument('--save_n_successes', type=int, default=0,
+                   help='Stop after saving this many successful trajectories. '
+                        '0 = no limit (save all successes within '
+                        '--n_episodes).')
     return p.parse_args()
 
 
@@ -151,6 +163,9 @@ def main():
     eval_sim_steps_per_action = int(ckpt['sim_steps_per_action'])
     eval_ctrl_freq = float(ckpt.get('ctrl_freq',
                                     eval_sim_freq / eval_sim_steps_per_action))
+    # Hanger-goal randomization the ckpt was trained under. Legacy ckpts
+    # without this field default to 0 (v3-and-earlier fixed-goal behavior).
+    eval_randomize_goal_radius = float(ckpt.get('randomize_goal_radius', 0.0))
 
     # Tail frames: CLI override wins, then ckpt metadata, then default 5
     # (matches collect_bc_demos.py default).
@@ -173,6 +188,8 @@ def main():
     print(f'[init] MAX_ACT_VEL={eval_max_act_vel} '
           f'sim_freq={eval_sim_freq} '
           f'sim_steps_per_action={eval_sim_steps_per_action}')
+    print(f'[init] randomize_goal_radius={eval_randomize_goal_radius} m'
+          f'{" (off — fixed goal)" if eval_randomize_goal_radius <= 0 else ""}')
 
     # CRITICAL parity patch — same as train_diffusion_bc.py does at startup.
     _orig_mav = DeformEnv.MAX_ACT_VEL
@@ -232,6 +249,7 @@ def main():
         f'--sim_steps_per_action={eval_sim_steps_per_action}',
         '--cam_viewmat',
         *[f'{x:.6f}' for x in eval_cam_viewmat],
+        f'--randomize_goal_radius={eval_randomize_goal_radius}',
     ]
     try:
         dargs, _ = get_args_parser()
@@ -245,34 +263,31 @@ def main():
     e = RetryResetEnv(e)
     e.seed(args.eval_seed)
     deform = resolve_deform(e)
+    # Always patch deform.render() to use the obs-camera projection
+    # (fov=60) so any recorded mp4 frames + settle frames inside
+    # make_final_steps match what the policy actually saw at training
+    # time. Unconditional even when recording is off: keeps the invariant
+    # robust if a future caller adds a render call.
+    patch_deform_render_to_obs_camera(deform)
 
     # --- Video setup --------------------------------------------------------
-    # Monkey-patch deform.render() to use the obs-camera projection (fov=60)
-    # so the recorded videos look like collect_bc_demos.py's debug videos.
-    # This affects only the recorded mp4 frames; obs-camera renders use a
-    # separate path (capture_rgb_depth).
     record_videos = args.n_video_episodes > 0
     if record_videos:
-        import types as _types
-        import pybullet as _pb
-        _MATCHED_PROJ = proj_matrix()
-
-        def _matched_render(self, mode='rgb_array', width=300, height=300):
-            assert mode == 'rgb_array'
-            _, _, rgba, _, _ = self.sim.getCameraImage(
-                width=width, height=height,
-                renderer=_pb.ER_BULLET_HARDWARE_OPENGL,
-                viewMatrix=self._cam_viewmat,
-                projectionMatrix=_MATCHED_PROJ)
-            return np.asarray(rgba)[:, :, :3]
-
-        deform.render = _types.MethodType(_matched_render, deform)
-
         if args.video_dir is None:
             args.video_dir = str(ckpt_path.parent / 'videos')
         os.makedirs(args.video_dir, exist_ok=True)
         print(f'[init] recording {args.n_video_episodes} eval videos '
               f'to {args.video_dir}')
+
+    # --- Trajectory saving setup -------------------------------------------
+    save_trajs = args.save_traj_dir is not None
+    if save_trajs:
+        os.makedirs(args.save_traj_dir, exist_ok=True)
+        limit_str = (str(args.save_n_successes)
+                     if args.save_n_successes > 0 else 'unlimited')
+        print(f'[init] saving successful trajectories to {args.save_traj_dir} '
+              f'(limit: {limit_str})')
+    n_saved = 0
 
     # --- Helpers (mirror train_diffusion_bc._capture_obs_for_policy) ------
     def capture_obs(hole_idx, corner_idx):
@@ -364,6 +379,9 @@ def main():
             obs_deque = collections.deque(
                 [first_obs] * obs_horizon, maxlen=obs_horizon)
 
+            ep_obs_raw = [] if save_trajs else None
+            ep_acts_raw = [] if save_trajs else None
+
             step = 0
             done = False
             while not done and step < per_ep_max:
@@ -376,6 +394,12 @@ def main():
                 chunk = act_normalizer.unapply(naction[start:end])
                 for a in chunk:
                     a = np.clip(a, -1.0, 1.0).astype(np.float32)
+                    if save_trajs:
+                        obs_now = obs_deque[-1]
+                        ep_obs_raw.append(
+                            {k: v.copy() for k, v in obs_now.items()}
+                            if isinstance(obs_now, dict) else obs_now.copy())
+                        ep_acts_raw.append(a.copy())
                     _, _, done, info = e.step(a)
                     step += 1
                     if is_recorded:
@@ -403,6 +427,49 @@ def main():
             s_topo += int(t)
             s_legacy += l
             ep_lens.append(step)
+
+            traj_msg = ''
+            if save_trajs and (h or l):
+                want_more = (args.save_n_successes == 0
+                             or n_saved < args.save_n_successes)
+                if want_more and ep_obs_raw:
+                    if isinstance(ep_obs_raw[0], dict):
+                        obs_out = {k: np.stack([o[k] for o in ep_obs_raw])
+                                   for k in ep_obs_raw[0]}
+                    else:
+                        obs_out = np.stack(ep_obs_raw)
+                    traj_pkl = {
+                        'obs': obs_out,
+                        'acts': np.stack(ep_acts_raw),
+                        'success_hanging': h,
+                        'success_topological': int(t),
+                        'success_legacy': l,
+                        'success': max(h, l),
+                        'len': step,
+                        'obs_mode': obs_mode,
+                        'cam_viewmat': list(eval_cam_viewmat),
+                        'cam_resolution': eval_cam_resolution,
+                        'pcd_n_points': pcd_n_points,
+                        'max_act_vel': eval_max_act_vel,
+                        'ctrl_freq': eval_ctrl_freq,
+                        'sim_freq': eval_sim_freq,
+                        'sim_steps_per_action': eval_sim_steps_per_action,
+                        'episode_tail_frames': episode_tail_frames,
+                        'eval_seed': args.eval_seed,
+                        'episode_idx': ep,
+                        'ckpt': str(ckpt_path),
+                    }
+                    tfname = (f'traj_ep{ep+1:03d}_seed{args.eval_seed}'
+                              f'_l{l}_h{h}_t{int(t)}.pkl')
+                    tfpath = os.path.join(args.save_traj_dir, tfname)
+                    with open(tfpath, 'wb') as _f:
+                        pickle.dump(traj_pkl, _f, protocol=4)
+                    n_saved += 1
+                    traj_msg = f'  [traj] {tfname}'
+                    if args.save_n_successes > 0 and n_saved >= args.save_n_successes:
+                        print(f'  [traj] --save_n_successes={args.save_n_successes} '
+                              f'reached, stopping after ep {ep+1}')
+
             video_msg = ''
             if is_recorded and ep_frames:
                 fname = (f'eval_ep{ep+1:03d}_seed{args.eval_seed}_'
@@ -416,7 +483,11 @@ def main():
                     video_msg = f'  [video] WARN: {_err!r}'
             print(f'  [ep {ep+1}/{args.n_episodes}] len={step:3d}  '
                   f'h={s_hanging}/{ep+1} t={s_topo}/{ep+1} l={s_legacy}/{ep+1}'
-                  f'{video_msg}')
+                  f'{traj_msg}{video_msg}')
+
+            if (save_trajs and args.save_n_successes > 0
+                    and n_saved >= args.save_n_successes):
+                break
 
     e.close()
 
@@ -430,11 +501,14 @@ def main():
                        f'(safety cap={args.max_episode_len})')
     else:
         sizing_desc = f'no episodes ran'
-    print(f'\n=== Eval results (n={n}, sizing: {sizing_desc}) ===')
-    print(f'  legacy        = {s_legacy}/{n} = {s_legacy/n:.3f}')
-    print(f'  hanging       = {s_hanging}/{n} = {s_hanging/n:.3f}')
-    print(f'  topological   = {s_topo}/{n} = {s_topo/n:.3f}')
+    n_ran = len(ep_lens)
+    print(f'\n=== Eval results (n={n_ran}/{n}, sizing: {sizing_desc}) ===')
+    print(f'  legacy        = {s_legacy}/{n_ran} = {s_legacy/max(n_ran,1):.3f}')
+    print(f'  hanging       = {s_hanging}/{n_ran} = {s_hanging/max(n_ran,1):.3f}')
+    print(f'  topological   = {s_topo}/{n_ran} = {s_topo/max(n_ran,1):.3f}')
     print(f'  mean ep_len   = {np.mean(ep_lens):.1f}')
+    if save_trajs:
+        print(f'  trajectories saved = {n_saved} -> {args.save_traj_dir}')
 
 
 if __name__ == '__main__':

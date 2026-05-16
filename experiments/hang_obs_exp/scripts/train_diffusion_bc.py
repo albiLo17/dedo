@@ -67,7 +67,7 @@ from _bc_obs_helpers import (  # noqa: E402
     capture_rgb_depth, depth_to_pcd, proj_matrix,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     measure_hole_radius, get_hole_indices, get_hole_loops,
-    resolve_deform)
+    resolve_deform, patch_deform_render_to_obs_camera)
 
 from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
     build_privileged_obs, identify_cloth_corners)
@@ -390,6 +390,10 @@ recorded_ctrl_freqs: set = set()    # control-freq parity (same kind of invarian
                                     # play back at the wrong speed)
 recorded_sim_freqs: set = set()
 recorded_sim_steps_per_action: set = set()
+# Hanger-goal randomization radius. Treated like max_act_vel: comes from the
+# demo pkls (not a CLI flag) since the policy trained on a specific spatial
+# distribution and eval must mirror it. Mixed values raise.
+recorded_randomize_goal_radii: set = set()
 # Per-demo episode lengths. Demos are collected with deform.max_episode_len
 # set per-episode to (traj_len + episode_tail_frames) — typically ~51 ctrl
 # steps at 15 Hz — so the training distribution covers only this window.
@@ -473,6 +477,11 @@ for fname in demo_paths:
         recorded_sim_freqs.add(int(d['sim_freq']))
     if 'sim_steps_per_action' in d:
         recorded_sim_steps_per_action.add(int(d['sim_steps_per_action']))
+    if 'randomize_goal_radius' in d:
+        # round to 6 dp so float-repr noise across collection runs doesn't
+        # produce false mismatches.
+        recorded_randomize_goal_radii.add(
+            round(float(d['randomize_goal_radius']), 6))
     ep_ends.append(sum(len(a) for a in act_buf))
 
 if not obs_buf:
@@ -622,6 +631,35 @@ else:
           f'steps/action={eval_sim_steps_per_action}). If demos were '
           f'collected at a different ctrl_freq, eval will be inconsistent. '
           f'Re-collect to be safe.')
+
+
+# ---------------------------------------------------------------------------
+# Pick the eval env's hanger-goal randomization radius. Same parity story as
+# max_act_vel: demos were collected with a specific spatial distribution of
+# peg positions and the policy fits that distribution; eval must mirror it
+# or the policy is being scored on an OOD goal distribution. Mixed values
+# across the demo dir = data is inhomogeneous and we refuse to silently mix.
+# Legacy pkls (no field) are interpreted as the v3-and-earlier behavior:
+# radius = 0 (fixed goal). The training script does not expose a CLI
+# override — the value comes from the demos.
+# ---------------------------------------------------------------------------
+if len(recorded_randomize_goal_radii) > 1:
+    raise RuntimeError(
+        f'[data] demos use mixed randomize_goal_radius values '
+        f'{sorted(recorded_randomize_goal_radii)}. The policy would be '
+        f'trained on a mixture of spatial distributions and there is no '
+        f'sensible single eval distribution to score it against. '
+        f'Re-collect into a clean directory with a single '
+        f'--randomize_goal_radius.')
+if recorded_randomize_goal_radii:
+    eval_randomize_goal_radius = next(iter(recorded_randomize_goal_radii))
+    print(f'[data] eval randomize_goal_radius (from demos) = '
+          f'{eval_randomize_goal_radius} m'
+          f'{" (off — fixed goal)" if eval_randomize_goal_radius <= 0 else ""}')
+else:
+    eval_randomize_goal_radius = 0.0
+    print(f'[data] no randomize_goal_radius in demos (legacy pkls); '
+          f'using 0 (fixed goal, v3-and-earlier behavior)')
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +973,7 @@ def _build_eval_env(eval_seed):
         f'--sim_steps_per_action={eval_sim_steps_per_action}',
         '--cam_viewmat',
         *[f'{x:.6f}' for x in eval_cam_viewmat],
+        f'--randomize_goal_radius={eval_randomize_goal_radius}',
     ]
     try:
         dargs, _ = get_args_parser()
@@ -947,6 +986,12 @@ def _build_eval_env(eval_seed):
         e = gym.make(dargs.env, args=dargs)
     finally:
         sys.argv = sys_argv_backup
+    # Patch deform.render() at construction so eval-video frames AND the
+    # in-step make_final_steps settle frames both use the obs-camera
+    # projection (fov=60), matching what capture_rgb_depth feeds the
+    # policy. Unconditional: cheap, idempotent, and prevents any future
+    # render call in this env from silently using dedo's fov≈90 default.
+    patch_deform_render_to_obs_camera(resolve_deform(e))
     e = RetryResetEnv(e)
     e.seed(eval_seed)
     return e, dargs
@@ -1040,28 +1085,10 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
 
     e, dargs = _build_eval_env(eval_seed)
     deform = resolve_deform(e)
-
-    # Monkey-patch deform.render() to use the obs-camera projection
-    # (fov=60) instead of dedo's DEFAULT_CAM_PROJECTION (fov≈90), so
-    # both policy-phase frames AND make_final_steps settle frames render
-    # through the same projection. Mirrors collect_bc_demos.py exactly —
-    # view matrix is already correct (deform._cam_viewmat set at env
-    # construction); this only fixes the projection.
-    if record_video_episodes > 0:
-        import types as _types
-        import pybullet as _pb
-        _MATCHED_PROJ = proj_matrix()
-
-        def _matched_render(self, mode='rgb_array', width=300, height=300):
-            assert mode == 'rgb_array'
-            _, _, rgba, _, _ = self.sim.getCameraImage(
-                width=width, height=height,
-                renderer=_pb.ER_BULLET_HARDWARE_OPENGL,
-                viewMatrix=self._cam_viewmat,
-                projectionMatrix=_MATCHED_PROJ)
-            return np.asarray(rgba)[:, :, :3]
-
-        deform.render = _types.MethodType(_matched_render, deform)
+    # `deform.render` is already patched to use the obs-camera projection
+    # (see _build_eval_env above) — policy-phase frames AND
+    # make_final_steps settle frames all render through fov=60, matching
+    # `capture_rgb_depth`. No per-call patching needed here.
 
     # Per-episode RGB frame buffers populated only for the first
     # `record_video_episodes` rollouts. Outer list is one entry per
@@ -1297,6 +1324,10 @@ _CKPT_METADATA_TEMPLATE = {
     # termination policy without the demo dir.
     'episode_tail_frames': int(args.episode_tail_frames),
     'max_episode_len_safety_cap': int(args.max_episode_len),
+    # Hanger-goal randomization radius the demos were collected under.
+    # Saved into the ckpt so eval_diffusion_bc.py can rebuild a parity
+    # eval env without the demo dir. 0.0 = fixed goal (legacy v3 behavior).
+    'randomize_goal_radius': float(eval_randomize_goal_radius),
 }
 
 
