@@ -40,7 +40,7 @@ Usage
   python experiments/hang_obs_exp/scripts/view_demo_inspect.py
   python experiments/hang_obs_exp/scripts/view_demo_inspect.py --seed 42
 """
-import sys, os, time, argparse, threading, io, pickle, copy
+import sys, os, time, argparse, threading, io, pickle, copy, socket
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -126,6 +126,45 @@ parser.add_argument('--export_pcd_width', type=int, default=100,
 parser.add_argument('--export_pcd_max_points', type=int, default=2048,
                     help='Random subsample each step pcd down to this many '
                          'points before adding to the trajectory. 0 = keep all.')
+# Live ZED real-camera pointcloud (from scripts/zed_pcd_publisher.py
+# running on the ZED host). Rendered under /real_workspace and posed
+# interactively via GUI sliders to align with the sim cloud.
+parser.add_argument('--zed_stream', type=str, default='',
+                    help='HOST:PORT of a zed_pcd_publisher TCP stream '
+                         '(e.g. 192.168.1.50:5556). Empty = disabled.')
+parser.add_argument('--zed_pcd_file', type=str, default='',
+                    help='Path to a .npy the zed_pcd_publisher rewrites '
+                         'atomically (--mode file). Tailed by mtime. '
+                         'Used only if --zed_stream is empty.')
+parser.add_argument('--zed_max_points', type=int, default=20000,
+                    help='Viewer-side safety subsample of each ZED frame.')
+parser.add_argument('--zed_cam_x', type=float, default=0.0,
+                    help='Initial ZED cloud pose in the Franka world '
+                         'frame (m). Live-editable via GUI slider.')
+parser.add_argument('--zed_cam_y', type=float, default=0.0)
+parser.add_argument('--zed_cam_z', type=float, default=0.0)
+parser.add_argument('--zed_cam_yaw', type=float, default=0.0,
+                    help='Initial ZED cloud yaw/pitch/roll (deg), applied '
+                         'Rz@Ry@Rx, before the xyz offset.')
+parser.add_argument('--zed_cam_pitch', type=float, default=0.0)
+parser.add_argument('--zed_cam_roll', type=float, default=0.0)
+# Camera-frame trajectory overlay. Same sim-format pkl schema as
+# --export_traj but with obs in the sim CAMERA frame. Rendered under a
+# /sim_scene/cam frame at cam_pos*sim_scale (so the camera origin scales
+# + moves with the sliders, as expected) with rotation cam_wxyz; this
+# composes to the SAME world transform as the sim-world --export_traj,
+# so a correct camframe conversion overlays it exactly at any sim_scale.
+parser.add_argument('--cam_traj', type=str, default='',
+                    help='Path to a camera-frame rollout pkl to overlay '
+                         '(verifies the sim-world -> camera-frame '
+                         'transform while you calibrate to real).')
+parser.add_argument('--cam_pos', type=float, nargs=3,
+                    default=[9.8618, -9.8618, 6.7202],
+                    help='Sim camera origin in sim-world coords.')
+parser.add_argument('--cam_wxyz', type=float, nargs=4,
+                    default=[-0.6242, 0.6812, 0.2821, -0.2585],
+                    help='Sim camera orientation, viser wxyz quaternion '
+                         '(= R_cam_to_world).')
 extra = parser.parse_args()
 
 # Build dedo args. cam_resolution=0 forces low-dim grip obs (the wrapper
@@ -871,6 +910,18 @@ if extra.export_traj:
         print(f'[inspect] loaded exported trajectory: '
               f"{imported_traj['summary']}")
 
+cam_traj = None
+_cam_pose_pos = np.asarray(extra.cam_pos, dtype=np.float64)
+_cam_pose_wxyz = np.asarray(extra.cam_wxyz, dtype=np.float64)
+if extra.cam_traj:
+    cam_traj = _load_exported_traj(extra.cam_traj)
+    if cam_traj is not None:
+        print(f"[inspect] loaded CAMERA-FRAME trajectory: "
+              f"{cam_traj['summary']}")
+        print(f'[inspect]   cam pose: pos={_cam_pose_pos.tolist()} '
+              f'wxyz={_cam_pose_wxyz.tolist()} (sim-world coords; '
+              f'origin scales with sim_scale)')
+
 # Slightly darker than the workspace box colors so the trajectories
 # stand out against them.
 _add_recorded_traj('traj_right', traj_right,
@@ -905,7 +956,18 @@ if imported_traj is not None and imported_traj['kind'] == 'realworld':
 _imp_traj = imported_traj if (imported_traj is not None
                               and imported_traj.get('kind') == 'sim') else None
 _imp_enabled = _imp_traj is not None
-imp_n = int(len(_imp_traj['ee_left'])) if _imp_traj is not None else 0
+# Camera-frame overlay (same schema; obs in the sim camera frame).
+_cam_traj = cam_traj if (cam_traj is not None
+                         and cam_traj.get('kind') == 'sim') else None
+_cam_enabled = _cam_traj is not None
+cam_n = int(len(_cam_traj['ee_left'])) if _cam_traj is not None else 0
+_cam_visible = True                # whole-overlay toggle (/sim_scene/cam)
+_cam_root_handle = None
+# Shared replay: one frame index drives both overlays in lockstep so a
+# correct camframe conversion stays glued to the sim-world import.
+_replay_enabled = _imp_enabled or _cam_enabled
+_sim_imp_n = int(len(_imp_traj['ee_left'])) if _imp_traj is not None else 0
+imp_n = max(_sim_imp_n, cam_n)
 imp_frame = 0                      # main-loop-owned current replay frame
 _imported_pcd_visible = True       # mirrors the GUI checkbox
 _imported_pcd_handle = None
@@ -989,9 +1051,9 @@ def update_imported_replay(frame, sim_s):
     it = _imp_traj
     if it is None:
         return
-    f = int(np.clip(frame, 0, imp_n - 1))
     L = np.asarray(it['ee_left'],  dtype=np.float32)
     R = np.asarray(it['ee_right'], dtype=np.float32)
+    f = int(np.clip(frame, 0, len(L) - 1))
     h_left = server.scene.add_icosphere(
         '/sim_scene/imported_traj/ee_left',
         radius=0.18 * sim_s,
@@ -1020,6 +1082,87 @@ def update_imported_replay(frame, sim_s):
             pass
 
 
+def rebuild_cam_traj_nodes(sim_s):
+    """(Re)build the camera-frame overlay under /sim_scene/cam.
+
+    The cam frame sits at cam_pos*sim_s (so the camera origin scales +
+    moves with the sliders, as expected) with rotation cam_wxyz; child
+    points are camera-frame coords * sim_s. Composing the /sim_scene
+    parent (offset + Rz(yaw)) with this gives exactly
+    offset + Rz(yaw) @ (sim_s * (R_cam @ p_cam + cam_pos)) — identical
+    to _sim_point_to_world of the sim-world import, so a correct
+    camframe conversion overlays it at any sim_scale. Colors differ so
+    any residual misalignment is visible."""
+    global _cam_root_handle
+    it = _cam_traj
+    if it is None:
+        return
+    _cam_root_handle = server.scene.add_frame(
+        '/sim_scene/cam',
+        position=tuple(float(x) for x in _cam_pose_pos * sim_s),
+        wxyz=tuple(float(x) for x in _cam_pose_wxyz),
+        show_axes=True,
+        axes_length=0.6 * sim_s, axes_radius=0.02 * sim_s)
+    server.scene.add_label('/sim_scene/cam/label', text='sim camera',
+                           position=(0.0, 0.0, 0.0))
+    L = np.asarray(it['ee_left'],  dtype=np.float32)
+    R = np.asarray(it['ee_right'], dtype=np.float32)
+    if len(L) >= 2:
+        server.scene.add_line_segments(
+            '/sim_scene/cam/left', points=_polyline_segments(L) * sim_s,
+            colors=np.asarray((170, 90, 170), dtype=np.uint8),
+            line_width=1.5)
+        server.scene.add_line_segments(
+            '/sim_scene/cam/right', points=_polyline_segments(R) * sim_s,
+            colors=np.asarray((120, 100, 170), dtype=np.uint8),
+            line_width=1.5)
+    g = it.get('goal')
+    if g is not None:
+        server.scene.add_icosphere(
+            '/sim_scene/cam/goal', radius=0.30 * sim_s,
+            position=tuple(float(x) for x in np.asarray(g, np.float32) * sim_s),
+            color=(255, 255, 255))
+        server.scene.add_label(
+            '/sim_scene/cam/goal/label', text='cam goal',
+            position=(0.0, 0.0, 0.4 * sim_s))
+    update_cam_replay(imp_frame, sim_s)
+    try:
+        _cam_root_handle.visible = bool(_cam_visible)
+    except Exception:
+        pass
+
+
+def update_cam_replay(frame, sim_s):
+    """Per-frame camera-frame EE markers + that frame's pcd, under
+    /sim_scene/cam (so they inherit the cam pose). Distinct colors from
+    the sim-world import. Whole-overlay visibility is governed by the
+    /sim_scene/cam parent frame, so per-tick child re-adds can't
+    override a hidden overlay."""
+    it = _cam_traj
+    if it is None:
+        return
+    L = np.asarray(it['ee_left'],  dtype=np.float32)
+    R = np.asarray(it['ee_right'], dtype=np.float32)
+    f = int(np.clip(frame, 0, len(L) - 1))
+    server.scene.add_icosphere(
+        '/sim_scene/cam/ee_left', radius=0.18 * sim_s,
+        position=tuple(float(x) for x in L[f] * sim_s),
+        color=(255, 60, 200))
+    server.scene.add_icosphere(
+        '/sim_scene/cam/ee_right', radius=0.18 * sim_s,
+        position=tuple(float(x) for x in R[f] * sim_s),
+        color=(255, 230, 0))
+    pc = it.get('pcd')
+    if pc is not None and len(pc):
+        fp = int(np.clip(f, 0, pc.shape[0] - 1))
+        pts = np.asarray(pc[fp], dtype=np.float32) * sim_s
+        col = np.broadcast_to(np.asarray((255, 150, 40), dtype=np.uint8),
+                              pts.shape).copy()
+        server.scene.add_point_cloud(
+            '/sim_scene/cam/pcd', points=pts, colors=col,
+            point_size=max(1e-4, 0.015 * sim_s))
+
+
 # --------------------------------------------------------------------------
 # Real-world goal point. Lives under /real_workspace so it sits in the
 # franka world frame (NOT scaled/rotated by --sim_*). Magenta to stand
@@ -1037,6 +1180,118 @@ server.scene.add_label(
     position=(0.0, 0.0, 0.04),
 )
 print(f'[inspect] real-world goal plotted at {_real_goal_pos}')
+
+
+# --------------------------------------------------------------------------
+# Live ZED real-camera pointcloud. A background thread pulls frames from
+# scripts/zed_pcd_publisher.py (TCP stream or atomically-rewritten .npy)
+# and parks the latest cloud in a locked slot; the main loop transforms
+# it by the GUI pose sliders and renders it under /real_workspace so it
+# can be visually aligned with the sim cloud. Stdlib + numpy only.
+# --------------------------------------------------------------------------
+_zed_enabled = bool(extra.zed_stream) or bool(extra.zed_pcd_file)
+_zed_lock = threading.Lock()
+_zed_slot = {'pts': None, 'col': None, 'seq': 0, 'status': 'off'}
+_zed_visible = True                # mirrors the GUI checkbox
+_zed_handle = None                 # current /real_workspace/zed_pcd node
+
+
+def _rpy_matrix(yaw_deg, pitch_deg, roll_deg):
+    """Rz(yaw) @ Ry(pitch) @ Rx(roll), degrees -> (3,3) float64."""
+    y, p, r = np.radians([yaw_deg, pitch_deg, roll_deg])
+    cz, sz = np.cos(y), np.sin(y)
+    cy, sy = np.cos(p), np.sin(p)
+    cx, sx = np.cos(r), np.sin(r)
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=np.float64)
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=np.float64)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=np.float64)
+    return Rz @ Ry @ Rx
+
+
+def _zed_store(xyzrgb):
+    """(N,6) float32 [xyz|rgb 0..1] -> locked slot (subsampled)."""
+    a = np.asarray(xyzrgb, dtype=np.float32)
+    if a.ndim != 2 or a.shape[1] < 3 or a.shape[0] == 0:
+        return
+    mx = int(extra.zed_max_points)
+    if mx > 0 and a.shape[0] > mx:
+        a = a[np.random.choice(a.shape[0], mx, replace=False)]
+    pts = a[:, :3].copy()
+    if a.shape[1] >= 6:
+        col = np.clip(a[:, 3:6] * 255.0, 0, 255).astype(np.uint8)
+    else:
+        col = np.broadcast_to(np.uint8([0, 200, 255]),
+                              pts.shape).copy()
+    with _zed_lock:
+        _zed_slot['pts'] = pts
+        _zed_slot['col'] = col
+        _zed_slot['seq'] += 1
+        _zed_slot['status'] = f"live ({pts.shape[0]} pts)"
+
+
+def _zed_set_status(msg):
+    with _zed_lock:
+        _zed_slot['status'] = msg
+
+
+def _zed_tcp_loop(host, port):
+    while True:
+        try:
+            _zed_set_status(f'connecting {host}:{port}…')
+            sock = socket.create_connection((host, port), timeout=5.0)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            _zed_set_status(f'connected {host}:{port}')
+
+            def _recvall(n):
+                chunks = b''
+                while len(chunks) < n:
+                    b = sock.recv(n - len(chunks))
+                    if not b:
+                        raise ConnectionError('stream closed')
+                    chunks += b
+                return chunks
+
+            while True:
+                hdr = _recvall(4)
+                ln = int.from_bytes(hdr, 'big')
+                payload = _recvall(ln)
+                arr = np.load(io.BytesIO(payload), allow_pickle=False)
+                _zed_store(arr)
+        except Exception as e:
+            _zed_set_status(f'reconnecting ({e!r})')
+            time.sleep(2.0)
+
+
+def _zed_file_loop(path):
+    p = Path(path).expanduser()
+    last_mtime = -1.0
+    while True:
+        try:
+            if p.exists():
+                m = p.stat().st_mtime
+                if m != last_mtime:
+                    last_mtime = m
+                    arr = np.load(p, allow_pickle=False)
+                    _zed_store(arr)
+                    _zed_set_status(f'file ok ({p.name})')
+            else:
+                _zed_set_status(f'waiting for {p}')
+        except Exception as e:
+            _zed_set_status(f'file err ({e!r})')
+        time.sleep(0.1)
+
+
+if _zed_enabled:
+    if extra.zed_stream:
+        _h, _, _p = extra.zed_stream.partition(':')
+        threading.Thread(target=_zed_tcp_loop,
+                         args=(_h, int(_p or 5556)),
+                         daemon=True).start()
+        print(f'[inspect] ZED stream thread -> {extra.zed_stream}')
+    else:
+        threading.Thread(target=_zed_file_loop,
+                         args=(extra.zed_pcd_file,), daemon=True).start()
+        print(f'[inspect] ZED file-tail thread -> {extra.zed_pcd_file}')
 
 
 # --------------------------------------------------------------------------
@@ -1269,7 +1524,7 @@ with server.gui.add_folder('Playback'):
 # Playback folder above (different length/seed).
 btn_imp_play = btn_imp_back = btn_imp_fwd = None
 sld_imp_frame = sld_imp_hz = gui_imp_status = None
-if _imp_enabled:
+if _replay_enabled:
     with server.gui.add_folder('Imported replay'):
         btn_imp_play = server.gui.add_button('Pause / Play import')
         btn_imp_back = server.gui.add_button('Step -1')
@@ -1541,10 +1796,80 @@ def _(_event):
             pass
 
 
-# Build the sim-frame imported trajectory now that the GUI sliders +
-# pcd toggle exist (no-op for real-world-frame / no import). Rebuilt on
-# sim_scale changes in the main loop.
+# Camera-frame overlay visibility. Toggling the /sim_scene/cam parent
+# frame hides the whole subtree (pcd + EE + goal + axes) regardless of
+# the per-tick child re-adds.
+chk_cam_show = None
+if _cam_enabled:
+    chk_cam_show = server.gui.add_checkbox(
+        'Show camframe overlay', initial_value=_cam_visible,
+        hint='The --cam_traj rollout rendered through the sim camera '
+             'pose. Should sit exactly on the sim-world import if the '
+             'camera-frame conversion is correct.')
+
+    @chk_cam_show.on_update
+    def _(event):
+        global _cam_visible
+        _cam_visible = bool(event.target.value)
+        if _cam_root_handle is not None:
+            try:
+                _cam_root_handle.visible = _cam_visible
+            except Exception:
+                pass
+
+
+# Live ZED real-camera cloud controls. Pose sliders are read per-tick by
+# the main loop (no on_update needed), mirroring the sim_scale pattern.
+chk_zed_show = sld_zed_size = gui_zed_status = None
+sld_zed_x = sld_zed_y = sld_zed_z = None
+sld_zed_yaw = sld_zed_pitch = sld_zed_roll = None
+if _zed_enabled:
+    with server.gui.add_folder('ZED real cloud'):
+        chk_zed_show = server.gui.add_checkbox(
+            'Show ZED cloud', initial_value=_zed_visible,
+            hint='Live real-camera pointcloud under /real_workspace. '
+                 'Pose it with the sliders below to align it onto the '
+                 'sim cloud (or move the sim with Sim → Real scale).')
+        sld_zed_size = server.gui.add_slider(
+            'ZED point size (m)', min=0.001, max=0.03, step=0.001,
+            initial_value=0.006)
+        sld_zed_x = server.gui.add_slider(
+            'ZED x (m)', min=-3.0, max=3.0, step=0.005,
+            initial_value=float(extra.zed_cam_x))
+        sld_zed_y = server.gui.add_slider(
+            'ZED y (m)', min=-3.0, max=3.0, step=0.005,
+            initial_value=float(extra.zed_cam_y))
+        sld_zed_z = server.gui.add_slider(
+            'ZED z (m)', min=-3.0, max=3.0, step=0.005,
+            initial_value=float(extra.zed_cam_z))
+        sld_zed_yaw = server.gui.add_slider(
+            'ZED yaw (deg)', min=-180.0, max=180.0, step=0.5,
+            initial_value=float(extra.zed_cam_yaw))
+        sld_zed_pitch = server.gui.add_slider(
+            'ZED pitch (deg)', min=-180.0, max=180.0, step=0.5,
+            initial_value=float(extra.zed_cam_pitch))
+        sld_zed_roll = server.gui.add_slider(
+            'ZED roll (deg)', min=-180.0, max=180.0, step=0.5,
+            initial_value=float(extra.zed_cam_roll))
+        gui_zed_status = server.gui.add_text(
+            'ZED', initial_value='off', disabled=True)
+
+    @chk_zed_show.on_update
+    def _(event):
+        global _zed_visible
+        _zed_visible = bool(event.target.value)
+        if _zed_handle is not None:
+            try:
+                _zed_handle.visible = _zed_visible
+            except Exception:
+                pass
+
+
+# Build the sim-frame imported trajectory + camera-frame overlay now
+# that the GUI sliders + toggles exist (each a no-op if not loaded).
+# Both are rebuilt on sim_scale changes in the main loop.
 rebuild_imported_traj_nodes(float(extra.sim_scale))
+rebuild_cam_traj_nodes(float(extra.sim_scale))
 
 
 # Cross-thread state. Viser callbacks fire on its own thread; we just
@@ -1758,6 +2083,42 @@ def do_reset():
           f'T={T}, peak |vel|={float(np.abs(traj).max()):.3f} m/s')
 
 
+def update_zed_cloud():
+    """Pull the latest ZED frame, transform by the GUI pose sliders, and
+    render it under /real_workspace. Cheap (cloud is pre-subsampled);
+    re-adds the same node each tick so it tracks slider edits."""
+    global _zed_handle
+    # All ZED widgets are created together under `if _zed_enabled:`; the
+    # explicit None-checks also narrow the optional handles for static
+    # analysis.
+    if (not _zed_enabled or gui_zed_status is None
+            or sld_zed_size is None
+            or sld_zed_x is None or sld_zed_y is None or sld_zed_z is None
+            or sld_zed_yaw is None or sld_zed_pitch is None
+            or sld_zed_roll is None):
+        return
+    with _zed_lock:
+        pts = _zed_slot['pts']
+        col = _zed_slot['col']
+        status = _zed_slot['status']
+    gui_zed_status.value = status
+    if pts is None or len(pts) == 0:
+        return
+    R = _rpy_matrix(sld_zed_yaw.value, sld_zed_pitch.value,
+                    sld_zed_roll.value)
+    t = np.array([sld_zed_x.value, sld_zed_y.value, sld_zed_z.value],
+                 dtype=np.float64)
+    world = (np.asarray(pts, dtype=np.float64) @ R.T + t).astype(np.float32)
+    _zed_handle = server.scene.add_point_cloud(
+        '/real_workspace/zed_pcd',
+        points=world, colors=np.asarray(col, dtype=np.uint8),
+        point_size=max(1e-4, float(sld_zed_size.value)))
+    try:
+        _zed_handle.visible = bool(_zed_visible)
+    except Exception:
+        pass
+
+
 _last_applied_sim_scale = float(extra.sim_scale)
 _imp_last_t = time.time()        # imported-replay frame-advance pacer
 try:
@@ -1773,12 +2134,13 @@ try:
         if abs(cur_S - _last_applied_sim_scale) > 1e-6:
             rebuild_static_sim_nodes(cur_S)
             rebuild_imported_traj_nodes(cur_S)
+            rebuild_cam_traj_nodes(cur_S)
             _last_applied_sim_scale = cur_S
 
         # Imported-rollout replay: advance/scrub on its own Hz, decoupled
         # from the scripted-env playback below. (Widget None-checks also
         # narrow the optional GUI handles for static analysis.)
-        if (_imp_enabled and sld_imp_hz is not None
+        if (_replay_enabled and sld_imp_hz is not None
                 and sld_imp_frame is not None
                 and gui_imp_status is not None):
             imp_playing, imp_nudge, imp_scrub = consume_imp_flags()
@@ -1794,6 +2156,7 @@ try:
                 imp_frame = (imp_frame + 1) % imp_n      # loop the rollout
                 _imp_last_t = now
             update_imported_replay(imp_frame, cur_S)
+            update_cam_replay(imp_frame, cur_S)
             try:
                 if int(sld_imp_frame.value) != imp_frame:
                     sld_imp_frame.value = imp_frame
@@ -1802,6 +2165,10 @@ try:
             _imp_tag = ('PLAY' if imp_playing else 'PAUSE')
             gui_imp_status.value = (
                 f'[{_imp_tag}] frame {imp_frame}/{imp_n - 1}')
+
+        # Live ZED real cloud (re-rendered every tick so it tracks pose
+        # slider edits + new frames from the publisher).
+        update_zed_cloud()
 
         # Pending action for this tick.
         if step < T:
