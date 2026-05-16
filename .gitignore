@@ -135,3 +135,6 @@ dmypy.json
 .pyre/
 
 logs/
+
+# Large sample trajectory file (>100MB, kept locally only — exceeds GitHub limit)
+experiments/hang_obs_exp/sample_trajectory_format.pkl
