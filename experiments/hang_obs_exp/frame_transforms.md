@@ -181,7 +181,7 @@ where MAX_ACT_VEL_real = MAX_ACT_VEL_sim × scale = 4.0 × 0.045 = 0.18 m/s
 
 ## Specific values for cam_viewmat = [14, −5, 45, 0, 0, 5.5]
 
-This is the camera used for all v3/v4 demo collection and evaluation.
+This is the camera used for v3 demo collection and evaluation.
 The script reads `cam_viewmat` from each pkl, so these numbers are
 for reference and verification only.
 
