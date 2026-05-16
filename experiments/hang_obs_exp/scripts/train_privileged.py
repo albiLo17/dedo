@@ -361,6 +361,25 @@ parser.add_argument('--max_episode_len', type=int, default=200,
                          'dedo default is 200; lower (e.g. 100) cuts '
                          'wall-clock and avoids dithering after the cloth '
                          'has already reached the pole region.')
+parser.add_argument('--ctrl_freq', type=float, default=15.0,
+                    help='Control frequency in Hz for training + eval + '
+                         'scripted-demo collection. Implemented by setting '
+                         'sim_steps_per_action = round(sim_freq/ctrl_freq) '
+                         'on the dedo args. 15 Hz is the default; dedo\'s '
+                         'native default is 62.5 Hz. Lower ctrl_freq -> '
+                         'each PPO action covers more sim time, so the '
+                         'policy makes fewer / coarser decisions per '
+                         'episode (matters when comparing against BC '
+                         'demos collected at a specific Hz). The actual '
+                         'achieved freq is saved in config.json under '
+                         'reward_def.ctrl_freq for downstream parity '
+                         'checks.')
+parser.add_argument('--sim_freq', type=int, default=500,
+                    help='PyBullet physics frequency. Default 500 matches '
+                         'dedo. Lower risks soft-body instability; raise '
+                         'only if ctrl_freq doesn\'t round cleanly '
+                         '(e.g. sim_freq=450 + ctrl_freq=15 -> exact '
+                         '15 Hz instead of 500/33 = 15.15 Hz).')
 parser.add_argument('--load_checkpoint', type=str, default=None,
                     help='Path to a previous run logdir (containing '
                          'agent.zip and vec_normalize.pkl) to resume '
@@ -383,6 +402,50 @@ if extra_args.no_adaptive_success:
 # Parse net_arch up front so it's available when wandb.run.name is
 # built (which happens before policy construction below).
 _net_arch_list = [int(x) for x in extra_args.net_arch.split(',') if x.strip()]
+
+# Resume-time auto-restore of MAX_ACT_VEL. If the user is resuming from
+# a previous run's checkpoint and didn't explicitly pass --max_act_vel,
+# read it back from the checkpoint's config.json. Without this, a
+# resume run silently falls back to dedo's default 10.0 while the
+# original run might have been at e.g. 4.1 — action scales diverge
+# between training and continuation rollouts, eval becomes inconsistent
+# with the saved policy. An explicit user-supplied --max_act_vel still
+# takes precedence (overriding the saved value is sometimes intentional,
+# e.g. for sensitivity studies).
+if extra_args.load_checkpoint and extra_args.max_act_vel is None:
+    import json as _json_resume
+    _ckpt_cfg = os.path.join(extra_args.load_checkpoint, 'config.json')
+    if os.path.exists(_ckpt_cfg):
+        try:
+            with open(_ckpt_cfg) as _f:
+                _saved_cfg = _json_resume.load(_f)
+            # `dump_run_config` writes the active runtime MAX_ACT_VEL
+            # under reward_def.dedo_max_act_vel (already resolved from
+            # 'auto' or float to a concrete number). The CLI raw value
+            # at extra.max_act_vel may be 'auto' or None, so we prefer
+            # the resolved class-attribute snapshot.
+            _saved_mav = (_saved_cfg.get('reward_def', {})
+                          .get('dedo_max_act_vel'))
+            if (_saved_mav is not None
+                    and abs(float(_saved_mav) - 10.0) > 1e-6):
+                extra_args.max_act_vel = str(float(_saved_mav))
+                print(f'[resume] auto-restored '
+                      f'--max_act_vel={extra_args.max_act_vel} '
+                      f'from {_ckpt_cfg}. Pass --max_act_vel explicitly '
+                      f'to override.')
+            else:
+                print(f'[resume] config.json shows MAX_ACT_VEL was at '
+                      f'dedo default ({_saved_mav}); no auto-restore '
+                      f'needed.')
+        except (ValueError, KeyError, OSError) as _e:
+            print(f'[resume] WARN: could not read max_act_vel from '
+                  f'{_ckpt_cfg}: {_e!r}. MAX_ACT_VEL stays at dedo '
+                  f'default — pass --max_act_vel manually if the '
+                  f'original run used a non-default value.')
+    else:
+        print(f'[resume] WARN: no config.json at {_ckpt_cfg}; '
+              f'cannot auto-restore MAX_ACT_VEL. Pass --max_act_vel '
+              f'explicitly if the original run used a non-default value.')
 
 # Parse the max_act_vel knob into a tag (None | 'auto' | float). Explicit
 # floats patch DeformEnv.MAX_ACT_VEL immediately; 'auto' defers until after
@@ -429,6 +492,22 @@ _sf_descr = (
     else 'dedo default (|last_rwd| < SUCCESS_REWARD_THRESHOLD, ~0.125 m)')
 print(f'[success-criterion] training = eval = BC scripted: {_sf_descr}')
 
+# Resolve ctrl_freq -> sim_steps_per_action. Rounding may shift the actual
+# achieved freq slightly (e.g. sim_freq=500 / ctrl_freq=15 -> 33 steps ->
+# 15.15 Hz). Print + record the actual value so config.json and any
+# downstream parity check sees the truth, not the requested target.
+_steps_per_action = max(1, int(round(extra_args.sim_freq / extra_args.ctrl_freq)))
+_actual_ctrl_freq = extra_args.sim_freq / _steps_per_action
+if abs(_actual_ctrl_freq - extra_args.ctrl_freq) / extra_args.ctrl_freq > 0.05:
+    print(f'[init] WARN: requested ctrl_freq={extra_args.ctrl_freq} Hz '
+          f'rounds to sim_steps_per_action={_steps_per_action} -> actual '
+          f'ctrl_freq={_actual_ctrl_freq:.3f} Hz (>5% deviation). Pick a '
+          f'--sim_freq that divides ctrl_freq more cleanly to fix.')
+else:
+    print(f'[init] ctrl_freq={extra_args.ctrl_freq} Hz -> '
+          f'sim_steps_per_action={_steps_per_action} '
+          f'(actual {_actual_ctrl_freq:.3f} Hz, sim_freq={extra_args.sim_freq})')
+
 # Build dedo args with cam_resolution=0 (wrapper takes care of geometry obs)
 sys.argv = [
     'train_privileged',
@@ -439,6 +518,8 @@ sys.argv = [
     f'--log_save_interval={extra_args.log_save_interval}',
     '--seed', str(extra_args.seed),
     '--max_episode_len', str(extra_args.max_episode_len),
+    f'--sim_freq={extra_args.sim_freq}',
+    f'--sim_steps_per_action={_steps_per_action}',
     # Lock cam_viewmat against preset_override_util — every env reset()
     # would otherwise clobber it with procedural_hang_cloth's preset
     # (yaw=314, target z=5.3), which hides the hanger once the cloth drops.
@@ -736,7 +817,13 @@ if not _resuming and extra_args.critic_warmup_rollouts > 0:
 # Persist a self-describing config.json + push to wandb.config so future
 # debugging never has to guess what reward this run optimized.
 dump_run_config(extra_args, dedo_args, dedo_args.logdir,
-                use_wandb=dedo_args.use_wandb)
+                use_wandb=dedo_args.use_wandb,
+                extra_metadata={
+                    'ctrl_freq_requested': float(extra_args.ctrl_freq),
+                    'ctrl_freq_actual': float(_actual_ctrl_freq),
+                    'sim_freq': int(extra_args.sim_freq),
+                    'sim_steps_per_action': int(_steps_per_action),
+                })
 
 # ---------------------------------------------------------------------------
 # Behavior cloning pretrain on scripted demos (huge unlock for sparse-reward
@@ -886,6 +973,21 @@ def _collect_demo_rollouts(args, obs_mode_str, num_episodes,
                 'obs_modes': [obs_mode_str],
                 'recorded_in': obs_mode_str,
                 'success_factor': extra_args.success_factor,
+                # Action-scale parity invariant. Demos store actions in
+                # `clip(traj / MAX_ACT_VEL, -1, 1)` — so loading these
+                # demos in a future run with a different MAX_ACT_VEL
+                # silently mistrains. _load_manual_demos refuses to
+                # proceed when this field disagrees with the active
+                # DeformEnv.MAX_ACT_VEL.
+                'max_act_vel': float(DeformEnv.MAX_ACT_VEL),
+                # Control-freq parity invariant. The waypoint trajectory
+                # was built at this Hz; loading these demos in a run at a
+                # different ctrl_freq means BC learns actions appropriate
+                # for one cadence while PPO rolls out at another.
+                # _load_manual_demos refuses to proceed on mismatch.
+                'ctrl_freq': float(ctrl_freq),
+                'sim_freq': int(args.sim_freq),
+                'sim_steps_per_action': int(args.sim_steps_per_action),
                 'len': len(ep_act),
                 'source': 'scripted',
             }
@@ -961,12 +1063,25 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
     out the wrong demos. We emit a single aggregate warning when we see
     any mismatch; legacy pkls without a stored `success_factor` only get
     a soft 'unknown' note."""
+    from dedo.envs.deform_env import DeformEnv as _DeformEnvForCheck
     obs_buf, act_buf = [], []
     rewards_per_ep = []  # filled if pkls have 'rewards' field
     n_files, n_success_demos = 0, 0
     n_pkls_missing_rewards = 0
     sf_train = extra_args.success_factor
     sf_mismatches, sf_unknown = 0, 0
+    # MAX_ACT_VEL parity: demos store actions in clip(traj / MAX_ACT_VEL,
+    # -1, 1). A training-time MAX_ACT_VEL different from the demos' value
+    # means the policy learns the wrong action scale — silent and
+    # catastrophic for BC. Track per-pkl values and refuse to proceed
+    # when any disagrees with the active training-time class attribute.
+    mav_train = float(_DeformEnvForCheck.MAX_ACT_VEL)
+    mav_per_pkl = []  # (fname, recorded_mav_or_None) for the post-loop check
+    # Same parity story for ctrl_freq: a 15 Hz demo's actions were planned
+    # to span 1/15s of sim time each; replaying them at 62.5 Hz advances
+    # the trajectory ~4x faster than intended.
+    ctrl_freq_train = float(_actual_ctrl_freq)
+    ctrl_freq_per_pkl = []
     for fname in sorted(os.listdir(demo_dir)):
         if not (fname.startswith('demo_') and fname.endswith('.pkl')):
             continue
@@ -979,6 +1094,13 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
                 sf_mismatches += 1
         else:
             sf_unknown += 1
+
+        # Track MAX_ACT_VEL — checked after the loop so we can emit a
+        # single aggregate error rather than spamming per-pkl.
+        mav_per_pkl.append((fname, float(d['max_act_vel'])
+                            if 'max_act_vel' in d else None))
+        ctrl_freq_per_pkl.append((fname, float(d['ctrl_freq'])
+                                  if 'ctrl_freq' in d else None))
 
         if only_success and not d.get('success', 0):
             print(f'[BC] {fname}: success=0, skipping '
@@ -1025,6 +1147,66 @@ def _load_manual_demos(demo_dir, obs_mode_str, only_success=False):
               f'flags may not reflect the training criterion — '
               f'--bc_demos_only_success could keep/drop the wrong demos. '
               f'Re-record with the current --success_factor to align.')
+
+    # MAX_ACT_VEL parity enforcement (strict, fails-loud).
+    mav_recorded = sorted({m for _, m in mav_per_pkl if m is not None})
+    mav_missing = [fn for fn, m in mav_per_pkl if m is None]
+    mav_mismatches = [fn for fn, m in mav_per_pkl
+                      if m is not None and abs(m - mav_train) > 1e-6]
+    if mav_mismatches:
+        # Sample a few filenames for the error message so the user can
+        # immediately spot-check.
+        _examples = ', '.join(mav_mismatches[:3])
+        _extra = (f' (+{len(mav_mismatches) - 3} more)'
+                  if len(mav_mismatches) > 3 else '')
+        raise RuntimeError(
+            f'[BC] action-scale mismatch: training MAX_ACT_VEL={mav_train} '
+            f'but {len(mav_mismatches)}/{len(mav_per_pkl)} demo pkl(s) '
+            f'were recorded under different value(s) {mav_recorded}. '
+            f'Demo actions are stored as clip(traj / MAX_ACT_VEL, -1, 1); '
+            f'loading them at a different MAX_ACT_VEL would silently '
+            f'mistrain the policy (BC pulls actor toward wrong absolute '
+            f'velocities). Example mismatched files: {_examples}{_extra}. '
+            f'Re-pass --max_act_vel={mav_recorded[0]} to match the demos, '
+            f'or re-record them under the current MAX_ACT_VEL.')
+    if mav_missing:
+        print(f'[BC] WARNING: {len(mav_missing)} demo pkl(s) lack a '
+              f'recorded `max_act_vel` field (legacy pkls). Cannot '
+              f'verify action-scale parity. Training will proceed under '
+              f'the assumption that they were recorded at MAX_ACT_VEL='
+              f'{mav_train} (the current setting). If that\'s wrong, '
+              f'BC will silently fail. Re-record under current settings '
+              f'to remove this warning.')
+
+    # ctrl_freq parity (strict, fails-loud — same rationale as max_act_vel).
+    ctrl_freq_recorded = sorted({round(f, 4) for _, f in ctrl_freq_per_pkl
+                                 if f is not None})
+    ctrl_freq_missing = [fn for fn, f in ctrl_freq_per_pkl if f is None]
+    ctrl_freq_mismatches = [fn for fn, f in ctrl_freq_per_pkl
+                            if f is not None
+                            and abs(f - ctrl_freq_train) > 1e-3]
+    if ctrl_freq_mismatches:
+        _examples = ', '.join(ctrl_freq_mismatches[:3])
+        _extra = (f' (+{len(ctrl_freq_mismatches) - 3} more)'
+                  if len(ctrl_freq_mismatches) > 3 else '')
+        raise RuntimeError(
+            f'[BC] control-freq mismatch: training ctrl_freq='
+            f'{ctrl_freq_train:.3f} Hz but {len(ctrl_freq_mismatches)}/'
+            f'{len(ctrl_freq_per_pkl)} demo pkl(s) were recorded under '
+            f'different value(s) {ctrl_freq_recorded}. Demos at a '
+            f'different ctrl_freq replay actions at the wrong speed, '
+            f'so BC pulls the actor toward action sequences that '
+            f'aren\'t physically realizable in 1/ctrl_freq seconds. '
+            f'Example mismatched files: {_examples}{_extra}. Re-pass '
+            f'--ctrl_freq={ctrl_freq_recorded[0]:.3f} to match the '
+            f'demos, or re-record them under the current ctrl_freq.')
+    if ctrl_freq_missing:
+        print(f'[BC] WARNING: {len(ctrl_freq_missing)} demo pkl(s) lack '
+              f'a recorded `ctrl_freq` field (legacy pkls). Cannot '
+              f'verify control-freq parity. Training will proceed under '
+              f'the assumption they were recorded at ctrl_freq='
+              f'{ctrl_freq_train:.3f} Hz (the current setting). '
+              f'Re-record under current settings to remove this warning.')
     if n_pkls_missing_rewards > 0:
         print(f'[BC] NOTE: {n_pkls_missing_rewards} demo pkl(s) lack a '
               f'per-step `rewards` field. Demo-based critic warmup '

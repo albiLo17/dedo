@@ -386,6 +386,33 @@ def probe_peak_demo_vel(dedo_args, n_probes=3, max_attempts=12):
 
 
 # ---------------------------------------------------------------------------
+# Per-episode max_episode_len computation. Mirrors collect_bc_demos.py
+# exactly: build the scripted hole-aware trajectory the demo controller
+# WOULD have run for the current cloth, then set the env cap to
+# `len(traj) + episode_tail_frames`. This makes eval episodes terminate at
+# the same control-step distribution as training demos, avoiding the OOD
+# tail where the diffusion policy drifts into pull-taut behavior.
+#
+# Returns None on any failure (no hole loop, NaN mesh, traj build error),
+# so the caller can fall back to a global safety cap.
+# ---------------------------------------------------------------------------
+def compute_per_episode_max_len(deform, ctrl_freq, tail_frames, safety_cap):
+    from dedo.demo_preset import build_traj, merge_traj
+    wp = build_hole_aware_waypoints(deform)
+    if wp is None:
+        return None
+    try:
+        _, va = build_traj(deform, wp, 'a', anchor_idx=0,
+                           ctrl_freq=ctrl_freq, robot=None)
+        _, vb = build_traj(deform, wp, 'b', anchor_idx=1,
+                           ctrl_freq=ctrl_freq, robot=None)
+        traj = merge_traj(va, vb)
+    except Exception:
+        return None
+    return min(int(len(traj)) + int(tail_frames), int(safety_cap))
+
+
+# ---------------------------------------------------------------------------
 # Wandb run-name autonaming.
 #
 # The wandb run name is the only thing visible in the runs table, in
