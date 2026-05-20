@@ -57,6 +57,7 @@ TASK_INFO = {
              'cloth/mask_4.obj',
              ],
     'HangProcCloth': ['procedural_hang_cloth'],
+    'HangProcClothReal': ['procedural_hang_cloth_real'],
     'BGarments': [],
     'Debug': ['cloth/apron_0_large.obj',
               'bags/backpack_0.obj',
@@ -144,6 +145,28 @@ SCENE_INFO = {
 
         },
         'goal_pos': [[0, 0.00, 8.2]],
+    },
+    'hangcloth_real': {
+        'entities': {
+            'urdf/hanger.urdf': {
+                'basePosition': [0.5, 0.0, 0.321],
+                # Rz(90°): rotate hanger so arms point in ±y, perpendicular to
+                # the cloth's +x approach direction (cloth is in the XZ plane).
+                # In the default orientation the arms are in ±x and the cloth
+                # would hit them head-on.
+                'baseOrientation': [0, 0, np.pi / 2],
+                'globalScaling': 0.45,
+
+            },
+            'urdf/tallrod.urdf': {
+                'basePosition': [0.5, 0.0, -0.039],
+                'baseOrientation': [0, 0, 0],
+                'globalScaling': 0.45,
+                'useTexture': True,
+            },
+
+        },
+        'goal_pos': [[0.5, 0.0, 0.330]],
     },
     'button': {
         'entities': {
@@ -255,7 +278,33 @@ DEFORM_INFO = {
         'deform_scale': 3,
         'deform_elastic_stiffness': 50,
         'deform_bending_stiffness': 1,
-        'deform_damping_stiffness': 0.01,
+        'deform_damping_stiffness': 1,  # sim2real: damps billow/flutter
+        'cam_viewmat': [8.8, -12.6, 314, -0.4, 0.6, 5.3],
+        'plane_texture_file': 'textures/plane/brown_yellow_carpet.jpg',
+        'rigid_texture_file': "textures/rigid/lightwood.jpg",
+        'deform_texture_file': 'textures/deform/pb_greenleaves.png',
+    },
+    'procedural_hang_cloth_real': {
+        # Start cloth high enough that even the tallest cloth (h=1.0,
+        # scale=0.135 → bottom at init_z - 0.135) clears the peg tip
+        # (z≈0.344) during the horizontal +x approach (bottom ≥ 0.415).
+        'deform_init_pos': [0.275, 0.0, 0.55],
+        'deform_init_ori': [0, 0, 0],
+        'deform_scale': 0.135,
+        # At deform_scale=0.135 the cloth is ~22x smaller than the original
+        # scale=3 hangcloth. With g and mass fixed, relative sag scales as
+        # M*g/(k*L): keeping M=1,k=50 collapses the cloth; pure k*22 (=1100)
+        # holds it but explodes the explicit spring solver at dt=1/500.
+        # Fix splits the ~22x sag compensation across mass and stiffness so
+        # k stays in the proven-stable 50-150 band, and raises sim_freq for
+        # the unavoidably-faster springs (pass --sim_freq 1000).
+        'deform_mass': 0.1,                 # 10x lighter -> 10x less sag
+        'deform_elastic_stiffness': 120,    # 2.4x stiffer -> ~24x total
+        # Bending resists out-of-plane folding; at 22x smaller scale a low
+        # value lets the sheet crumple onto itself. Scaled up the same way
+        # as elastic so the cloth hangs as a sheet, not wadded paper.
+        'deform_bending_stiffness': 20,
+        'deform_damping_stiffness': 0.1,    # damps wrinkle jitter
         'cam_viewmat': [8.8, -12.6, 314, -0.4, 0.6, 5.3],
         'plane_texture_file': 'textures/plane/brown_yellow_carpet.jpg',
         'rigid_texture_file': "textures/rigid/lightwood.jpg",
