@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import math
 import os
 import pickle
 import sys
@@ -179,7 +180,16 @@ parser.add_argument('--video_render_size', type=int, default=300,
                          'Independent of the policy obs resolution — '
                          'this is just what the wandb player shows. '
                          'Matches HangVideoCallback default (PPO runs).')
-parser.add_argument('--video_fps', type=int, default=30)
+parser.add_argument('--video_fps', type=int, default=None,
+                    help='Playback FPS for eval-rollout MP4s. Default '
+                         '(None) auto-sets to the demos\' recorded '
+                         'ctrl_freq so playback matches sim wall-clock '
+                         'time — same convention as collect_bc_demos.py\'s '
+                         '--debug_fps. Pass an explicit int to override '
+                         '(e.g. 30 for smoother scrubbing at 2x sim speed; '
+                         'collect-time debug videos use 15 by default so '
+                         'matching keeps eval and collection videos '
+                         'visually comparable).')
 parser.add_argument('--settle_frame_stride', type=int, default=2,
                     help='Sub-sample the post-settle gravity-phase frames '
                          'captured inside make_final_steps. 2 matches '
@@ -208,6 +218,28 @@ parser.add_argument('--resume', type=str, default=None,
                          '(obs_horizon/pred_horizon/etc.) must match the '
                          'ckpt — load_state_dict will error out on shape '
                          'mismatch.')
+parser.add_argument('--eval_only', action='store_true',
+                    help='Skip training entirely; load --resume checkpoint '
+                         'and only run the final eval ('
+                         '--n_final_eval_episodes episodes). Useful for '
+                         're-scoring a checkpoint after fixing eval-time '
+                         'bugs (e.g. demo_speed time extension, action '
+                         'clip tightening) without paying for retraining. '
+                         'Requires --resume. Per-epoch eval (and '
+                         'policy_best.pt tracking) is also skipped — '
+                         'only the final-eval block at the end runs.')
+parser.add_argument('--eval_all_in', type=str, default=None,
+                    help='Directory containing policy_ep<NNNN>.pt '
+                         'checkpoints. When set, skips training and runs '
+                         'eval (--n_eval_episodes episodes) on each '
+                         'checkpoint in epoch order, logging metrics to '
+                         'wandb keyed by epoch — recreates the '
+                         'mid-training eval curve with updated eval-time '
+                         'code (demo_speed time extension, video_fps fix). '
+                         'Reuses the same env build across checkpoints '
+                         'inside the loop so it\'s faster than re-running '
+                         'the script per checkpoint. Mutually exclusive '
+                         'with --resume; implies --eval_only.')
 parser.add_argument('--max_episode_len', type=int, default=200,
                     help='Safety ceiling on per-episode length. The actual '
                          'per-episode cap at eval is the scripted-traj '
@@ -261,6 +293,16 @@ parser.add_argument('--device', type=str, default=None,
                          'silicon, else cpu.')
 
 args = parser.parse_args()
+
+if args.eval_all_in and args.resume:
+    parser.error('--eval_all_in and --resume are mutually exclusive; '
+                 '--eval_all_in iterates over all policy_ep*.pt in the dir.')
+if args.eval_all_in:
+    # --eval_all_in always skips training; the per-checkpoint loop replaces
+    # the single final-eval block.
+    args.eval_only = True
+elif args.eval_only and not args.resume:
+    parser.error('--eval_only requires --resume to point at a checkpoint.')
 
 
 # =============================================================================
@@ -394,6 +436,13 @@ recorded_sim_steps_per_action: set = set()
 # demo pkls (not a CLI flag) since the policy trained on a specific spatial
 # distribution and eval must mirror it. Mixed values raise.
 recorded_randomize_goal_radii: set = set()
+# Demo-speed slowdown factor (1.0 = unmodified, 0.5 = half-speed commanded
+# velocities with 2x trajectory length). Demos with non-1.0 demo_speed have
+# more steps per episode AND smaller per-step displacements, so the eval env
+# needs a proportionally larger max_episode_len to give the policy enough
+# time to complete the motion. Treated like max_act_vel: pulled from pkls,
+# parity-checked, no CLI override.
+recorded_demo_speeds: set = set()
 # Per-demo episode lengths. Demos are collected with deform.max_episode_len
 # set per-episode to (traj_len + episode_tail_frames) — typically ~51 ctrl
 # steps at 15 Hz — so the training distribution covers only this window.
@@ -482,6 +531,10 @@ for fname in demo_paths:
         # produce false mismatches.
         recorded_randomize_goal_radii.add(
             round(float(d['randomize_goal_radius']), 6))
+    if 'demo_speed' in d:
+        # round to 6 dp; demo_speed is always 1/N (collected as
+        # 1.0 / int(round(1/speed))) so this is plenty.
+        recorded_demo_speeds.add(round(float(d['demo_speed']), 6))
     ep_ends.append(sum(len(a) for a in act_buf))
 
 if not obs_buf:
@@ -632,6 +685,26 @@ else:
           f'collected at a different ctrl_freq, eval will be inconsistent. '
           f'Re-collect to be safe.')
 
+# Auto-resolve --video_fps to match ctrl_freq so eval-rollout MP4s play
+# back at real-time sim speed. Frame capture happens once per env.step()
+# (i.e. at ctrl_freq), so encoding at video_fps == ctrl_freq is real-time.
+# Encoding at video_fps > ctrl_freq makes the video play SPED UP — which
+# is what was happening with the previous default of 30 (videos played at
+# ~2x sim speed at ctrl_freq~15 Hz). When the user passes --video_fps
+# explicitly, honor it.
+if args.video_fps is None:
+    args.video_fps = max(1, int(round(eval_ctrl_freq)))
+    print(f'[data] video_fps auto-set to {args.video_fps} '
+          f'(matches eval_ctrl_freq={eval_ctrl_freq:.3f} Hz for real-time '
+          f'playback)')
+else:
+    _expected = max(1, int(round(eval_ctrl_freq)))
+    if args.video_fps != _expected:
+        _ratio = args.video_fps / eval_ctrl_freq
+        print(f'[data] video_fps={args.video_fps} (CLI override); '
+              f'eval ctrl_freq={eval_ctrl_freq:.3f} Hz -> playback runs '
+              f'at {_ratio:.2f}x sim speed.')
+
 
 # ---------------------------------------------------------------------------
 # Pick the eval env's hanger-goal randomization radius. Same parity story as
@@ -660,6 +733,33 @@ else:
     eval_randomize_goal_radius = 0.0
     print(f'[data] no randomize_goal_radius in demos (legacy pkls); '
           f'using 0 (fixed goal, v3-and-earlier behavior)')
+
+
+# ---------------------------------------------------------------------------
+# Demo-speed parity. Same story as max_act_vel: the policy learned actions
+# at the recorded speed (smaller magnitudes + more steps when demo_speed<1)
+# so eval has to mirror it. Critical knob: eval's per-episode max length is
+# scaled by 1/demo_speed so a 0.5-speed-collected policy gets 2x the steps
+# to complete its motion. Without this, a slow policy runs out of time
+# before reaching the goal — exactly the symptom the user observed.
+# Legacy pkls (no field) are interpreted as demo_speed=1.0.
+# ---------------------------------------------------------------------------
+if len(recorded_demo_speeds) > 1:
+    raise RuntimeError(
+        f'[data] demos use mixed demo_speed values '
+        f'{sorted(recorded_demo_speeds)}. Each value implies a different '
+        f'commanded-velocity scale and a different episode-length budget; '
+        f'mixing them would train the policy on inconsistent action '
+        f'distributions. Re-collect into a clean directory with a single '
+        f'--demo_speed.')
+if recorded_demo_speeds:
+    eval_demo_speed = next(iter(recorded_demo_speeds))
+    print(f'[data] eval demo_speed (from demos) = {eval_demo_speed}'
+          f'{" (default; no slowdown)" if eval_demo_speed == 1.0 else ""}')
+else:
+    eval_demo_speed = 1.0
+    print(f'[data] no demo_speed in demos (legacy pkls); using 1.0 '
+          f'(no slowdown).')
 
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1243,14 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             safety_cap=args.max_episode_len)
         if _per_ep_max is None:
             _per_ep_max = eval_max_episode_len
+        # Demos collected at demo_speed<1 commanded smaller velocities AND
+        # were stretched to 1/demo_speed times the step count. The policy
+        # learned that distribution, so eval rollouts also need
+        # 1/demo_speed times the steps to complete the same motion.
+        # compute_per_episode_max_len rebuilds the scripted traj at FULL
+        # speed (it has no knowledge of demo_speed), so we scale here.
+        if eval_demo_speed != 1.0 and eval_demo_speed > 0:
+            _per_ep_max = int(math.ceil(_per_ep_max / eval_demo_speed))
         deform.max_episode_len = _per_ep_max
 
         # Prime obs deque with the initial obs (repeated obs_horizon times).
@@ -1412,7 +1520,11 @@ best_eval_epoch = resume_best_eval_epoch
 best_ckpt_path = os.path.join(logdir, 'policy_best.pt')
 
 step_counter = resume_step_counter
-for epoch in range(resume_start_epoch, args.num_epochs):
+if args.eval_only:
+    print(f'\n=== --eval_only: skipping training loop, jumping straight '
+          f'to final eval on {args.resume} ===')
+for epoch in (range(0) if args.eval_only
+              else range(resume_start_epoch, args.num_epochs)):
     epoch_loss = []
     epoch_start = time.time()
     for obs_b, act_b in dataloader:
@@ -1511,29 +1623,83 @@ for epoch in range(resume_start_epoch, args.num_epochs):
 # (deploy scripts will know what eval rate this checkpoint achieved without
 # loading the wandb run).
 # =============================================================================
-print(f'\n=== Final eval ({args.n_final_eval_episodes} episodes) ===')
-# Always record at least one video at the end of training so deploy
-# decisions don't depend on the wandb mid-training videos.
-final_record_n = max(args.n_video_episodes, 1) \
-    if args.video_every_evals > 0 else 0
-final_metrics = evaluate_policy(
-    n_episodes=args.n_final_eval_episodes,
-    eval_seed=args.seed + args.eval_seed_offset + 1,
-    label='final_eval',
-    record_video_episodes=final_record_n,
-    video_label='final')
-final_video_path = final_metrics.pop('final_eval/_video_path', None)
-print('\nFinal eval:')
-for k, v in sorted(final_metrics.items()):
-    print(f'  {k}: {v}')
-if args.use_wandb:
-    log_dict = dict(final_metrics)
-    if final_video_path:
-        log_dict['final_eval/video'] = wandb.Video(
-            final_video_path, fps=args.video_fps,
-            caption=f'final | '
-                    f'success_rate={final_metrics["final_eval/success_rate"]:.2f}')
-    wandb.log(log_dict)
+if args.eval_all_in:
+    # ---------------------------------------------------------------------
+    # Recreate the training-time eval curve from saved checkpoints. Loads
+    # each policy_ep<NNNN>.pt in epoch order, swaps weights into the
+    # already-built policy/encoder, runs eval, logs to wandb at step=epoch.
+    # ---------------------------------------------------------------------
+    import re
+    import glob
+    pattern = os.path.join(args.eval_all_in, 'policy_ep*.pt')
+    found = sorted(glob.glob(pattern))
+    if not found:
+        raise FileNotFoundError(
+            f'no policy_ep*.pt under {args.eval_all_in}; nothing to eval.')
+    print(f'\n=== --eval_all_in: re-eval {len(found)} checkpoint(s) '
+          f'from {args.eval_all_in} ===')
+    for ckpt_path in found:
+        m = re.search(r'policy_ep(\d+)\.pt$', ckpt_path)
+        ep = int(m.group(1)) if m else -1
+        print(f'\n--- ep{ep:04d}: {os.path.basename(ckpt_path)} ---')
+        ckpt = torch.load(ckpt_path, map_location=device)
+        # policy_state_dict / encoder_state_dict already hold EMA-applied
+        # weights (see _save_ema_checkpoint). evaluate_policy will then
+        # also apply ema.copy_to internally — that's a no-op since the
+        # loaded ema_state_dict matches the loaded EMA-applied weights.
+        policy.load_state_dict(ckpt['policy_state_dict'])
+        encoder.load_state_dict(ckpt['encoder_state_dict'])
+        if 'ema_state_dict' in ckpt:
+            ema.load_state_dict(ckpt['ema_state_dict'])
+        # One video per checkpoint is enough to inspect motion qualitatively;
+        # the success-rate number is the main payload across the curve.
+        reeval_record_n = min(args.n_video_episodes,
+                              args.n_eval_episodes) if (
+            args.video_every_evals > 0) else 0
+        reeval_metrics = evaluate_policy(
+            n_episodes=args.n_eval_episodes,
+            eval_seed=args.seed + args.eval_seed_offset,
+            label='reeval',
+            record_video_episodes=reeval_record_n,
+            video_label=f'ep{ep:04d}')
+        reeval_video_path = reeval_metrics.pop('reeval/_video_path', None)
+        for k, v in sorted(reeval_metrics.items()):
+            print(f'  {k}: {v}')
+        if args.use_wandb:
+            log_dict = dict(reeval_metrics)
+            log_dict['reeval/epoch'] = ep
+            if reeval_video_path:
+                log_dict['reeval/video'] = wandb.Video(
+                    reeval_video_path, fps=args.video_fps,
+                    caption=f'ep{ep:04d} | '
+                            f'success_rate='
+                            f'{reeval_metrics["reeval/success_rate"]:.2f}')
+            wandb.log(log_dict, step=ep)
+    print('\n=== --eval_all_in: done ===')
+else:
+    print(f'\n=== Final eval ({args.n_final_eval_episodes} episodes) ===')
+    # Always record at least one video at the end of training so deploy
+    # decisions don't depend on the wandb mid-training videos.
+    final_record_n = max(args.n_video_episodes, 1) \
+        if args.video_every_evals > 0 else 0
+    final_metrics = evaluate_policy(
+        n_episodes=args.n_final_eval_episodes,
+        eval_seed=args.seed + args.eval_seed_offset + 1,
+        label='final_eval',
+        record_video_episodes=final_record_n,
+        video_label='final')
+    final_video_path = final_metrics.pop('final_eval/_video_path', None)
+    print('\nFinal eval:')
+    for k, v in sorted(final_metrics.items()):
+        print(f'  {k}: {v}')
+    if args.use_wandb:
+        log_dict = dict(final_metrics)
+        if final_video_path:
+            log_dict['final_eval/video'] = wandb.Video(
+                final_video_path, fps=args.video_fps,
+                caption=f'final | '
+                        f'success_rate={final_metrics["final_eval/success_rate"]:.2f}')
+        wandb.log(log_dict)
 
 
 # =============================================================================
@@ -1542,16 +1708,17 @@ if args.use_wandb:
 # final eval — that's the whole point of best-tracking. Both files are
 # valid; deploy from whichever the workflow prefers.
 # =============================================================================
-final_ckpt_path = os.path.join(logdir, 'policy.pt')
-_save_ema_checkpoint(
-    final_ckpt_path, epoch=args.num_epochs, eval_metrics=final_metrics)
-print(f'\n[ckpt] saved final {final_ckpt_path}')
-if best_eval_epoch > 0:
-    print(f'[ckpt] best mid-training eval/success_rate='
-          f'{best_eval_success:.3f} at epoch {best_eval_epoch} '
-          f'-> policy_best.pt')
-else:
-    print(f'[ckpt] no mid-training eval ran (--eval_every_epochs=0); '
-          f'policy_best.pt was NOT written.')
+if not args.eval_all_in:
+    final_ckpt_path = os.path.join(logdir, 'policy.pt')
+    _save_ema_checkpoint(
+        final_ckpt_path, epoch=args.num_epochs, eval_metrics=final_metrics)
+    print(f'\n[ckpt] saved final {final_ckpt_path}')
+    if best_eval_epoch > 0:
+        print(f'[ckpt] best mid-training eval/success_rate='
+              f'{best_eval_success:.3f} at epoch {best_eval_epoch} '
+              f'-> policy_best.pt')
+    else:
+        print(f'[ckpt] no mid-training eval ran (--eval_every_epochs=0); '
+              f'policy_best.pt was NOT written.')
 if args.use_wandb:
     wandb.finish()

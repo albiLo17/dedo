@@ -66,7 +66,7 @@ class RetryResetEnv(gym.Wrapper):
 #      at the apex; the post-trajectory zero-velocity hold and
 #      make_final_steps then let the hanger catch the hole.
 # ---------------------------------------------------------------------------
-def build_hole_aware_waypoints(underlying):
+def build_hole_aware_waypoints(underlying, waypoint_scale=1.0):
     from dedo.utils.mesh_utils import get_mesh_data
 
     if not hasattr(underlying.args, 'deform_true_loop_vertices'):
@@ -101,20 +101,24 @@ def build_hole_aware_waypoints(underlying):
     #               (apex + 2.0; pin spans apex+0.05..apex+0.55) and
     #               translate it directly over the apex. Aligns the hole
     #               for the descent.
-    #   2. THREAD — descend so the hole sweeps DOWN through the pin
-    #               region and at the same time begin a y-overshoot:
-    #               (y = apex.y - 0.5, z = apex.z + 0.0). The cloth body
-    #               starts to sweep past the hanger plane, dragging the
-    #               hanger arms through the cloth.
-    #   3. CATCH  — continue past in y and slightly below in z
-    #               (y = apex.y - 1.1, z = apex.z - 0.4). This is the
-    #               key step: as the hole boundary slides past the apex
-    #               in -y, the apex catches on the trailing edge of the
-    #               hole. The cloth weight then drapes around the hanger
-    #               arms during the make_final_steps gravity settle.
-    hole_hover = np.array([hanger[0], hanger[1] + 0.2, hanger[2] + 1.8])
-    hole_thread = np.array([hanger[0], hanger[1] - 0.4, hanger[2] + 0.1])
-    hole_hold = np.array([hanger[0], hanger[1] - 1.2, hanger[2] - 0.5])
+    #   2. THREAD — sweep the hole past the apex in -y while staying
+    #               near apex height (z = apex.z + 0.1). The cloth body
+    #               translates well past the hanger plane BEFORE the
+    #               descent, so the apex sits cleanly inside the hole
+    #               boundary when CATCH begins. Pushing further forward
+    #               here (vs. the original -0.4) leaves a shorter,
+    #               mostly-vertical descent in CATCH — more realistic
+    #               for a real robot replay.
+    #   3. CATCH  — drop down past the apex (y = apex.y - 1.2,
+    #               z = apex.z - 0.5). With THREAD already well forward,
+    #               this is mostly a downward motion that lets the apex
+    #               catch on the trailing edge of the hole. The cloth
+    #               weight then drapes around the hanger arms during
+    #               the make_final_steps gravity settle.
+    s = waypoint_scale
+    hole_hover = np.array([hanger[0], hanger[1] + 0.2 * s, hanger[2] + 1.8 * s])
+    hole_thread = np.array([hanger[0], hanger[1] - 1.0 * s, hanger[2] + 0.4 * s])
+    hole_hold = np.array([hanger[0], hanger[1] - 1.2 * s, hanger[2] - 0.5 * s])
 
     def grip_target(hole_target, delta):
         return [float(hole_target[0] + delta[0]),

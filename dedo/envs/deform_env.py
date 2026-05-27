@@ -30,7 +30,8 @@ from ..utils.task_info import (
     DEFAULT_CAM_PROJECTION, DEFORM_INFO, SCENE_INFO, TASK_INFO,
     TOTE_MAJOR_VERSIONS, TOTE_VARS_PER_VERSION)
 from ..utils.procedural_utils import (
-    gen_procedural_hang_cloth, gen_procedural_button_cloth)
+    gen_procedural_hang_cloth, gen_procedural_hang_cloth_real,
+    gen_procedural_button_cloth)
 from ..utils.args import preset_override_util
 from ..utils.process_camera import ProcessCamera, cameraConfig
 
@@ -67,8 +68,8 @@ class DeformEnv(gym.Env):
         self.max_episode_len = self.args.max_episode_len
         # Define sizes of observation and action spaces.
         self.gripper_lims = np.tile(np.concatenate(
-            [DeformEnv.WORKSPACE_BOX_SIZE * np.ones(3),  # 3D pos
-             np.ones(3)]), self.num_anchors)             # 3D linvel/MAX_OBS_VEL
+            [self.WORKSPACE_BOX_SIZE * np.ones(3),  # 3D pos
+             np.ones(3)]), self.num_anchors)         # 3D linvel/MAX_OBS_VEL
         if args.cam_resolution <= 0:  # report gripper positions as low-dim obs
             self.observation_space = gym.spaces.Box(
                 -1.0 * self.gripper_lims, self.gripper_lims)
@@ -141,8 +142,10 @@ class DeformEnv(gym.Env):
 
     def load_objects(self, sim, args, debug):
         scene_name = self.args.task.lower()
-        if scene_name in ['hanggarment', 'bgarments', 'sewing','hangproccloth']:
+        if scene_name in ['hanggarment', 'bgarments', 'sewing', 'hangproccloth']:
            scene_name = 'hangcloth'  # same hanger for garments and cloths
+        elif scene_name == 'hangprocclothreal':
+           scene_name = 'hangcloth_real'
         elif scene_name.startswith('button'):
             scene_name = 'button'
         elif scene_name.startswith('dress'):
@@ -168,6 +171,16 @@ class DeformEnv(gym.Env):
                 args.num_holes = args.version
             deform_obj = gen_procedural_hang_cloth(
                 self.args, 'procedural_hang_cloth', DEFORM_INFO)
+
+            preset_override_util(args, DEFORM_INFO[deform_obj])
+        elif self.args.task == 'HangProcClothReal':  # real-world scale variant
+            args.node_density = 15
+            if args.version == 0:
+                args.num_holes = np.random.randint(2)+1
+            elif args.version in [1,2]:
+                args.num_holes = args.version
+            deform_obj = gen_procedural_hang_cloth_real(
+                self.args, 'procedural_hang_cloth_real', DEFORM_INFO)
 
             preset_override_util(args, DEFORM_INFO[deform_obj])
         elif self.args.task == 'ButtonProc':  # procedural gen. for buttoning
@@ -231,7 +244,8 @@ class DeformEnv(gym.Env):
             args.deform_init_pos, args.deform_init_ori,
             args.deform_bending_stiffness, args.deform_damping_stiffness,
             args.deform_elastic_stiffness, args.deform_friction_coeff,
-            not args.disable_self_collision, debug)
+            not args.disable_self_collision, debug,
+            mass=getattr(args, 'deform_mass', 1.0))
         if scene_name == 'button':  # pin cloth edge for buttoning task
             assert ('deform_fixed_anchor_vertex_ids' in DEFORM_INFO[deform_obj])
             pin_fixed(sim, deform_id,
@@ -248,7 +262,8 @@ class DeformEnv(gym.Env):
         # makes the dxy reproducible across collection/eval.
         goal_dxy = np.zeros(2, dtype=np.float32)
         randomize_r = float(getattr(args, 'randomize_goal_radius', 0.0))
-        if scene_name == 'hangcloth' and randomize_r > 0.0:
+        _is_hangcloth_scene = scene_name in ('hangcloth', 'hangcloth_real')
+        if _is_hangcloth_scene and randomize_r > 0.0:
             goal_dxy = np.random.uniform(
                 -randomize_r, randomize_r, size=2).astype(np.float32)
         self._last_goal_dxy = goal_dxy
@@ -260,9 +275,9 @@ class DeformEnv(gym.Env):
             texture_file = None
             if 'useTexture' in kwargs and kwargs['useTexture']:
                 texture_file = self.get_texture_path(args.rigid_texture_file)
-            # Apply the same dxy shift to hanger + tallrod for hangcloth.
+            # Apply the same dxy shift to hanger + tallrod for hangcloth scenes.
             base_position = list(kwargs['basePosition'])
-            if scene_name == 'hangcloth':
+            if _is_hangcloth_scene:
                 base_position[0] = float(base_position[0]) + float(goal_dxy[0])
                 base_position[1] = float(base_position[1]) + float(goal_dxy[1])
             id = load_rigid_object(
@@ -273,7 +288,7 @@ class DeformEnv(gym.Env):
 
         # Mark the goal and store intermediate info for reward computations.
         goal_poses = SCENE_INFO[scene_name]['goal_pos']
-        if scene_name == 'hangcloth' and randomize_r > 0.0:
+        if _is_hangcloth_scene and randomize_r > 0.0:
             goal_poses = [
                 [float(p[0]) + float(goal_dxy[0]),
                  float(p[1]) + float(goal_dxy[1]),
@@ -409,7 +424,7 @@ class DeformEnv(gym.Env):
             info = self.make_final_steps()
             info['pre_settle_reward'] = pre_settle_reward
             info['pre_settle_dist_m'] = (
-                -pre_settle_reward * DeformEnv.WORKSPACE_BOX_SIZE)
+                -pre_settle_reward * self.WORKSPACE_BOX_SIZE)
             last_rwd = self.get_reward() * DeformEnv.FINAL_REWARD_MULT
             info['is_success'] = np.abs(last_rwd) < self.SUCESS_REWARD_TRESHOLD
             reward += last_rwd
@@ -555,7 +570,7 @@ class DeformEnv(gym.Env):
             cent_pts = pts[true_loop_vertices]
             cent_pts = cent_pts[~np.isnan(cent_pts).any(axis=1)]  # remove nans
             if len(cent_pts) == 0 or np.isnan(cent_pts).any():
-                dist = DeformEnv.WORKSPACE_BOX_SIZE*num_holes_to_track
+                dist = self.WORKSPACE_BOX_SIZE*num_holes_to_track
                 dist *= DeformEnv.FINAL_REWARD_MULT
                 # Save a screenshot for debugging.
                 # obs = self.render(mode='rgb_array', width=300, height=300)
@@ -569,7 +584,7 @@ class DeformEnv(gym.Env):
             dist = np.min(dist)
         else:
             dist = np.mean(dist)
-        rwd = -1.0 * dist / DeformEnv.WORKSPACE_BOX_SIZE
+        rwd = -1.0 * dist / self.WORKSPACE_BOX_SIZE
         return rwd
 
     def render(self, mode='rgb_array', width=300, height=300):
@@ -584,3 +599,78 @@ class DeformEnv(gym.Env):
         assert (isinstance(rgba_px, np.ndarray)), 'Install numpy, then pybullet'
         img = rgba_px[:, :, 0:3]
         return img
+
+
+class HangProcClothRealEnv(DeformEnv):
+    """Real-world-scale variant of HangProcCloth.
+
+    Identical to DeformEnv but with WORKSPACE_BOX_SIZE reduced to 1.0 m
+    so that reward magnitudes and observation bounds match the metre-scale
+    coordinate system (hanger at ~0.32 m, cloth starting at ~0.27 m).
+
+    Also uses a smaller anchor radius (5 mm vs the default 50 mm) so that
+    the gripper spheres do not collide with each other or with the cloth
+    mesh elements (which are ~19 mm wide at this scale).
+    """
+    WORKSPACE_BOX_SIZE = 1.0
+    ANCHOR_RADIUS = 0.005  # 5 mm — scaled down from 50 mm for metre-scale env
+
+    # NOTE: do_action is intentionally NOT overridden. The base-class
+    # force-PD controller (command_anchor_velocity, ±CTRL_MAX_FORCE=10 N)
+    # is used. An earlier kinematic resetBaseVelocity override existed to
+    # beat gravity drift when the cloth was 1 kg (~5.9 N/anchor, too close
+    # to the 10 N cap). The cloth is now 0.1 kg (deform_mass), so the
+    # gravity load is ~0.5 N/anchor with ample control headroom. Force
+    # control also preserves cloth↔anchor coupling: when the cloth resists,
+    # the anchor naturally slows, keeping the sheet taut — kinematic
+    # control decoupled this and whipped the cloth into a crumple.
+
+    def make_final_steps(self):
+        # Override: hold anchors stationary (v=0) during the gravity settle so
+        # they do not fall through the floor (use_collision=False). The cloth
+        # drapes naturally around the hanger peg while the anchors hover.
+        change_anchor_color_gray(self.sim, self.anchor_ids[0])
+        change_anchor_color_gray(self.sim, self.anchor_ids[1])
+        info = {'final_obs': []}
+        if self._record_settle_frames:
+            info['settle_frames'] = []
+        sub_step_idx = 0
+        for sim_step in range(DeformEnv.STEPS_AFTER_DONE):
+            for anchor_id in self.anchor_ids:
+                self.sim.resetBaseVelocity(
+                    anchor_id, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+            self.sim.stepSimulation()
+            if sim_step % self.args.sim_steps_per_action == 0:
+                next_obs, _ = self.get_obs()
+                info['final_obs'].append(next_obs)
+                if (self._record_settle_frames and
+                        sub_step_idx % self._settle_frame_stride == 0):
+                    info['settle_frames'].append(self.render(
+                        mode='rgb_array', **self._settle_render_kwargs))
+                sub_step_idx += 1
+        return info
+
+    def make_anchors(self):
+        from ..utils.anchor_utils import (
+            attach_anchor, create_anchor_geom, ANCHOR_RGBA_ACTIVE)
+        from ..utils.init_utils import get_preset_properties
+        from ..utils.mesh_utils import get_mesh_data
+        from ..utils.task_info import DEFORM_INFO
+        import numpy as np
+        preset_dynamic_anchor_vertices = get_preset_properties(
+            DEFORM_INFO, self.deform_obj, 'deform_anchor_vertices')
+        _, mesh = get_mesh_data(self.sim, self.deform_id)
+        mesh = np.array(mesh)
+        for i in range(self.num_anchors):
+            anchor_vertices = preset_dynamic_anchor_vertices[i]
+            anchor_pos = mesh[anchor_vertices].mean(axis=0)
+            # use_collision=False: prevent the anchor sphere from colliding
+            # with nearby cloth vertices (which causes physics explosions at
+            # metre scale where the 5 mm sphere is close to cloth elements).
+            anchor_id = create_anchor_geom(
+                self.sim, anchor_pos,
+                mass=0.1, radius=self.ANCHOR_RADIUS,
+                rgba=ANCHOR_RGBA_ACTIVE, use_collision=False)
+            attach_anchor(self.sim, anchor_id, anchor_vertices, self.deform_id)
+            self.anchors[anchor_id] = {'pos': anchor_pos,
+                                       'vertices': anchor_vertices}

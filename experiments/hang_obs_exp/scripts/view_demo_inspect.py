@@ -40,6 +40,11 @@ Usage
   python experiments/hang_obs_exp/scripts/view_demo_inspect.py
   python experiments/hang_obs_exp/scripts/view_demo_inspect.py --seed 42
 """
+# PEP 604 `X | None` annotations are used below; this env runs Python
+# 3.8, where those are evaluated at runtime and raise TypeError. Making
+# all annotations lazy (strings) fixes it and is harmless here.
+from __future__ import annotations
+
 import sys, os, time, argparse, threading, io, pickle, copy, socket
 from pathlib import Path
 
@@ -90,21 +95,20 @@ parser.add_argument(
     '--export_traj', type=str, default='',
     help='Path to a pickled exported trajectory list-of-dicts to visualize '
          'in the world frame. If set, left/right EE paths are rendered.')
-parser.add_argument('--sim_scale', type=float, default=0.045,
+parser.add_argument('--sim_scale', type=float, default=1.0,
                     help='Visualization-only uniform scale factor applied '
                          'to the entire sim scene (cloth, hanger, rod, '
                          'anchors, world axes). 1.0 = sim native scale. '
-                         '~0.05-0.10 = roughly matched to a sub-meter '
-                         'Franka workspace. Changeable live via the GUI '
-                         'slider; this flag just sets the initial value.')
-parser.add_argument('--sim_offset_x', type=float, default=0.5,
+                         'Defaults to 1.0 because the sim now runs natively '
+                         'in real-world meter coordinates.')
+parser.add_argument('--sim_offset_x', type=float, default=0.0,
                     help='Initial x offset of the sim scene in viz '
                          '(meters). Live-editable via GUI slider.')
 parser.add_argument('--sim_offset_y', type=float, default=0.0,
                     help='Initial y offset of the sim scene in viz (m).')
-parser.add_argument('--sim_offset_z', type=float, default=-0.038999999999999924,
+parser.add_argument('--sim_offset_z', type=float, default=0.0,
                     help='Initial z offset of the sim scene in viz (m).')
-parser.add_argument('--sim_yaw_deg', type=float, default=90,
+parser.add_argument('--sim_yaw_deg', type=float, default=0,
                     help='Initial rotational offset of the sim scene '
                          'about the world +z axis, in degrees. -90 maps '
                          "sim's +y (forward) to franka's +x (forward).")
@@ -159,10 +163,10 @@ parser.add_argument('--cam_traj', type=str, default='',
                          '(verifies the sim-world -> camera-frame '
                          'transform while you calibrate to real).')
 parser.add_argument('--cam_pos', type=float, nargs=3,
-                    default=[9.8618, -9.8618, 6.7202],
+                    default=[0.944, 0.444, 0.263],
                     help='Sim camera origin in sim-world coords.')
 parser.add_argument('--cam_wxyz', type=float, nargs=4,
-                    default=[-0.6242, 0.6812, 0.2821, -0.2585],
+                    default=[-0.2586, 0.2821, 0.6811, -0.6242],
                     help='Sim camera orientation, viser wxyz quaternion '
                          '(= R_cam_to_world).')
 extra = parser.parse_args()
@@ -528,9 +532,15 @@ def _pos(p):
     return tuple(float(x) * s for x in p)
 
 
+# One old sim unit expressed in world metres. Marker sizes (sphere
+# radii, axis lengths, grid spacing) were authored in old sim units,
+# so multiplying by this constant keeps them correct when sim_s == 1.0.
+_SIM_UNIT = 0.045
+
+
 def _scl(v):
-    """Scale a scalar length/radius from sim coords to viz coords."""
-    return float(v) * _S()
+    """Scale a scalar length/radius from old-sim coords to viz coords."""
+    return float(v) * _SIM_UNIT * _S()
 
 
 # Track the last sim_scale we applied to one-shot scene nodes (grid,
@@ -580,8 +590,8 @@ def rebuild_static_sim_nodes(sim_s):
     # Grid — re-add (same name replaces previous node).
     server.scene.add_grid(
         '/sim_scene/grid',
-        width=20.0 * sim_s, height=20.0 * sim_s, plane='xy',
-        cell_size=1.0 * sim_s, section_size=5.0 * sim_s,
+        width=20.0 * _SIM_UNIT * sim_s, height=20.0 * _SIM_UNIT * sim_s, plane='xy',
+        cell_size=1.0 * _SIM_UNIT * sim_s, section_size=5.0 * _SIM_UNIT * sim_s,
     )
     # URDFs — remove existing then re-add at the new scale.
     for h in list(_static_urdf_handles.values()):

@@ -1,4 +1,11 @@
 """
+Collect scripted-controller demos using the real-world-scale HangProcClothReal
+environment.  Drop-in replacement for collect_bc_demos.py; the only
+differences are:
+  - gym env: HangProcClothReal-v1  (world-metre coords, XZ-plane cloth)
+  - cam_viewmat default rescaled to match the ~0.3-0.5 m workspace
+  - grip/goal obs divided by WORKSPACE_BOX_SIZE=1.0 instead of 20.0
+
 Collect scripted-controller demos with state + RGB + point-cloud obs
 simultaneously, for cross-modality behavior-cloning experiments.
 
@@ -66,7 +73,7 @@ import numpy as np
 import pybullet
 
 import dedo  # noqa: F401  (registers gym envs)
-from dedo.envs.deform_env import DeformEnv
+from dedo.envs.deform_env import DeformEnv, HangProcClothRealEnv
 from dedo.utils.args import get_args_parser, args_postprocess
 from dedo.utils.mesh_utils import get_mesh_data
 from dedo.demo_preset import build_traj, merge_traj
@@ -98,6 +105,9 @@ PRIV_MODES = ('hole_centroid', 'hole_centroid_corners',
 # Argparse
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
+parser.add_argument('--viz', action='store_true', default=False,
+                    help='Open PyBullet GUI for live visualization. '
+                         'Slows collection; use only for debugging.')
 parser.add_argument('--demos_dir', type=str, required=True,
                     help='Output directory. Created if missing. '
                          'Existing demo_NNN.pkl files are kept; new demos '
@@ -159,18 +169,12 @@ parser.add_argument('--randomize_goal_radius', type=float, default=0.0,
                          'training script enforces strict parity across the '
                          'demo dir.')
 parser.add_argument('--cam_viewmat', type=float, nargs=6,
-                    default=[14.0, -5.0, 45.0, 0.0, 0.0, 5.5],
+                    default=[0.63, -5.0, 45.0, 0.5, 0.0, 0.21],
                     help='dedo cam_viewmat: dist pitch yaw tx ty tz. '
-                         'Default zoomed-out, low-pitch diagonal so cloth '
-                         'stays in frame across all trajectory phases AND '
-                         'PCD pixel density stays roughly constant (~1000 '
-                         'valid px per frame at cam_resolution=128) — '
-                         'validated against _diag_pcd_framing.py. The '
-                         'lower pitch keeps the cloth oriented more '
-                         'face-on to the camera, so the hole stays '
-                         'visible at most timesteps. Same view is used '
-                         'for both RGB and PCD obs, so the two '
-                         'modalities receive equivalent info.')
+                         'Default rescaled from the HangProcCloth values '
+                         'to match the real-world-metre workspace: '
+                         'dist 14→0.63 m, target (0,0,5.5)→(0.5,0,0.21) m. '
+                         'Adjust if the cloth moves out of frame.')
 parser.add_argument('--ctrl_freq', type=float, default=15.0,
                     help='Control frequency in Hz (one env.step every '
                          '1/ctrl_freq seconds of sim time). Implemented '
@@ -192,21 +196,6 @@ parser.add_argument('--sim_freq', type=int, default=500,
                          'cleanly — e.g. sim_freq=450 with ctrl_freq=15 '
                          'gives sim_steps_per_action=30 (exact 15 Hz). '
                          'Lower sim_freq risks soft-body instability.')
-parser.add_argument('--demo_speed', type=float, default=1.0,
-                    help='Multiplicative factor on the scripted-controller '
-                         'commanded velocities. <1.0 records slower demos '
-                         '(more realistic for a real robot); >1.0 records '
-                         'faster ones. The trajectory is stretched by '
-                         'round(1/demo_speed) — each waypoint repeated N '
-                         'times — and the velocity magnitudes scaled by '
-                         '1/N, so total displacement (and therefore task '
-                         'completion) is preserved, only the commanded '
-                         'magnitude changes. --max_episode_len is '
-                         'automatically scaled by the same N so the longer '
-                         'rollouts fit. Use 1/N values (0.5, 0.333, 0.25) '
-                         'for exact slowdowns; other values are rounded '
-                         'to the nearest 1/N with a warning. Saved per '
-                         'pkl as `demo_speed`.')
 parser.add_argument('--debug_viz_first_n', type=int, default=3,
                     help='Generate debug visualization artifacts for the '
                          'first N KEPT demos (PNG grid + MP4 video + action '
@@ -232,16 +221,6 @@ parser.add_argument('--debug_n_grid_samples', type=int, default=5,
                          'the PNG grid (post-settle frame is added as an '
                          'extra row). 5 + 1 = 6 rows is a comfortable '
                          'PNG height.')
-parser.add_argument('--debug_viz_first_n_failed', type=int, default=3,
-                    help='Write an MP4 for the first N attempts that fail '
-                         'the success check (when --only_success is on, '
-                         'these are dropped from the dataset). Saved as '
-                         '<demos_dir>/debug_viz/failed_attempt_NNN_video.mp4. '
-                         '0 disables. Useful for diagnosing why the '
-                         'scripted controller misses (cloth orientation, '
-                         'hole geometry, peg overshoot, etc.). Independent '
-                         'of --debug_viz_first_n / --debug_viz_every which '
-                         'only cover KEPT demos.')
 parser.add_argument('--episode_tail_frames', type=int, default=5,
                     help='Number of zero-velocity hold frames appended '
                          'after the planned trajectory ends, before '
@@ -265,27 +244,6 @@ extra = parser.parse_args()
 # report the actual achieved freq so the user knows what gets saved.
 _steps_per_action = max(1, int(round(extra.sim_freq / extra.ctrl_freq)))
 _actual_ctrl_freq = extra.sim_freq / _steps_per_action
-
-# Derive demo-speed trajectory stretch. We slow the demo by repeating each
-# velocity waypoint N times and scaling magnitudes by 1/N — preserves total
-# displacement, lowers commanded velocity by 1/N. The dedo env's
-# max_episode_len safety cap is scaled by the same N so the longer rollout
-# isn't truncated.
-if extra.demo_speed <= 0:
-    raise ValueError(f'--demo_speed must be > 0, got {extra.demo_speed}')
-_demo_stretch = max(1, int(round(1.0 / extra.demo_speed)))
-_actual_demo_speed = 1.0 / _demo_stretch
-_effective_safety_cap = int(extra.max_episode_len * _demo_stretch)
-if extra.demo_speed != 1.0:
-    if abs(_actual_demo_speed - extra.demo_speed) > 1e-6:
-        print(f'[init] WARN: --demo_speed={extra.demo_speed} rounds to '
-              f'stretch={_demo_stretch}x -> actual speed '
-              f'{_actual_demo_speed:.4f}. Use a 1/N value for exact match.')
-    else:
-        print(f'[init] --demo_speed={extra.demo_speed} -> trajectory '
-              f'stretched {_demo_stretch}x, velocity magnitudes scaled '
-              f'by {_actual_demo_speed} (safety cap raised '
-              f'{extra.max_episode_len} -> {_effective_safety_cap})')
 if abs(_actual_ctrl_freq - extra.ctrl_freq) / extra.ctrl_freq > 0.05:
     print(f'[init] WARN: requested ctrl_freq={extra.ctrl_freq} Hz rounds '
           f'to sim_steps_per_action={_steps_per_action} -> actual '
@@ -303,12 +261,12 @@ os.makedirs(extra.demos_dir, exist_ok=True)
 # ---------------------------------------------------------------------------
 sys.argv = [
     'collect_bc_demos',
-    '--env=HangProcCloth-v1',
+    '--env=HangProcClothReal-v1',
     f'--cam_resolution={extra.cam_resolution}',  # enables camera at all
     '--num_envs=0',
     '--total_env_steps=0',
     '--seed', str(extra.seed),
-    '--max_episode_len', str(_effective_safety_cap),
+    '--max_episode_len', str(extra.max_episode_len),
     f'--sim_freq={extra.sim_freq}',
     f'--sim_steps_per_action={_steps_per_action}',
     '--cam_viewmat',
@@ -318,7 +276,7 @@ sys.argv = [
 args, _ = get_args_parser()
 args_postprocess(args)
 args.debug = False
-args.viz = False
+args.viz = getattr(extra, 'viz', False)
 args.uint8_pixels = True  # we manage RGB ourselves; this is a defensive default
 
 # Apply MAX_ACT_VEL globally (action normalization).
@@ -367,8 +325,7 @@ def _next_demo_id():
 # action stats plot. The collector buffers high-res renders + depth +
 # centroid coords only for these demos so non-debug demos stay cheap.
 # ---------------------------------------------------------------------------
-_debug_enabled = (extra.debug_viz_first_n > 0 or extra.debug_viz_every > 0
-                  or extra.debug_viz_first_n_failed > 0)
+_debug_enabled = (extra.debug_viz_first_n > 0 or extra.debug_viz_every > 0)
 _debug_dir = os.path.join(extra.demos_dir, 'debug_viz') if _debug_enabled else None
 if _debug_dir is not None:
     os.makedirs(_debug_dir, exist_ok=True)
@@ -401,14 +358,11 @@ print(f'  pcd_n_points:    {extra.pcd_n_points}')
 print(f'  MAX_ACT_VEL:     {DeformEnv.MAX_ACT_VEL}')
 print(f'  ctrl_freq:       {_actual_ctrl_freq:.3f} Hz '
       f'(sim_freq={extra.sim_freq}, steps/action={_steps_per_action})')
-print(f'  demo_speed:      {_actual_demo_speed}'
-      f'{" (stretch=" + str(_demo_stretch) + "x)" if _demo_stretch > 1 else ""}')
 print(f'  randomize_goal:  radius={extra.randomize_goal_radius} m'
       f'{" (off — fixed goal)" if extra.randomize_goal_radius <= 0 else ""}')
 if _debug_enabled:
     print(f'  debug_viz:       first {extra.debug_viz_first_n} kept'
           f'{f" + every {extra.debug_viz_every}th" if extra.debug_viz_every > 0 else ""}'
-          f'{f" + first {extra.debug_viz_first_n_failed} failed" if extra.debug_viz_first_n_failed > 0 else ""}'
           f' -> {_debug_dir}')
 else:
     print(f'  debug_viz:       disabled')
@@ -419,7 +373,6 @@ _action_stats_kept: list = []
 
 n_kept = 0
 n_dropped_failed = 0
-n_failed_videos_written = 0
 attempts = 0
 max_attempts = max(extra.n_demos * 5, 30)
 start_time = time.time()
@@ -436,25 +389,21 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     corner_idx = identify_cloth_corners(verts0)
     hole_radius = measure_hole_radius(deform, hole_idx)
 
-    wp = build_hole_aware_waypoints(deform)
+    wp = build_hole_aware_waypoints(deform, waypoint_scale=0.045)
     if wp is None:
         print(f'[demo] attempt {attempts}: build waypoints failed, retrying')
         continue
     try:
         _, va = build_traj(deform, wp, 'a', anchor_idx=0,
-                           ctrl_freq=ctrl_freq, robot=None)
+                           ctrl_freq=ctrl_freq, robot=None,
+                           interp_kind='pchip')
         _, vb = build_traj(deform, wp, 'b', anchor_idx=1,
-                           ctrl_freq=ctrl_freq, robot=None)
+                           ctrl_freq=ctrl_freq, robot=None,
+                           interp_kind='pchip')
         traj = merge_traj(va, vb)
     except Exception as e:
         print(f'[demo] attempt {attempts}: build_traj failed ({e!r}), retrying')
         continue
-
-    # Apply demo-speed slowdown: repeat each waypoint N times and scale
-    # velocity magnitudes by 1/N. Same total displacement, lower commanded
-    # velocity at each step.
-    if _demo_stretch > 1:
-        traj = np.repeat(traj, _demo_stretch, axis=0) * _actual_demo_speed
 
     # Defensive check: trajectory peak must not exceed MAX_ACT_VEL or
     # `clip(traj / MAX_ACT_VEL, -1, 1)` silently saturates and the
@@ -473,12 +422,12 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     # The dedo env reads stepnum >= max_episode_len each env.step(), so
     # mutating after every reset() is safe.
     _eff_max_ep_len = min(int(len(traj)) + int(extra.episode_tail_frames),
-                          int(_effective_safety_cap))
+                          int(extra.max_episode_len))
     deform.max_episode_len = _eff_max_ep_len
     if attempts == 1:
         print(f'[demo] per-episode max_episode_len = {_eff_max_ep_len} '
               f'(traj_len={len(traj)} + tail={extra.episode_tail_frames}, '
-              f'safety cap={_effective_safety_cap})')
+              f'safety cap={extra.max_episode_len})')
 
     # Per-episode buffers.
     ep_state = {m: [] for m in PRIV_MODES}
@@ -491,15 +440,8 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     # Decide upfront whether this attempt is a debug-instrumented demo.
     # If this attempt becomes the next kept demo, it would be kept-index
     # `n_kept` (zero-based). Build the extra buffers eagerly so we don't
-    # need to re-run the episode after the success check. We also keep
-    # recording while we still need failure videos — most attempts will
-    # succeed so we may record a few attempts that ultimately don't end
-    # up needing a failure video; those buffers are just discarded.
-    _need_failure_video = (
-        extra.debug_viz_first_n_failed > 0
-        and n_failed_videos_written < extra.debug_viz_first_n_failed)
-    _is_debug_attempt = _debug_enabled and (
-        _should_debug(n_kept) or _need_failure_video)
+    # need to re-run the episode after the success check.
+    _is_debug_attempt = _debug_enabled and _should_debug(n_kept)
     ep_debug_depth = [] if _is_debug_attempt else None
     ep_debug_centroid = [] if _is_debug_attempt else None
     ep_debug_video_frames = [] if _is_debug_attempt else None
@@ -542,24 +484,27 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         # proprioception (the privileged state modes already include it
         # inline, but RGB/PCD need it concatenated at the encoder).
         grip = np.asarray(deform.get_grip_obs(), dtype=np.float32)
-        grip = np.clip(grip / 20.0, -2.0, 2.0)  # 20.0 = DeformEnv.WORKSPACE_BOX_SIZE
+        grip = np.clip(grip / HangProcClothRealEnv.WORKSPACE_BOX_SIZE, -2.0, 2.0)
         ep_grip.append(grip)
         # Hanger goal world-pos, /WBOX-normalized. Matches the privileged
         # obs's last 3 dims so RGB/PCD encoders that concat this to their
         # grip projection see the same goal vector the privileged state
         # vector embeds — fair-comparison invariant.
-        goal_w = np.asarray(deform.goal_pos[0], dtype=np.float32) / 20.0
+        goal_w = np.asarray(deform.goal_pos[0], dtype=np.float32) / HangProcClothRealEnv.WORKSPACE_BOX_SIZE
         ep_goal.append(goal_w)
-        rgb, depth, seg, view, proj = capture_rgb_depth(
-            deform, extra.cam_resolution, extra.cam_resolution)
-        # Cloth-only PCD: filter pixels by pybullet segmentation mask so
-        # the encoder spends 100% of its 2048-point budget on the cloth
-        # surface instead of ~30-40% on the static peg/pole/flag/base.
-        # The peg's geometry is constant across episodes, so removing it
-        # only loses redundant info while concentrating point density on
-        # the deformable surface the policy needs to reason about.
-        pcd_world = cloth_only_pcd(
-            depth, seg, view, proj, deform.deform_id, extra.pcd_n_points)
+        if extra.cam_resolution > 0:
+            rgb, depth, seg, view, proj = capture_rgb_depth(
+                deform, extra.cam_resolution, extra.cam_resolution)
+            # Cloth-only PCD: filter pixels by pybullet segmentation mask so
+            # the encoder spends 100% of its 2048-point budget on the cloth
+            # surface instead of ~30-40% on the static peg/pole/flag/base.
+            # The peg's geometry is constant across episodes, so removing it
+            # only loses redundant info while concentrating point density on
+            # the deformable surface the policy needs to reason about.
+            pcd_world = cloth_only_pcd(
+                depth, seg, view, proj, deform.deform_id, extra.pcd_n_points)
+        else:
+            rgb = depth = seg = view = proj = pcd_world = None
         ep_rgb.append(rgb)
         ep_pcd.append(pcd_world)
 
@@ -567,7 +512,7 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         # composed video frame: sim_high_res | obs+PCD overlay | PCD
         # projected through the SAME camera as the obs (= what the
         # policy's PCD encoder sees, in screen space).
-        if _is_debug_attempt:
+        if _is_debug_attempt and extra.cam_resolution > 0:
             ep_debug_depth.append(depth.copy())
             centroid_w = hole_centroid_world(deform, hole_idx)
             ep_debug_centroid.append(centroid_w)
@@ -614,7 +559,7 @@ while n_kept < extra.n_demos and attempts < max_attempts:
     # Debug-only: stitch the dedo-captured settle frames into the video,
     # then take one final RGB+depth+PCD capture for the PNG grid's
     # post-settle row.
-    if _is_debug_attempt:
+    if _is_debug_attempt and extra.cam_resolution > 0:
         # 1) Settle frames live in info['settle_frames'] as a list of
         # high-res RGB arrays from inside make_final_steps. Pair each
         # with the LAST policy-phase obs+PCD/PCD-camera panels so the
@@ -671,32 +616,10 @@ while n_kept < extra.n_demos and attempts < max_attempts:
 
     if extra.only_success and not keep_success:
         n_dropped_failed += 1
-        # Write a failure-attempt MP4 if requested and we have buffered
-        # debug frames for this attempt. ep_debug_video_frames already
-        # includes the post-step settle frames stitched above, so the
-        # video shows where the cloth ended up.
-        failed_video_path = None
-        if (_is_debug_attempt
-                and ep_debug_video_frames
-                and n_failed_videos_written
-                    < extra.debug_viz_first_n_failed):
-            failed_video_path = os.path.join(
-                _debug_dir,
-                f'failed_attempt_{n_failed_videos_written:03d}_video.mp4')
-            try:
-                write_video_mp4(ep_debug_video_frames, failed_video_path,
-                                fps=extra.debug_fps)
-                n_failed_videos_written += 1
-            except Exception as _e:
-                print(f'  [debug_viz] WARN: failed-attempt video write '
-                      f'failed: {_e!r}')
-                failed_video_path = None
-        suffix = (f'  -> wrote {os.path.basename(failed_video_path)}'
-                  if failed_video_path is not None else '')
         print(f'[demo] attempt {attempts} (kept {n_kept}/{extra.n_demos})  '
               f'len={len(ep_act)}  rwd={ep_reward_total:.1f}  '
               f'h={success_hanging} t={success_topological} '
-              f'l={success_legacy}  (dropped){suffix}')
+              f'l={success_legacy}  (dropped)')
         continue
 
     # 4) Save pkl.
@@ -706,8 +629,10 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         'obs': {
             **{m: np.asarray(ep_state[m], dtype=np.float32)
                for m in PRIV_MODES},
-            'rgb': np.asarray(ep_rgb, dtype=np.uint8),
-            'pcd': np.asarray(ep_pcd, dtype=np.float32),
+            'rgb': (np.asarray(ep_rgb, dtype=np.uint8)
+                    if extra.cam_resolution > 0 else np.empty(0, dtype=np.uint8)),
+            'pcd': (np.asarray(ep_pcd, dtype=np.float32)
+                    if extra.cam_resolution > 0 else np.empty(0, dtype=np.float32)),
             # 12-dim gripper proprioception. Used by RGB and PCD modes as
             # an auxiliary input; the privileged state modes already have
             # it embedded in their first 12 dims so they don't need it.
@@ -746,17 +671,11 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         'ctrl_freq': float(_actual_ctrl_freq),
         'sim_freq': int(extra.sim_freq),
         'sim_steps_per_action': int(_steps_per_action),
-        # Demo-speed slowdown factor applied to the scripted-controller
-        # velocities (1.0 = unmodified, 0.5 = half-speed commanded
-        # velocities with 2x trajectory length). Demos with non-1.0
-        # demo_speed teach the policy slower commanded velocities, which
-        # are more realistic to replay on a real robot.
-        'demo_speed': float(_actual_demo_speed),
         # Per-episode hanger goal randomization. Recorded so the training
         # script can enforce parity across the demo dir, and so eval-time
         # env construction matches the distribution the policy trained on.
         # The actual sampled (dx, dy) for THIS episode is recoverable from
-        # obs['goal'][0] vs the nominal (0, 0, 8.2)/WBOX; we store the
+        # obs['goal'][0] vs the nominal (0.5, 0, 0.330)/WBOX; we store the
         # radius (the distribution parameter) here, not the per-episode
         # draw.
         'randomize_goal_radius': float(extra.randomize_goal_radius),
@@ -773,20 +692,10 @@ while n_kept < extra.n_demos and attempts < max_attempts:
 
     n_kept += 1
     pkl_mb = os.path.getsize(out_path) / 1e6
-    # Unnormalized peak commanded velocity (m/s). peak_abs_a is in
-    # normalized [-1, 1] units (the policy's space); multiplying by
-    # MAX_ACT_VEL recovers the raw velocity that was sent to the env.
-    # Use this to pick a tighter --max_act_vel: pick a value slightly
-    # above the run's max peak|v| so the [-1, 1] range stays well-
-    # utilized without saturating.
-    _peak_v_mps = act_stats["peak_abs_a"] * float(DeformEnv.MAX_ACT_VEL)
     print(f'[demo] attempt {attempts} (kept {n_kept}/{extra.n_demos})  '
           f'len={act_stats["ep_len"]}  '
           f'active={act_stats["n_active"]} hold={act_stats["n_hold"]} '
           f'({act_stats["hold_frac"]*100:.0f}% hold)  '
-          f'peak|a|={act_stats["peak_abs_a"]:.2f} '
-          f'(peak|v|={_peak_v_mps:.2f} m/s) '
-          f'mean||a||={act_stats["mean_norm_a"]:.2f}  '
           f'rwd={ep_reward_total:.1f}  '
           f'h={success_hanging} t={success_topological} '
           f'l={success_legacy}  saved {os.path.basename(out_path)} '
@@ -878,9 +787,6 @@ elapsed = time.time() - start_time
 print(f'\nDone. kept={n_kept}, dropped={n_dropped_failed}, '
       f'attempts={attempts}, elapsed={elapsed:.0f}s '
       f'({elapsed/max(n_kept,1):.1f}s/demo)')
-if extra.debug_viz_first_n_failed > 0:
-    print(f'  failed-attempt videos written: {n_failed_videos_written}'
-          f'/{extra.debug_viz_first_n_failed} (target)')
 
 # Aggregate action stats across kept demos. Helpful for "is this dataset
 # 50% padding or 75%?" at a glance.

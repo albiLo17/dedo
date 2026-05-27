@@ -84,6 +84,11 @@ def get_args_parser():
                         help='Initial orientation for deform (in Euler angles)')
     parser.add_argument('--deform_scale', type=float, default=1.0,
                         help='Scaling for the deform object')
+    parser.add_argument('--deform_mass', type=float, default=1.0,
+                        help='Total mass (kg) of the deform object. '
+                             'Default 1.0 matches the historical hardcoded '
+                             'value; small scaled-down cloths need this '
+                             'lowered or the springs cannot hold the weight.')
     parser.add_argument('--deform_bending_stiffness', type=float, default=1.0,
                         help='deform spring elastic stiffness')  # 1.0-300.0
     parser.add_argument('--deform_damping_stiffness', type=float, default=0.1,
