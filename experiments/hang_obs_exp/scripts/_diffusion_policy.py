@@ -202,14 +202,25 @@ class PointCloudObsEncoder(nn.Module):
          'grip': (B*To, 12) float32 in roughly [-1, 1] (/WBOX-normalized),
          'goal': (B*To,  3) float32 in roughly [-1, 1] (/WBOX-normalized
                  hanger pose — matches the privileged state vector's
-                 last 3 dims so all modalities see equivalent goal info)}
+                 last 3 dims so all modalities see equivalent goal info),
+         'priv': (B*To, priv_dim) float32, OPTIONAL — only present when
+                 priv_dim > 0 (the pcd_priv mode). Holds the privileged
+                 hole-centroid xyz (/WBOX-normalized). Appended as a third
+                 aux input so a pcd+privileged policy can lean on the
+                 ground-truth hole location while still seeing cloth shape
+                 from the point cloud.}
 
-    Output: (B*To, pcd_feat_dim + grip_out_dim + goal_out_dim).
+    Output: (B*To, pcd_feat_dim + grip_out_dim + goal_out_dim
+             [+ priv_out_dim if priv_dim > 0]).
+
+    NOTE: priv_dim defaults to 0 so existing pure-pcd checkpoints (which
+    have no priv_proj submodule and a smaller feat_dim) load unchanged.
     """
 
     def __init__(self, n_points: int = 512, pcd_feat_dim: int = 256,
                  grip_dim: int = 12, grip_out_dim: int = 12,
-                 goal_dim: int = 3, goal_out_dim: int = 8):
+                 goal_dim: int = 3, goal_out_dim: int = 8,
+                 priv_dim: int = 0, priv_out_dim: int = 8):
         super().__init__()
         import os
         force_pure = os.environ.get(
@@ -280,10 +291,18 @@ class PointCloudObsEncoder(nn.Module):
 
         self.grip_proj = _GripProjection(grip_dim, grip_out_dim)
         self.goal_proj = _GoalProjection(goal_dim, goal_out_dim)
+        # Optional privileged-centroid projection (pcd_priv mode). Reuses the
+        # _GoalProjection MLP shape (small Linear+ReLU) since both project a
+        # 3-d /WBOX-normalized position into the conditioning vector.
+        self.priv_dim = priv_dim
+        if priv_dim > 0:
+            self.priv_proj = _GoalProjection(priv_dim, priv_out_dim)
         self.n_points = n_points
         self.grip_dim = grip_dim
         self.goal_dim = goal_dim
         self.feat_dim = pcd_feat_dim + grip_out_dim + goal_out_dim
+        if priv_dim > 0:
+            self.feat_dim += priv_out_dim
 
     def forward(self, obs) -> torch.Tensor:
         if isinstance(obs, dict):
@@ -293,6 +312,7 @@ class PointCloudObsEncoder(nn.Module):
             if goal is None:
                 goal = torch.zeros(pcd.shape[0], self.goal_dim,
                                    device=pcd.device, dtype=torch.float32)
+            priv = obs.get('priv')
         else:
             # Backward compat: single-tensor input is pcd alone; grip
             # and goal zeroed.
@@ -301,6 +321,7 @@ class PointCloudObsEncoder(nn.Module):
                                device=pcd.device, dtype=torch.float32)
             goal = torch.zeros(pcd.shape[0], self.goal_dim,
                                device=pcd.device, dtype=torch.float32)
+            priv = None
         pcd = pcd.float()
 
         if self._has_cuda:
@@ -316,7 +337,13 @@ class PointCloudObsEncoder(nn.Module):
         pcd_feat = l3_feat.squeeze(-1)
         grip_feat = self.grip_proj(grip)
         goal_feat = self.goal_proj(goal.float())
-        return torch.cat([pcd_feat, grip_feat, goal_feat], dim=-1)
+        feats = [pcd_feat, grip_feat, goal_feat]
+        if self.priv_dim > 0:
+            if priv is None:
+                priv = torch.zeros(pcd.shape[0], self.priv_dim,
+                                   device=pcd.device, dtype=torch.float32)
+            feats.append(self.priv_proj(priv.float()))
+        return torch.cat(feats, dim=-1)
 
 
 def build_encoder(obs_mode: str, obs_kwargs: dict) -> nn.Module:
@@ -326,10 +353,11 @@ def build_encoder(obs_mode: str, obs_kwargs: dict) -> nn.Module:
     if obs_mode == 'rgb':
         return RGBObsEncoder(
             pretrained=obs_kwargs.get('pretrained', False))
-    if obs_mode == 'pcd':
+    if obs_mode in ('pcd', 'pcd_priv'):
         return PointCloudObsEncoder(
             n_points=obs_kwargs.get('n_points', 512),
-            pcd_feat_dim=obs_kwargs.get('feat_dim', 256))
+            pcd_feat_dim=obs_kwargs.get('feat_dim', 256),
+            priv_dim=obs_kwargs.get('priv_dim', 0))
     raise ValueError(f'unknown obs_mode {obs_mode!r}')
 
 
@@ -644,7 +672,9 @@ class ObsNormalizer:
             self.stats['max'] = flat.max(axis=0).astype(np.float32)
         elif self.obs_mode == 'rgb':
             pass  # encoder divides image by 255
-        elif self.obs_mode == 'pcd':
+        elif self.obs_mode in ('pcd', 'pcd_priv'):
+            # pcd_priv normalizes its PCD exactly like pcd; the aux priv/
+            # grip/goal inputs are pass-through (already /WBOX-normalized).
             flat = primary.reshape(-1, 3)
             self.stats['mean'] = flat.mean(axis=0).astype(np.float32)
             half = (flat.max(axis=0) - flat.min(axis=0)) / 2.0
@@ -663,11 +693,11 @@ class ObsNormalizer:
         if self.obs_mode == 'rgb':
             # `obs` is a dict {'image': ..., 'grip': ...}; both pass-through.
             return obs
-        if self.obs_mode == 'pcd':
+        if self.obs_mode in ('pcd', 'pcd_priv'):
             mean = self.stats['mean']
             scale = float(self.stats['scale']) or 1.0
             pcd_norm = ((obs['pcd'] - mean) / scale).astype(np.float32)
-            # Preserve all auxiliary inputs (grip, goal, …) — the
+            # Preserve all auxiliary inputs (grip, goal, priv, …) — the
             # normalizer only acts on the primary PCD tensor.
             out = {'pcd': pcd_norm}
             for k, v in obs.items():

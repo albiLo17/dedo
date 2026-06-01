@@ -80,6 +80,17 @@ from _diffusion_policy import (  # noqa: E402
 PRIV_STATE_MODES = ('hole_centroid', 'hole_centroid_corners',
                     'hole_vertices', 'full_mesh')
 
+# Workspace-box normalizer; positions are stored as meters / _WBOX in the
+# demo pkls (matches PrivilegedObsWrapper). Eval-time hole-centroid noise is
+# specified in meters (factor * hole_radius) and converted to this normalized
+# scale before being added to the centroid dims.
+_WBOX = 20.0
+
+# Indices of the hole-centroid xyz inside the 18-dim hole_centroid state
+# vector: grip (12) + centroid (3) + goal (3). Eval-time noise perturbs this
+# slice only.
+_HOLE_CENTROID_SLICE = slice(12, 15)
+
 
 # =============================================================================
 # Argparse
@@ -89,9 +100,14 @@ parser.add_argument('--demo_path', type=str, required=True,
                     help='Directory of demo_NNN.pkl files written by '
                          'collect_bc_demos.py.')
 parser.add_argument('--obs_mode', type=str, default='state',
-                    choices=['state', 'rgb', 'pcd'],
+                    choices=['state', 'rgb', 'pcd', 'pcd_priv'],
                     help='Which obs modality to train on. Each demo pkl '
-                         'contains all three; this picks the key to load.')
+                         'contains all three; this picks the key to load. '
+                         'pcd_priv = PointNet++ on the cloth PCD with the '
+                         'privileged 3-d hole centroid appended as an '
+                         'auxiliary input (alongside grip+goal). Pairs with '
+                         '--eval_hole_noise_factor to test robustness of a '
+                         'pcd+privileged policy to noisy hole estimates.')
 parser.add_argument('--state_key', type=str, default='hole_centroid',
                     choices=list(PRIV_STATE_MODES),
                     help='Which privileged-state field to use when '
@@ -282,6 +298,42 @@ parser.add_argument('--eval_seed_offset', type=int, default=9999,
                          'eval pass — eval-rate trace then reflects only '
                          'policy change, not env resampling.')
 
+# Eval-time hole-centroid noise (robustness probe). EVAL-ONLY — training
+# always sees the clean privileged centroid; this perturbs only the obs the
+# policy is scored on. std = eval_hole_noise_factor * hole_radius, where
+# hole_radius is the per-episode mean centroid->loop-vertex distance measured
+# at reset (the same measure_hole_radius the success check uses). Gaussian,
+# mean 0, regenerated independently every timestep and per xyz coordinate.
+# Applies to obs_mode=state (state_key=hole_centroid) and obs_mode=pcd_priv,
+# both of which expose a hole-centroid triple to perturb. 0 = off (default).
+parser.add_argument('--eval_hole_noise_factor', type=float, default=0.0,
+                    help='Eval-only: add N(0, factor*hole_radius) noise to '
+                         'the hole-centroid xyz every timestep. 0 = off. '
+                         'Used for the "noisy privileged" runs. Does NOT '
+                         'affect training data; only the eval rollouts.')
+
+# Failed-episode full videos. Independent of --video_every_evals (which only
+# records the first --n_video_episodes into a single highlight mp4). When on,
+# EVERY eval episode's frames are captured and any episode that fails (under
+# --success_metric) is encoded to its own full mp4 and logged to wandb. This
+# means every eval episode pays the per-step render cost (~6-10 s/episode),
+# so it materially slows eval — that is the accepted trade for full failure
+# coverage.
+parser.add_argument('--record_failed_videos', action='store_true',
+                    default=True,
+                    help='Record a full mp4 of every FAILED eval episode '
+                         '(under --success_metric) and log it to wandb. '
+                         'Applies to mid-training and final eval. On by '
+                         'default; pass --no_record_failed_videos to skip '
+                         '(restores the cheaper first-N-only video path).')
+parser.add_argument('--no_record_failed_videos', dest='record_failed_videos',
+                    action='store_false')
+parser.add_argument('--max_failed_videos_per_eval', type=int, default=0,
+                    help='Cap on how many failed-episode mp4s to log per '
+                         'eval pass (0 = unlimited; log every failure). '
+                         'Frames are still captured for all episodes '
+                         'regardless — this only bounds wandb upload / disk.')
+
 # wandb
 parser.add_argument('--use_wandb', action='store_true')
 parser.add_argument('--wandb_project', type=str, default='hang_bc_diffusion')
@@ -303,6 +355,21 @@ if args.eval_all_in:
     args.eval_only = True
 elif args.eval_only and not args.resume:
     parser.error('--eval_only requires --resume to point at a checkpoint.')
+
+# Eval-time hole noise only makes sense where a hole centroid is exposed.
+if args.eval_hole_noise_factor < 0:
+    parser.error('--eval_hole_noise_factor must be >= 0.')
+if args.eval_hole_noise_factor > 0:
+    if args.obs_mode == 'state' and args.state_key != 'hole_centroid':
+        parser.error(
+            '--eval_hole_noise_factor requires state_key=hole_centroid for '
+            'obs_mode=state (the centroid lives at dims 12:15 of that '
+            f'vector); got state_key={args.state_key!r}.')
+    if args.obs_mode in ('rgb', 'pcd'):
+        parser.error(
+            f'--eval_hole_noise_factor has no hole centroid to perturb for '
+            f'obs_mode={args.obs_mode!r}. Use obs_mode=state '
+            f'(state_key=hole_centroid) or obs_mode=pcd_priv.')
 
 
 # =============================================================================
@@ -351,6 +418,12 @@ def build_diffusion_run_suffix(a):
         parts.append(f'_ah{a.action_horizon}')
     if a.success_metric != 'hanging':
         parts.append(f'_sm-{a.success_metric}')
+    if a.eval_hole_noise_factor > 0:
+        # Put the eval-time hole-noise factor in the run name so it shows up
+        # in the wandb run path AND the on-disk logdir path. Marks the noisy-
+        # privileged eval runs distinctly (the trained weights are identical
+        # to the clean run; only eval differs).
+        parts.append(f'_noise{a.eval_hole_noise_factor:g}')
     if not a.only_success:
         parts.append('_all-demos')
     parts.append(f'_s{a.seed}')
@@ -383,6 +456,9 @@ if args.use_wandb:
     ]
     if args.obs_mode == 'state':
         wandb.run.tags = list(wandb.run.tags) + [f'state_key={args.state_key}']
+    if args.eval_hole_noise_factor > 0:
+        wandb.run.tags = list(wandb.run.tags) + [
+            f'hole_noise={args.eval_hole_noise_factor:g}']
 
 
 # =============================================================================
@@ -449,8 +525,18 @@ recorded_demo_speeds: set = set()
 # Eval must terminate inside (or very close to) the same window or the
 # policy runs OOD for the tail of every episode and drifts arbitrarily.
 recorded_episode_lengths: list = []
-needs_grip = args.obs_mode in ('rgb', 'pcd')  # state already has grip
-needs_goal = args.obs_mode in ('rgb', 'pcd')  # state already has goal
+# Visual modes load grip/goal as separate aux inputs. pcd_priv additionally
+# loads the privileged 3-d hole centroid (sliced from the recorded
+# hole_centroid state vector) as a third aux input. state mode bakes all of
+# these into its 18-dim vector already.
+needs_grip = args.obs_mode in ('rgb', 'pcd', 'pcd_priv')  # state has grip
+needs_goal = args.obs_mode in ('rgb', 'pcd', 'pcd_priv')  # state has goal
+needs_priv = args.obs_mode == 'pcd_priv'
+# Demo-pkl key holding the primary obs for this mode. pcd_priv reuses the
+# 'pcd' tensor (it just adds an aux privileged input on top of it).
+_PRIMARY_OBS_KEY = {'pcd_priv': 'pcd'}.get(args.obs_mode, args.obs_mode)
+priv_buf: list = []
+n_missing_priv = 0
 n_missing_grip = 0
 n_missing_goal = 0
 
@@ -474,12 +560,13 @@ for fname in demo_paths:
             continue
         obs = d['obs'][args.state_key]
     else:
-        if args.obs_mode not in d['obs']:
-            print(f'[demo] {fname}: missing obs key {args.obs_mode!r}, '
-                  f'skipping (re-collect with collect_bc_demos.py)')
+        if _PRIMARY_OBS_KEY not in d['obs']:
+            print(f'[demo] {fname}: missing obs key {_PRIMARY_OBS_KEY!r} '
+                  f'(for obs_mode={args.obs_mode!r}), skipping (re-collect '
+                  f'with collect_bc_demos.py)')
             n_skipped += 1
             continue
-        obs = d['obs'][args.obs_mode]
+        obs = d['obs'][_PRIMARY_OBS_KEY]
     acts = d['acts']
     if len(obs) != len(acts):
         print(f'[demo] {fname}: obs/act length mismatch '
@@ -507,6 +594,19 @@ for fname in demo_paths:
             goal_arr = np.zeros((len(acts), 3), dtype=np.float32)
             n_missing_goal += 1
         goal_buf.append(np.asarray(goal_arr, dtype=np.float32))
+    # Auxiliary privileged hole centroid (only for pcd_priv). Sliced from the
+    # recorded 18-dim hole_centroid state vector (grip[12] + centroid[3] +
+    # goal[3]); we keep the centroid triple only — grip and goal are already
+    # loaded above. Stored /WBOX-normalized exactly as the state vector holds
+    # them, so eval-time noise is added in the same normalized space.
+    if needs_priv:
+        hc = d['obs'].get('hole_centroid')
+        if hc is None:
+            priv_arr = np.zeros((len(acts), 3), dtype=np.float32)
+            n_missing_priv += 1
+        else:
+            priv_arr = np.asarray(hc, dtype=np.float32)[:, _HOLE_CENTROID_SLICE]
+        priv_buf.append(np.asarray(priv_arr, dtype=np.float32))
     # Track metadata used for eval-env construction.
     if 'cam_resolution' in d:
         recorded_cam_resolutions.add(int(d['cam_resolution']))
@@ -549,6 +649,8 @@ grip_all = (np.concatenate(grip_buf, axis=0)
             if needs_grip and grip_buf else None)
 goal_all = (np.concatenate(goal_buf, axis=0)
             if needs_goal and goal_buf else None)
+priv_all = (np.concatenate(priv_buf, axis=0)
+            if needs_priv and priv_buf else None)
 episode_ends = np.asarray(ep_ends, dtype=np.int64)
 print(f'[data] kept {len(obs_buf)}/{n_total} demos  '
       f'(skipped {n_skipped})')
@@ -567,6 +669,13 @@ if goal_all is not None:
         print(f'[data] WARN: {n_missing_goal} demo pkl(s) missing the '
               f'"goal" key. Used zero-goal fallback for those demos — '
               f're-collect with the updated collect_bc_demos.py to fix.')
+if priv_all is not None:
+    print(f'[data] priv shape = {priv_all.shape}  '
+          f'(privileged hole centroid; concat with pcd+grip+goal in encoder)')
+    if n_missing_priv > 0:
+        print(f'[data] WARN: {n_missing_priv} demo pkl(s) missing the '
+              f'"hole_centroid" key. Used zero-centroid fallback for those '
+              f'demos — re-collect with collect_bc_demos.py to fix.')
 print(f'[data] act  shape = {acts_all.shape}')
 
 # Sanity checks across demo pkls. Mismatch on any of these would cause
@@ -848,12 +957,13 @@ class DiffusionBCDataset(Dataset):
     collection time (the ActionNormalizer is a no-op).
     """
 
-    def __init__(self, obs_all, grip_all, goal_all, acts_all, episode_ends,
-                 obs_horizon, pred_horizon, action_horizon, obs_mode,
-                 obs_normalizer, act_normalizer):
+    def __init__(self, obs_all, grip_all, goal_all, priv_all, acts_all,
+                 episode_ends, obs_horizon, pred_horizon, action_horizon,
+                 obs_mode, obs_normalizer, act_normalizer):
         self.obs_all = obs_all
         self.grip_all = grip_all  # None for state-mode
         self.goal_all = goal_all  # None for state-mode
+        self.priv_all = priv_all  # None unless pcd_priv
         self.acts_all = acts_all
         # pad_after = action_horizon - 1 matches the pusht reference
         # (diffusion_policy_state_pusht_demo.py:731). Each padded window
@@ -908,6 +1018,10 @@ class DiffusionBCDataset(Dataset):
         goal_seq = goal_seq[:self.obs_horizon]
         primary_key = 'image' if self.obs_mode == 'rgb' else 'pcd'
         sample = {primary_key: obs_seq, 'grip': grip_seq, 'goal': goal_seq}
+        if self.obs_mode == 'pcd_priv':
+            priv_slice = self.priv_all[bs:be]
+            priv_seq = self._pad(priv_slice, self.pred_horizon, ss, se)
+            sample['priv'] = priv_seq[:self.obs_horizon]
         return self.obs_normalizer.apply(sample), act_seq
 
 
@@ -943,7 +1057,7 @@ def _to_device(obs, device):
 
 
 dataset = DiffusionBCDataset(
-    obs_all, grip_all, goal_all, acts_all, episode_ends,
+    obs_all, grip_all, goal_all, priv_all, acts_all, episode_ends,
     obs_horizon=args.obs_horizon, pred_horizon=args.pred_horizon,
     action_horizon=args.action_horizon, obs_mode=args.obs_mode,
     obs_normalizer=obs_normalizer, act_normalizer=act_normalizer)
@@ -964,10 +1078,13 @@ if args.obs_mode == 'state':
     enc_kwargs = {'state_dim': int(obs_all.shape[-1])}
 elif args.obs_mode == 'rgb':
     enc_kwargs = {'pretrained': args.pretrained_rgb}
-elif args.obs_mode == 'pcd':
+elif args.obs_mode in ('pcd', 'pcd_priv'):
     # Use the actual n_pts from the saved data (handles both 256 and 512
     # demos cleanly; PointCloudObsEncoder treats it as a fixed input size).
     enc_kwargs = {'n_points': int(obs_all.shape[-2]), 'feat_dim': 256}
+    if args.obs_mode == 'pcd_priv':
+        # 3-d privileged hole centroid appended as an aux input.
+        enc_kwargs['priv_dim'] = 3
 
 encoder = build_encoder(args.obs_mode, enc_kwargs).to(device)
 policy = DiffusionPolicy(
@@ -1097,18 +1214,59 @@ def _build_eval_env(eval_seed):
     return e, dargs
 
 
+def _perturb_centroid(centroid_norm, hole_noise_std, noise_rng):
+    """Add eval-only Gaussian noise to a /WBOX-normalized hole-centroid xyz.
+
+    `hole_noise_std` is already expressed in normalized units (meters / WBOX).
+    Noise is independent per coordinate and drawn fresh on every call so the
+    perturbation is regenerated each timestep. EVAL-ONLY — never invoked on
+    the training path. Does not mutate the input.
+
+    Returns (perturbed_centroid, noise_vec) where `noise_vec` is the applied
+    3-d noise in the SAME normalized units (all-zeros when no noise is added)
+    — the caller scales it to meters for the eval-video overlay and the
+    per-step noise plots.
+    """
+    if hole_noise_std <= 0:
+        return (np.asarray(centroid_norm, dtype=np.float32),
+                np.zeros(3, dtype=np.float32))
+    rng = noise_rng if noise_rng is not None else np.random
+    noise = rng.normal(0.0, hole_noise_std, size=3).astype(np.float32)
+    perturbed = np.asarray(centroid_norm, dtype=np.float32) + noise
+    return perturbed, noise
+
+
 def _capture_obs_for_policy(deform, obs_mode, state_key,
-                            hole_idx, corner_idx):
+                            hole_idx, corner_idx,
+                            hole_noise_std=0.0, noise_rng=None):
     """Return one obs sample matching what the dataset saw at training
     time (UN-normalized — the obs_normalizer is applied next).
 
-    state mode: returns a single ndarray (state_dim,).
-    rgb / pcd:  returns a dict {primary, grip, goal} with the same keys
-                the training dataset returns.
+    state mode:  obs is a single ndarray (state_dim,).
+    rgb / pcd:   obs is a dict {primary, grip, goal}.
+    pcd_priv:    obs is a dict {pcd, grip, goal, priv} where priv is the
+                 privileged 3-d hole centroid (/WBOX-normalized).
+
+    `hole_noise_std` (in normalized units = meters / WBOX) adds eval-only
+    Gaussian noise to the hole centroid — for obs_mode=state(hole_centroid)
+    it perturbs dims 12:15 of the vector; for pcd_priv it perturbs the
+    `priv` triple. 0 = no noise (the clean privileged obs).
+
+    Returns (obs, noise_vec_m): the realized 3-d noise in METERS this timestep
+    (all-zeros when no noise applied), used for the eval-video overlay and the
+    per-step noise plots.
     """
     if obs_mode == 'state':
-        return build_privileged_obs(
+        obs = build_privileged_obs(
             deform, state_key, hole_idx, corner_indices=corner_idx)
+        noise_vec_m = np.zeros(3, dtype=np.float32)
+        if hole_noise_std > 0 and state_key == 'hole_centroid':
+            obs = obs.copy()
+            perturbed, noise_vec = _perturb_centroid(
+                obs[_HOLE_CENTROID_SLICE], hole_noise_std, noise_rng)
+            obs[_HOLE_CENTROID_SLICE] = perturbed
+            noise_vec_m = noise_vec * _WBOX
+        return obs, noise_vec_m
 
     # Shared grip capture — matches PixelObsWrapper/PointCloudObsWrapper
     # and collect_bc_demos.py: 12-dim, /WBOX-normalized, clipped to [-2, 2].
@@ -1118,12 +1276,13 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
     # saves into every demo pkl under obs['goal'] — given to RGB/PCD
     # alongside grip so the eval-time obs matches training exactly.
     goal = np.asarray(deform.goal_pos[0], dtype=np.float32) / 20.0
+    _zero_noise = np.zeros(3, dtype=np.float32)
 
     if obs_mode == 'rgb':
         rgb, _, _, _, _ = capture_rgb_depth(
             deform, eval_cam_resolution, eval_cam_resolution)
-        return {'image': rgb, 'grip': grip, 'goal': goal}
-    if obs_mode == 'pcd':
+        return {'image': rgb, 'grip': grip, 'goal': goal}, _zero_noise
+    if obs_mode in ('pcd', 'pcd_priv'):
         from _bc_obs_helpers import cloth_only_pcd as _cloth_only_pcd
         _, depth, seg, view, proj = capture_rgb_depth(
             deform, eval_cam_resolution, eval_cam_resolution)
@@ -1131,7 +1290,21 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
         # eval-time PCD has the same distribution the encoder trained on.
         pcd = _cloth_only_pcd(depth, seg, view, proj,
                               deform.deform_id, collection_pcd_n_pts)
-        return {'pcd': pcd, 'grip': grip, 'goal': goal}
+        sample = {'pcd': pcd, 'grip': grip, 'goal': goal}
+        noise_vec_m = _zero_noise
+        if obs_mode == 'pcd_priv':
+            # Privileged hole centroid (/WBOX-normalized) sliced from the
+            # same hole_centroid builder the state mode uses, so training and
+            # eval share one source of truth. Noisy at eval iff factor > 0.
+            priv_vec = build_privileged_obs(
+                deform, 'hole_centroid', hole_idx, corner_indices=corner_idx)
+            priv = np.asarray(
+                priv_vec[_HOLE_CENTROID_SLICE], dtype=np.float32)
+            priv, noise_vec = _perturb_centroid(
+                priv, hole_noise_std, noise_rng)
+            noise_vec_m = noise_vec * _WBOX
+            sample['priv'] = priv
+        return sample, noise_vec_m
     raise AssertionError
 
 
@@ -1171,11 +1344,22 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
 
     If `record_video_episodes > 0`, captures rendered RGB frames for the
     first N episodes (including the post-settle phase via dedo's
-    `_record_settle_frames` hook), encodes them to a single mp4 in the
-    logdir, and logs it to wandb under `<label>/video`. The remaining
-    `n_episodes - record_video_episodes` rollouts run without capture so
-    the success-rate aggregate isn't biased by the slower recorded
-    episodes.
+    `_record_settle_frames` hook), encodes them to a single concatenated
+    "highlight" mp4 in the logdir, and stashes its path under
+    `<label>/_video_path` for the caller to log to wandb as `<label>/video`.
+
+    If `args.record_failed_videos` is set, EVERY episode's frames are also
+    captured (not just the first N), and any episode that fails under
+    `args.success_metric` is encoded to its own full mp4. Their paths are
+    returned under `<label>/_fail_video_paths` (a list) so the caller can
+    log them together under `<label>/fail_videos`. This makes every episode
+    pay the per-step render cost — the accepted trade for full failure
+    coverage. `args.max_failed_videos_per_eval` caps how many are written
+    per pass (0 = unlimited).
+
+    If `args.eval_hole_noise_factor > 0`, the hole-centroid obs fed to the
+    policy is perturbed with N(0, factor*hole_radius) noise every timestep
+    (the "noisy privileged" eval). Training data is never touched.
     """
     encoder.eval()
     policy.eval()
@@ -1190,19 +1374,49 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
     # make_final_steps settle frames all render through fov=60, matching
     # `capture_rgb_depth`. No per-call patching needed here.
 
-    # Per-episode RGB frame buffers populated only for the first
-    # `record_video_episodes` rollouts. Outer list is one entry per
-    # recorded episode; inner list is all frames from that episode
+    # Per-episode RGB frame buffers for the first `record_video_episodes`
+    # rollouts (the concatenated "highlight" mp4). Outer list is one entry
+    # per recorded episode; inner list is all frames from that episode
     # (policy phase + post-settle).
     recorded_episode_frames = []  # list of list of (H,W,3) uint8
+    # Paths of per-episode mp4s for FAILED episodes (when
+    # args.record_failed_videos). One file per failed episode.
+    fail_video_paths = []
+    n_failed = 0
+    n_failed_logged = 0
+
+    # Dedicated RNG for eval-time hole-centroid noise, seeded off the eval
+    # seed so the noisy-privileged eval is reproducible across passes without
+    # disturbing the global np.random stream (which env resampling relies on).
+    noise_rng = np.random.RandomState(eval_seed + 777)
+
+    # Per-step realized noise (meters), concatenated across all episodes in
+    # this eval pass, for the 3 saved plots. ep_noise_boundaries marks where
+    # each episode ends so the plots can show episode breaks.
+    noise_y_series = []
+    noise_z_series = []
+    noise_mag_series = []
+    ep_noise_boundaries = []
 
     s_hanging = s_topo = s_legacy = 0
     ep_rwds = []
     ep_lens = []
     for ep in range(n_episodes):
         is_recorded = ep < record_video_episodes
-        ep_frames = []  # filled only if is_recorded
+        # Capture frames for this episode if it's a highlight episode OR if
+        # failed-episode video recording is on (any episode might fail, and
+        # we only know after it finishes — so we must capture eagerly).
+        capture_this_ep = is_recorded or args.record_failed_videos
+        ep_frames = []  # filled only if capture_this_ep
         e.reset()
+        # DeformEnv.reset() calls load_objects() → preset_override_util(),
+        # which reads sys.argv to decide which args to preserve. Since
+        # _build_eval_env() restores sys.argv in its finally block, --cam_viewmat
+        # is no longer in sys.argv here, so preset_override_util clobbers
+        # dargs.cam_viewmat back to the procedural_hang_cloth preset value
+        # ([8.8, -12.6, yaw=314, ...]) every reset. Re-lock the correct
+        # viewmat so captures and renders always use the collection camera.
+        deform.args.cam_viewmat = list(eval_cam_viewmat)
         # Tell dedo to capture post-settle frames during make_final_steps
         # (the 500-step gravity phase that runs inside step() when done
         # fires). MUST be set AFTER e.reset() — collect_bc_demos.py uses
@@ -1212,7 +1426,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         # info['settle_frames'] would be missing. With this ordering the
         # flag is fresh-set on the deform every episode and persists
         # through env.step()'s call to make_final_steps.
-        if is_recorded:
+        if capture_this_ep:
             deform._record_settle_frames = True
             deform._settle_render_kwargs = dict(
                 width=args.video_render_size,
@@ -1225,11 +1439,18 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             # Skip degenerate clothes — count as failure to keep n_episodes honest.
             ep_rwds.append(0.0)
             ep_lens.append(0)
+            n_failed += 1
             continue
         hole_loops = get_hole_loops(deform)
         _, verts0 = get_mesh_data(deform.sim, deform.deform_id)
         corner_idx = identify_cloth_corners(verts0)
         hole_radius = measure_hole_radius(deform, hole_idx)
+        # Eval-only hole-centroid noise std, in /WBOX-normalized units (the
+        # space the stored centroid lives in). 0 unless this is a noisy-
+        # privileged eval. Fixed per episode (hole_radius measured at reset),
+        # but the noise sample itself is regenerated every timestep.
+        hole_noise_std = (args.eval_hole_noise_factor * hole_radius / _WBOX
+                          if args.eval_hole_noise_factor > 0 else 0.0)
 
         # Per-episode max_ep_len: mirror collect_bc_demos.py exactly —
         # build the scripted trajectory for THIS cloth (the demo
@@ -1254,10 +1475,23 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         deform.max_episode_len = _per_ep_max
 
         # Prime obs deque with the initial obs (repeated obs_horizon times).
-        first_obs = _capture_obs_for_policy(
-            deform, args.obs_mode, args.state_key, hole_idx, corner_idx)
+        first_obs, first_noise_vec = _capture_obs_for_policy(
+            deform, args.obs_mode, args.state_key, hole_idx, corner_idx,
+            hole_noise_std=hole_noise_std, noise_rng=noise_rng)
         obs_deque = collections.deque(
             [first_obs] * args.obs_horizon, maxlen=args.obs_horizon)
+
+        # Per-frame noise overlay bookkeeping. `last_noise_pct` is the realized
+        # ||noise|| as a % of the hole radius for the obs currently driving the
+        # policy; we stamp it onto each policy-phase frame. None when noise is
+        # off (clean runs) so the overlay omits the noise line.
+        def _noise_pct(noise_mag_m):
+            if hole_noise_std <= 0 or hole_radius <= 0:
+                return None
+            return 100.0 * noise_mag_m / hole_radius
+        last_noise_pct = _noise_pct(float(np.linalg.norm(first_noise_vec)))
+        # Parallel to ep_frames: one noise-pct (or None) per captured frame.
+        ep_frame_noise_pct = []
 
         ep_rwd = 0.0
         step = 0
@@ -1280,45 +1514,101 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
                 _, rwd, done, info = e.step(a)
                 ep_rwd += float(rwd)
                 step += 1
-                if is_recorded:
+                if capture_this_ep:
                     # Pre-settle policy-phase frame. On the terminal step
                     # (done=True), dedo's make_final_steps already ran
                     # INSIDE this step() call, and settle_frames is in
                     # `info` — we append those below after the loop. We
                     # still capture this one frame to mark the policy
-                    # handoff.
+                    # handoff. Stamp it with the noise level that was in the
+                    # obs that produced this action (last_noise_pct).
                     ep_frames.append(deform.render(
                         mode='rgb_array',
                         width=args.video_render_size,
                         height=args.video_render_size))
-                new_obs = _capture_obs_for_policy(
+                    ep_frame_noise_pct.append(last_noise_pct)
+                new_obs, step_noise_vec = _capture_obs_for_policy(
                     deform, args.obs_mode, args.state_key,
-                    hole_idx, corner_idx)
+                    hole_idx, corner_idx,
+                    hole_noise_std=hole_noise_std, noise_rng=noise_rng)
+                step_noise_mag = float(np.linalg.norm(step_noise_vec))
+                last_noise_pct = _noise_pct(step_noise_mag)
+                if hole_noise_std > 0:
+                    # cloth y / z = world y (idx 1) / z (idx 2): the cloth
+                    # lies in the world y-z plane, so these are its in-plane
+                    # axes. One sample per env step, concatenated across eps.
+                    noise_y_series.append(float(step_noise_vec[1]))
+                    noise_z_series.append(float(step_noise_vec[2]))
+                    noise_mag_series.append(step_noise_mag)
                 obs_deque.append(new_obs)
                 if done or step >= _per_ep_max:
                     break
+        if hole_noise_std > 0:
+            ep_noise_boundaries.append(len(noise_mag_series))
         # Append the post-settle (gravity-phase) frames captured by
         # dedo inside make_final_steps. `info['settle_frames']` exists
-        # iff `_record_settle_frames` was True at the terminal step.
-        if is_recorded:
+        # iff `_record_settle_frames` was True at the terminal step. Settle
+        # frames are physics-only (no policy obs), so their noise overlay is
+        # None.
+        if capture_this_ep:
             settle_frames = info.get('settle_frames', []) if isinstance(
                 info, dict) else []
             ep_frames.extend(settle_frames)
-            recorded_episode_frames.append(ep_frames)
+            ep_frame_noise_pct.extend([None] * len(settle_frames))
             deform._record_settle_frames = False  # turn off for next ep
 
         # Score this episode with all three metrics for cross-comparison.
-        s_hanging += int(check_hanging_on_peg(
+        ep_hanging = int(check_hanging_on_peg(
             deform, hole_idx, hole_radius, args.success_factor))
         st, _ = check_threaded_topological(deform, hole_loops)
-        s_topo += int(st)
-        s_legacy += int(check_legacy(
+        ep_topo = int(st)
+        ep_legacy = int(check_legacy(
             deform, hole_idx, hole_radius, args.success_factor))
+        s_hanging += ep_hanging
+        s_topo += ep_topo
+        s_legacy += ep_legacy
+        # Per-episode pass/fail under the headline metric.
+        ep_primary = {'hanging': ep_hanging, 'topological': ep_topo,
+                      'legacy': ep_legacy}[args.success_metric]
         ep_rwds.append(ep_rwd)
         ep_lens.append(step)
         print(f'  [{label} ep {ep+1}/{n_episodes}] '
               f'rwd={ep_rwd:6.1f}  len={step:3d}  '
-              f'h={s_hanging}/{ep+1} t={s_topo}/{ep+1} l={s_legacy}/{ep+1}')
+              f'h={s_hanging}/{ep+1} t={s_topo}/{ep+1} l={s_legacy}/{ep+1}'
+              f'{"  [FAIL]" if ep_primary == 0 else ""}')
+
+        # Overlay PASS/FAIL (green/red) + per-frame noise % now that the
+        # episode outcome is known. Done once here so BOTH the highlight
+        # concat and the per-failure mp4 reuse the same annotated frames.
+        if capture_this_ep and ep_frames:
+            ep_frames = [
+                _annotate_eval_frame(fr, ep_primary == 1, npct)
+                for fr, npct in zip(ep_frames, ep_frame_noise_pct)]
+        if is_recorded:
+            recorded_episode_frames.append(ep_frames)
+
+        # Full mp4 of every failed episode (under the headline metric), up to
+        # the per-eval cap. Frames were already captured above because
+        # capture_this_ep covered all episodes when record_failed_videos is on.
+        if ep_primary == 0:
+            n_failed += 1
+            if (args.record_failed_videos and ep_frames
+                    and (args.max_failed_videos_per_eval <= 0
+                         or n_failed_logged
+                         < args.max_failed_videos_per_eval)):
+                fail_filename = (
+                    f'{label}{("_" + video_label) if video_label else ""}'
+                    f'_failep{ep:03d}.mp4')
+                fail_path = os.path.join(logdir, fail_filename)
+                try:
+                    _write_mp4(ep_frames, fail_path, fps=args.video_fps)
+                    fail_video_paths.append(fail_path)
+                    n_failed_logged += 1
+                    print(f'  [video] wrote FAIL {fail_path} '
+                          f'({len(ep_frames)} frames)')
+                except Exception as _fail_video_err:
+                    print(f'  [video] WARN: fail mp4 encode failed: '
+                          f'{_fail_video_err!r}')
 
     # Encode the captured episodes into one mp4 (concat). One file per
     # eval pass is plenty — separate episodes can be told apart by the
@@ -1337,6 +1627,23 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         except Exception as _video_err:
             print(f'  [video] WARN: mp4 encode failed: {_video_err!r}')
             video_path = None
+
+    # Save the 3 per-step noise plots for this eval pass (only when noise is
+    # active — clean runs would just be flat-zero lines). Episode boundaries
+    # exclude the final one (== series length) so we don't draw a line at the
+    # right edge.
+    noise_plot_paths = {}
+    if args.eval_hole_noise_factor > 0 and noise_mag_series:
+        plot_prefix = os.path.join(
+            logdir,
+            f'{label}{("_" + video_label) if video_label else ""}_noise')
+        noise_plot_paths = _save_noise_plots(
+            noise_y_series, noise_z_series, noise_mag_series,
+            out_prefix=plot_prefix,
+            ep_boundaries=ep_noise_boundaries[:-1],
+            title_suffix=f'({label}'
+                         f'{(" " + video_label) if video_label else ""}, '
+                         f'factor={args.eval_hole_noise_factor:g})')
 
     e.close()
     # Restore non-EMA weights.
@@ -1362,12 +1669,22 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         f'{label}/std_reward': float(np.std(ep_rwds)),
         f'{label}/mean_episode_len': float(np.mean(ep_lens)),
         f'{label}/n_episodes': n_episodes,
+        f'{label}/n_failed': n_failed,
     }
     # Stash the on-disk video path for the caller (so it can wandb.log
     # the wandb.Video with the right epoch-tagged caption alongside the
     # numeric metrics, in a single wandb.log call).
     if video_path is not None:
         metrics[f'{label}/_video_path'] = video_path
+    # Stash failed-episode mp4 paths (list) for the caller to log together
+    # under <label>/fail_videos. Underscore-prefixed so the numeric-metrics
+    # logging loops skip it (same convention as _video_path).
+    if fail_video_paths:
+        metrics[f'{label}/_fail_video_paths'] = fail_video_paths
+    # Stash the noise-plot paths (dict name->path) for the caller to log as
+    # wandb images. Underscore-prefixed so numeric-metric loops skip it.
+    if noise_plot_paths:
+        metrics[f'{label}/_noise_plot_paths'] = noise_plot_paths
     return metrics
 
 
@@ -1396,6 +1713,8 @@ with open(os.path.join(logdir, 'config.json'), 'w') as f:
         'state_dim': int(obs_all.shape[-1]) if args.obs_mode == 'state' else None,
         'action_dim': int(acts_all.shape[-1]),
         'n_dataset_windows': len(dataset),
+        'eval_hole_noise_factor': float(args.eval_hole_noise_factor),
+        'record_failed_videos': bool(args.record_failed_videos),
     }, f, indent=2)
 
 
@@ -1436,6 +1755,9 @@ _CKPT_METADATA_TEMPLATE = {
     # Saved into the ckpt so eval_diffusion_bc.py can rebuild a parity
     # eval env without the demo dir. 0.0 = fixed goal (legacy v3 behavior).
     'randomize_goal_radius': float(eval_randomize_goal_radius),
+    # Eval-time hole-centroid noise factor (std = factor * hole_radius).
+    # Eval-only; recorded so a standalone eval reproduces the same probe.
+    'eval_hole_noise_factor': float(args.eval_hole_noise_factor),
 }
 
 
@@ -1482,6 +1804,107 @@ def _save_ema_checkpoint(path, epoch=None, eval_metrics=None):
 # cv2's mp4v fourcc produces an MPEG-4 Simple Profile stream that the
 # wandb HTML5 player can't decode — videos would sit on "loading" forever.
 # =============================================================================
+# Cache the "cv2 unavailable" state so the overlay falls back silently to
+# un-annotated frames after warning once (rather than per-frame spam).
+_CV2_WARNED = False
+
+
+def _annotate_eval_frame(frame, passed: bool, noise_pct=None):
+    """Draw a PASS/FAIL banner (green/red) and, when noise is active, the
+    realized hole-noise magnitude as a percentage of the hole radius onto a
+    single (H, W, 3) uint8 RGB frame. Returns a new annotated frame; on any
+    failure (e.g. cv2 missing) returns the frame unchanged.
+
+    `passed`     — episode-level success under --success_metric (green=pass).
+    `noise_pct`  — this frame's ||noise|| as a % of the hole radius, or None
+                   to omit the noise line (clean runs / post-settle frames).
+    """
+    global _CV2_WARNED
+    try:
+        import cv2
+    except Exception:
+        if not _CV2_WARNED:
+            print('  [video] WARN: cv2 unavailable; eval videos will not be '
+                  'annotated with PASS/FAIL + noise text.')
+            _CV2_WARNED = True
+        return frame
+    try:
+        f = np.ascontiguousarray(frame, dtype=np.uint8).copy()
+        w = f.shape[1]
+        s = w / 300.0  # scale text to the render size (default 300 px)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        label = 'PASS' if passed else 'FAIL'
+        # Colors are RGB tuples (frames are RGB; cv2 just writes channels in
+        # array order). Green for pass, red for fail.
+        color = (0, 200, 0) if passed else (235, 40, 40)
+        cv2.putText(f, label, (int(8 * s), int(30 * s)), font, 0.9 * s,
+                    color, max(1, int(round(2 * s))), cv2.LINE_AA)
+        if noise_pct is not None:
+            cv2.putText(f, f'noise {noise_pct:.0f}% of r',
+                        (int(8 * s), int(54 * s)), font, 0.55 * s,
+                        (255, 235, 0), max(1, int(round(1.5 * s))),
+                        cv2.LINE_AA)
+        return f
+    except Exception as _ann_err:
+        if not _CV2_WARNED:
+            print(f'  [video] WARN: frame annotation failed ({_ann_err!r}); '
+                  f'logging un-annotated frames.')
+            _CV2_WARNED = True
+        return frame
+
+
+def _save_noise_plots(noise_y, noise_z, noise_mag, out_prefix,
+                      ep_boundaries=None, title_suffix=''):
+    """Save 3 step-indexed PNGs for one eval pass: noise along the cloth y
+    axis, noise along the cloth z axis, and total noise magnitude (all in
+    meters). x-axis is the eval-step index, concatenated across all episodes
+    in the pass; faint vertical lines mark episode boundaries.
+
+    Returns {name: path} for the caller to log to wandb, or {} on failure
+    (e.g. matplotlib missing) — never raises into the eval loop.
+    """
+    if not noise_mag:
+        return {}
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # headless (Modal / servers have no display)
+        import matplotlib.pyplot as plt
+    except Exception as _plot_err:
+        print(f'  [plot] WARN: matplotlib unavailable ({_plot_err!r}); '
+              f'skipping noise plots.')
+        return {}
+    series = [
+        ('noise_y', noise_y, 'noise along cloth y  (m)'),
+        ('noise_z', noise_z, 'noise along cloth z  (m)'),
+        ('noise_mag', noise_mag, 'total noise magnitude  (m)'),
+    ]
+    x = range(len(noise_mag))
+    paths = {}
+    for name, data, ylabel in series:
+        try:
+            fig, ax = plt.subplots(figsize=(7, 3))
+            ax.plot(x, data, lw=0.8, color='tab:blue')
+            if ep_boundaries:
+                for b in ep_boundaries:
+                    ax.axvline(b, color='0.8', lw=0.5, zorder=0)
+            ax.axhline(0.0, color='0.6', lw=0.5, zorder=0)
+            ax.set_xlabel('eval step')
+            ax.set_ylabel(ylabel)
+            ax.set_title(f'{name}{(" " + title_suffix) if title_suffix else ""}')
+            ax.grid(alpha=0.25)
+            fig.tight_layout()
+            p = f'{out_prefix}_{name}.png'
+            fig.savefig(p, dpi=100)
+            plt.close(fig)
+            paths[name] = p
+        except Exception as _fig_err:
+            print(f'  [plot] WARN: failed to write {name} plot: {_fig_err!r}')
+    if paths:
+        print(f'  [plot] wrote {len(paths)} noise plot(s): '
+              f'{", ".join(os.path.basename(p) for p in paths.values())}')
+    return paths
+
+
 def _write_mp4(frames, path: str, fps: int = 30) -> None:
     if not frames:
         return
@@ -1575,6 +1998,8 @@ for epoch in (range(0) if args.eval_only
         # numeric metrics dict stays clean (wandb.log uses the path to
         # build a wandb.Video object instead of stringifying it).
         video_path = eval_metrics.pop('eval/_video_path', None)
+        fail_video_paths = eval_metrics.pop('eval/_fail_video_paths', None)
+        noise_plot_paths = eval_metrics.pop('eval/_noise_plot_paths', None)
         for k, v in eval_metrics.items():
             print(f'    {k}: {v}')
         if args.use_wandb:
@@ -1584,6 +2009,15 @@ for epoch in (range(0) if args.eval_only
                     video_path, fps=args.video_fps,
                     caption=f'epoch {epoch+1} | '
                             f'success_rate={eval_metrics["eval/success_rate"]:.2f}')
+            if fail_video_paths:
+                log_dict['eval/fail_videos'] = [
+                    wandb.Video(p, fps=args.video_fps,
+                                caption=f'epoch {epoch+1} FAIL | '
+                                        f'{os.path.basename(p)}')
+                    for p in fail_video_paths]
+            if noise_plot_paths:
+                for _name, _p in noise_plot_paths.items():
+                    log_dict[f'eval/{_name}'] = wandb.Image(_p)
             wandb.log(log_dict)
 
         # --- Periodic numbered checkpoint (opt-in via --save_every_epochs).
@@ -1663,6 +2097,9 @@ if args.eval_all_in:
             record_video_episodes=reeval_record_n,
             video_label=f'ep{ep:04d}')
         reeval_video_path = reeval_metrics.pop('reeval/_video_path', None)
+        reeval_fail_paths = reeval_metrics.pop('reeval/_fail_video_paths', None)
+        reeval_noise_plots = reeval_metrics.pop(
+            'reeval/_noise_plot_paths', None)
         for k, v in sorted(reeval_metrics.items()):
             print(f'  {k}: {v}')
         if args.use_wandb:
@@ -1674,6 +2111,15 @@ if args.eval_all_in:
                     caption=f'ep{ep:04d} | '
                             f'success_rate='
                             f'{reeval_metrics["reeval/success_rate"]:.2f}')
+            if reeval_fail_paths:
+                log_dict['reeval/fail_videos'] = [
+                    wandb.Video(p, fps=args.video_fps,
+                                caption=f'ep{ep:04d} FAIL | '
+                                        f'{os.path.basename(p)}')
+                    for p in reeval_fail_paths]
+            if reeval_noise_plots:
+                for _name, _p in reeval_noise_plots.items():
+                    log_dict[f'reeval/{_name}'] = wandb.Image(_p)
             wandb.log(log_dict, step=ep)
     print('\n=== --eval_all_in: done ===')
 else:
@@ -1689,6 +2135,8 @@ else:
         record_video_episodes=final_record_n,
         video_label='final')
     final_video_path = final_metrics.pop('final_eval/_video_path', None)
+    final_fail_paths = final_metrics.pop('final_eval/_fail_video_paths', None)
+    final_noise_plots = final_metrics.pop('final_eval/_noise_plot_paths', None)
     print('\nFinal eval:')
     for k, v in sorted(final_metrics.items()):
         print(f'  {k}: {v}')
@@ -1699,6 +2147,14 @@ else:
                 final_video_path, fps=args.video_fps,
                 caption=f'final | '
                         f'success_rate={final_metrics["final_eval/success_rate"]:.2f}')
+        if final_fail_paths:
+            log_dict['final_eval/fail_videos'] = [
+                wandb.Video(p, fps=args.video_fps,
+                            caption=f'final FAIL | {os.path.basename(p)}')
+                for p in final_fail_paths]
+        if final_noise_plots:
+            for _name, _p in final_noise_plots.items():
+                log_dict[f'final_eval/{_name}'] = wandb.Image(_p)
         wandb.log(log_dict)
 
 

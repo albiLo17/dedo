@@ -64,6 +64,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import gym
 import numpy as np
 import pybullet
+import trimesh
 
 import dedo  # noqa: F401  (registers gym envs)
 from dedo.envs.deform_env import DeformEnv
@@ -700,6 +701,19 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         continue
 
     # 4) Save pkl.
+    # Cloth triangulation for THIS episode's procedural mesh. The cloth is
+    # re-randomized (size + hole placement) every reset and saved to a unique
+    # /tmp path, so faces must be stored per-demo. They let a geometry-only
+    # replay (pick_camera_angle.py) reconstruct the exact recorded cloth
+    # surface without re-simulating — re-simulation can't reproduce a demo
+    # because the env builds a structurally different cloth each reset.
+    try:
+        cloth_faces = np.asarray(
+            trimesh.load(deform.args.deform_obj, process=False,
+                         force='mesh').faces, dtype=np.int32)
+    except Exception as _e:
+        print(f'  [warn] could not load cloth faces: {_e!r}')
+        cloth_faces = np.zeros((0, 3), dtype=np.int32)
     demo_id = _next_demo_id()
     out_path = os.path.join(extra.demos_dir, f'demo_{demo_id:03d}.pkl')
     payload = {
@@ -737,6 +751,9 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         'pcd_n_points': int(extra.pcd_n_points),
         'cam_viewmat': list(extra.cam_viewmat),
         'hole_radius': float(hole_radius),
+        # Per-episode cloth triangulation (F, 3). Enables physics-free
+        # geometry replay of obs['full_mesh'] in pick_camera_angle.py.
+        'cloth_faces': cloth_faces,
         'max_act_vel': float(DeformEnv.MAX_ACT_VEL),
         # Control-frequency parity. The trajectory was built at this
         # ctrl_freq and each row of `acts` advances 1/ctrl_freq seconds

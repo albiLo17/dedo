@@ -56,7 +56,7 @@ import modal
 
 APP_NAME = "hang-diffusion-bc"
 VOLUME_NAME = "hang-bc-data"
-DEMOS_SUBDIR = "bc_demos_randgoal_0.3_full"
+DEMOS_SUBDIR = "bc_demos_randgoal_0.3_full_cameraview_86"
 LOGS_SUBDIR = "diffusion_bc"
 
 app = modal.App(APP_NAME)
@@ -195,7 +195,7 @@ def collect_demos():
         "--cam_resolution", "128",
         "--pcd_n_points", "2048",
         "--max_act_vel", "4.0",
-        "--success_metric", "legacy",
+        "--success_metric", "hanging",
         "--success_factor", "1.2",
         "--ctrl_freq", "15",
         "--max_episode_len", "200",
@@ -224,17 +224,17 @@ _TRAIN_BASE_CMD = [
     "python", "experiments/hang_obs_exp/scripts/train_diffusion_bc.py",
     "--demo_path", DEMOS_PATH,
     "--action_horizon", "4",
-    "--success_metric", "legacy",
+    "--success_metric", "hanging",
     "--success_factor", "1.2",
-    "--num_epochs", "300",
+    "--num_epochs", "500",
     "--lr", "1e-4",
     "--num_workers", "2",
     "--eval_every_epochs", "20",
     "--n_eval_episodes", "30",
     "--n_final_eval_episodes", "100",
-    "--save_every_epochs", "20",
+    "--save_every_epochs", "40",
     "--use_wandb",
-    "--wandb_project", "hang_bc_diffusion",
+    "--wandb_project", "hang_bc_diffusion_cameraview_86",
     "--seed", "2026",
     "--logdir_root", f"{LOGS_PATH}/runs",
 ]
@@ -289,6 +289,55 @@ def train_pcd():
     _run_train(
         ["--obs_mode", "pcd", "--batch_size", "128"],
         "pcd.log",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Two extra runs requested: "noisy privileged" probes.
+#
+# train_noisy_state:    same training as train_state (clean privileged
+#                       hole_centroid), but eval perturbs the hole centroid
+#                       with N(0, 0.2*hole_radius) noise every timestep
+#                       (--eval_hole_noise_factor). Tests how a privileged
+#                       BC policy degrades under noisy hole estimates.
+#
+# train_noisy_pcd_priv: PointNet++ on the cloth PCD WITH the privileged 3-d
+#                       hole centroid appended as an aux input (obs_mode
+#                       pcd_priv). Trained on the clean centroid; eval adds
+#                       the same 0.2*hole_radius noise. Tests whether the
+#                       point cloud lets the policy ride out hole-estimate
+#                       noise that the pure-privileged policy can't.
+#
+# Both inherit --record_failed_videos (on by default in the train script), so
+# every failed eval episode gets a full mp4 logged to wandb.
+#
+# Run individually:
+#   modal run --detach modal_app.py::train_noisy_state
+#   modal run --detach modal_app.py::train_noisy_pcd_priv
+# -----------------------------------------------------------------------------
+@app.function(
+    image=image, gpu="A10G", cpu=4, memory=32768,
+    volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
+    timeout=24 * 3600,
+)
+def train_noisy_state():
+    _run_train(
+        ["--obs_mode", "state", "--state_key", "hole_centroid",
+         "--eval_hole_noise_factor", "0.2", "--batch_size", "256"],
+        "noisy_state.log",
+    )
+
+
+@app.function(
+    image=image, gpu="A10G", cpu=4, memory=32768,
+    volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
+    timeout=24 * 3600,
+)
+def train_noisy_pcd_priv():
+    _run_train(
+        ["--obs_mode", "pcd_priv",
+         "--eval_hole_noise_factor", "0.2", "--batch_size", "128"],
+        "noisy_pcd_priv.log",
     )
 
 
@@ -432,6 +481,34 @@ def eval_all_pcd(run_dir: str):
         ["--obs_mode", "pcd", "--batch_size", "128"],
         run_dir,
         "eval_all_pcd.log",
+    )
+
+
+@app.function(
+    image=image, gpu="A10G", cpu=4, memory=32768,
+    volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
+    timeout=6 * 3600,
+)
+def eval_all_noisy_state(run_dir: str):
+    _run_eval_all(
+        ["--obs_mode", "state", "--state_key", "hole_centroid",
+         "--eval_hole_noise_factor", "0.2", "--batch_size", "256"],
+        run_dir,
+        "eval_all_noisy_state.log",
+    )
+
+
+@app.function(
+    image=image, gpu="A10G", cpu=4, memory=32768,
+    volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
+    timeout=6 * 3600,
+)
+def eval_all_noisy_pcd_priv(run_dir: str):
+    _run_eval_all(
+        ["--obs_mode", "pcd_priv",
+         "--eval_hole_noise_factor", "0.2", "--batch_size", "128"],
+        run_dir,
+        "eval_all_noisy_pcd_priv.log",
     )
 
 
