@@ -256,6 +256,12 @@ parser.add_argument('--eval_all_in', type=str, default=None,
                          'inside the loop so it\'s faster than re-running '
                          'the script per checkpoint. Mutually exclusive '
                          'with --resume; implies --eval_only.')
+parser.add_argument('--eval_all_stride', type=int, default=1,
+                    help='With --eval_all_in, evaluate only every Nth '
+                         'checkpoint (epoch-sorted); e.g. 2 = every other one. '
+                         'The newest checkpoint is always included. Default 1 '
+                         '(all). Useful to halve a sweep when checkpoints are '
+                         'saved frequently.')
 parser.add_argument('--max_episode_len', type=int, default=200,
                     help='Safety ceiling on per-episode length. The actual '
                          'per-episode cap at eval is the scripted-traj '
@@ -311,6 +317,73 @@ parser.add_argument('--eval_hole_noise_factor', type=float, default=0.0,
                          'the hole-centroid xyz every timestep. 0 = off. '
                          'Used for the "noisy privileged" runs. Does NOT '
                          'affect training data; only the eval rollouts.')
+
+# Eval-time state estimator (UniClothDiff). EVAL-ONLY. When set, the
+# ground-truth hole centroid fed to the policy is REPLACED by an estimate from
+# a UniClothDiff GPS state-estimation model reconstructing the cloth mesh from
+# the partial point cloud (then taking the hole-loop vertices' centroid). The
+# model runs in a separate process/env over a websocket
+# (UniClothDiff/scripts/serve_predictor.py + cloth_state_estimator.py); this is
+# the deployable path — the policy consumes a hole location INFERRED from the
+# point cloud instead of read from the simulator. Mutually exclusive with
+# --eval_hole_noise_factor (which substitutes synthetic noise instead).
+parser.add_argument('--use_state_estimator', type=str, default='',
+                    help='Eval-only: "host:port" of a running UniClothDiff '
+                         'state-estimation websocket server. When set, the '
+                         "policy's hole-centroid input is replaced by the "
+                         "estimator's prediction from the cloth point cloud. "
+                         'Empty = off (use the GT centroid).')
+parser.add_argument('--state_estimator_steps', type=int, default=50,
+                    help='Denoising steps per state-estimator call. Fewer = '
+                         'faster closed-loop eval, lower fidelity.')
+parser.add_argument('--state_estimator_pcd_res', type=int, default=128,
+                    help='Camera resolution for the dense PCD capture fed to '
+                         'the state estimator (independent of the policy obs '
+                         'camera). 128 matches the collector default. Shared by '
+                         'the GPS estimator and the PF tracker.')
+
+# Eval-time GPS+GNS particle-filter tracker (UniClothDiff). EVAL-ONLY, and an
+# alternative to --use_state_estimator: instead of an independent per-frame GPS
+# estimate, a STATEFUL particle filter seeds the mesh with GPS diffusion and
+# rolls it forward with GNS dynamics, fusing point clouds over time. This keeps
+# tracking the hole through frames where the cloud is occluded (the client sends
+# no observation and the filter predicts with GNS only). Talks to
+# UniClothDiff/scripts/serve_pf_tracker.py. Format "host:port".
+parser.add_argument('--use_pf_tracker', type=str, default='',
+                    help='Eval-only: "host:port" of a running UniClothDiff '
+                         'particle-filter tracker server. Replaces the GT hole '
+                         'centroid with the tracker estimate. Empty = off.')
+parser.add_argument('--pf_occlusion_min_points', type=int, default=0,
+                    help='Treat a frame as OCCLUDED (send no point cloud, let '
+                         'GNS predict) when fewer than this many raw cloth '
+                         'pixels are visible. 0 = always observe. Use a '
+                         'positive value to exercise occlusion robustness.')
+parser.add_argument('--viz_estimate', action='store_true', default=True,
+                    help='When an estimator/tracker is active, overlay the '
+                         'predicted mesh (orange dots) + estimated hole centroid '
+                         '(green) and GT hole centroid (red) onto the eval '
+                         'videos. Pass --no_viz_estimate to disable.')
+parser.add_argument('--no_viz_estimate', dest='viz_estimate',
+                    action='store_false')
+parser.add_argument('--policy_inference_steps', type=int, default=None,
+                    help='Eval-only: number of DDPM denoising steps for the '
+                         "POLICY's own action diffusion (separate from the state "
+                         'estimator). None = the trained value (usually 100). '
+                         'Lower (e.g. 16-25) speeds each re-plan a lot, '
+                         'especially on CPU, at some action-quality cost.')
+parser.add_argument('--viz_debug_cam_yaw', type=float, default=None,
+                    help='When set (and an estimator/tracker is active), add a '
+                         'SECOND video panel rendered from a clear camera at this '
+                         'yaw (deg), with the same predicted-mesh + centroid '
+                         'overlay. Helps read the prediction when the eval camera '
+                         '(--eval_cam_yaw / demo viewpoint) is at a hard, grazing '
+                         'angle. Try 0 or 45. None = single panel.')
+parser.add_argument('--eval_cam_yaw', type=float, default=None,
+                    help='Eval-only: override the obs/PCD camera YAW (degrees) '
+                         'for every episode, keeping the rest of the cam_viewmat '
+                         'from the demos. Lets you score ONE trained model under '
+                         'a clear vs a grazing/occluded viewpoint without '
+                         're-collecting demos. None = use the demo yaw.')
 
 # Failed-episode full videos. Independent of --video_every_evals (which only
 # records the first --n_video_episodes into a single highlight mp4). When on,
@@ -370,6 +443,41 @@ if args.eval_hole_noise_factor > 0:
             f'--eval_hole_noise_factor has no hole centroid to perturb for '
             f'obs_mode={args.obs_mode!r}. Use obs_mode=state '
             f'(state_key=hole_centroid) or obs_mode=pcd_priv.')
+
+# State estimator only makes sense where a hole centroid is consumed, and it
+# replaces the same slot the synthetic-noise probe perturbs — so the two are
+# mutually exclusive.
+if args.use_state_estimator:
+    if args.eval_hole_noise_factor > 0:
+        parser.error(
+            '--use_state_estimator and --eval_hole_noise_factor are mutually '
+            'exclusive: one replaces the GT hole centroid with a learned '
+            'estimate, the other with synthetic noise.')
+    state_ok = args.obs_mode == 'state' and args.state_key == 'hole_centroid'
+    if not state_ok and args.obs_mode != 'pcd_priv':
+        parser.error(
+            '--use_state_estimator requires obs_mode=state '
+            '(state_key=hole_centroid) or obs_mode=pcd_priv — the modes that '
+            f'consume a hole centroid; got obs_mode={args.obs_mode!r} '
+            f'state_key={args.state_key!r}.')
+    if ':' not in args.use_state_estimator:
+        parser.error('--use_state_estimator must be "host:port" '
+                     '(e.g. localhost:8000).')
+
+# PF tracker shares the hole-centroid slot, so it's mutually exclusive with the
+# per-frame estimator and the synthetic-noise probe.
+if args.use_pf_tracker:
+    if args.use_state_estimator or args.eval_hole_noise_factor > 0:
+        parser.error(
+            '--use_pf_tracker is mutually exclusive with --use_state_estimator '
+            'and --eval_hole_noise_factor (all three write the hole centroid).')
+    state_ok = args.obs_mode == 'state' and args.state_key == 'hole_centroid'
+    if not state_ok and args.obs_mode != 'pcd_priv':
+        parser.error(
+            '--use_pf_tracker requires obs_mode=state (state_key=hole_centroid) '
+            f'or obs_mode=pcd_priv; got obs_mode={args.obs_mode!r}.')
+    if ':' not in args.use_pf_tracker:
+        parser.error('--use_pf_tracker must be "host:port" (e.g. localhost:8001).')
 
 
 # =============================================================================
@@ -1151,7 +1259,7 @@ if args.resume:
     print(f'  [resume] best_eval_success seeded at '
           f'{resume_best_eval_success:.3f} (epoch {resume_best_eval_epoch})')
 
-    if resume_start_epoch >= args.num_epochs:
+    if not args.eval_only and resume_start_epoch >= args.num_epochs:
         raise RuntimeError(
             f'ckpt epoch ({resume_start_epoch}) >= --num_epochs '
             f'({args.num_epochs}); nothing to train. Either pass a '
@@ -1236,9 +1344,169 @@ def _perturb_centroid(centroid_norm, hole_noise_std, noise_rng):
     return perturbed, noise
 
 
+# ---------------------------------------------------------------------------
+# State estimator (UniClothDiff) — lazy singleton + per-cloth conditioning.
+# ---------------------------------------------------------------------------
+_hole_estimator = None
+
+
+def _get_hole_estimator():
+    """Lazily open one persistent websocket to the UniClothDiff state-est
+    server (reused across all eval episodes). Returns None when the flag is
+    off."""
+    global _hole_estimator
+    if _hole_estimator is None and args.use_state_estimator:
+        from cloth_state_estimator import HoleEstimator
+        host, port = args.use_state_estimator.rsplit(':', 1)
+        _hole_estimator = HoleEstimator(
+            backend='remote', host=host, port=int(port),
+            num_inference_steps=args.state_estimator_steps)
+        print(f'[eval] connected to state estimator at '
+              f'{args.use_state_estimator}; metadata={_hole_estimator.metadata}')
+    return _hole_estimator
+
+
+def _cloth_unique_edges(deform):
+    """Undirected unique mesh edges (E, 2) from the current procedural .obj,
+    used to condition the state estimator's graph. None on failure (the
+    estimator then falls back to zero-padded edges)."""
+    try:
+        import trimesh
+        faces = np.asarray(trimesh.load(
+            deform.args.deform_obj, process=False, force='mesh').faces,
+            dtype=np.int64)
+    except Exception:
+        return None
+    if faces.size == 0:
+        return None
+    es = set()
+    for f in faces:
+        for k in range(3):
+            a, b = int(f[k]), int(f[(k + 1) % 3])
+            es.add((a, b) if a < b else (b, a))
+    return np.array(sorted(es), dtype=np.int64) if es else None
+
+
+def _estimate_centroid_norm(deform, hole_idx, est, est_rest, est_edges):
+    """Capture a dense cloth PCD and run the state estimator to get the hole
+    centroid, returned /WBOX-normalized to match the stored centroid frame."""
+    from _bc_obs_helpers import cloth_only_pcd as _cloth_only_pcd
+    n_pts = int(est.metadata.get('num_sample_points', 2048))
+    res = args.state_estimator_pcd_res
+    _, depth, seg, view, proj = capture_rgb_depth(deform, res, res)
+    pcd = _cloth_only_pcd(depth, seg, view, proj, deform.deform_id, n_pts)
+    centroid_world = est.estimate(
+        pcd, est_rest, hole_idx, edges=est_edges,
+        num_inference_steps=args.state_estimator_steps)
+    return (np.asarray(centroid_world, dtype=np.float32) / _WBOX)
+
+
+# ---------------------------------------------------------------------------
+# Particle-filter tracker (stateful: reset per episode, step per frame).
+# ---------------------------------------------------------------------------
+_pf_tracker = None
+
+
+def _get_pf_tracker():
+    global _pf_tracker
+    if _pf_tracker is None and args.use_pf_tracker:
+        from cloth_state_estimator import PFTrackerClient
+        host, port = args.use_pf_tracker.rsplit(':', 1)
+        _pf_tracker = PFTrackerClient(host=host, port=int(port))
+        print(f'[eval] connected to PF tracker at {args.use_pf_tracker}; '
+              f'metadata={_pf_tracker.metadata}')
+    return _pf_tracker
+
+
+def _grasped_positions(deform, actuated_sorted):
+    """Current world positions of the grasped vertices, in ascending order
+    (the order the GNS step expects per-vertex velocities)."""
+    _, verts = get_mesh_data(deform.sim, deform.deform_id)
+    return np.asarray(verts, dtype=np.float32)[actuated_sorted]
+
+
+def _capture_dense_pcd(deform, occ_min):
+    """Dense cloth-only PCD for the tracker, or None if the frame is occluded
+    (fewer than `occ_min` raw cloth pixels visible)."""
+    from _bc_obs_helpers import cloth_only_pcd as _cloth_only_pcd
+    res = args.state_estimator_pcd_res
+    _, depth, seg, view, proj = capture_rgb_depth(deform, res, res)
+    if occ_min > 0 and int((seg == int(deform.deform_id)).sum()) < occ_min:
+        return None
+    return _cloth_only_pcd(depth, seg, view, proj, deform.deform_id, 2048)
+
+
+def _apply_centroid_override(obs, obs_mode, state_key, centroid_norm):
+    """Overwrite the hole-centroid slot of an obs with a precomputed
+    /WBOX-normalized centroid (used by the PF tracker, which is stateful and so
+    can't go through _capture_obs_for_policy)."""
+    if centroid_norm is None:
+        return obs
+    if obs_mode == 'state' and state_key == 'hole_centroid':
+        obs = obs.copy()
+        obs[_HOLE_CENTROID_SLICE] = centroid_norm
+        return obs
+    if obs_mode == 'pcd_priv':
+        obs = dict(obs)
+        obs['priv'] = np.asarray(centroid_norm, dtype=np.float32)
+        return obs
+    return obs
+
+
+def _overlay_estimate(frame, view, proj, est_mesh, est_centroid, gt_centroid):
+    """Draw the estimator's predicted mesh + hole centroids onto an eval frame.
+
+    estimated mesh -> small dots, estimated hole centroid -> GREEN marker,
+    ground-truth hole centroid -> RED marker. All projected through the same
+    (view, proj) the frame was rendered with, so they register with the cloth.
+    Returns a new RGB frame.
+    """
+    from _debug_viz import overlay_pcd_on_rgb, project_world_to_screen
+    img = frame
+    if est_mesh is not None and len(est_mesh):
+        img = overlay_pcd_on_rgb(img, np.asarray(est_mesh, np.float32), view, proj)
+    img = np.ascontiguousarray(img[:, :, :3]).copy()
+    H, W = img.shape[:2]
+
+    def _marker(c, color, rad=4):
+        if c is None:
+            return
+        u, vv, in_view = project_world_to_screen(
+            np.asarray(c, np.float64), view, proj, W, H)
+        if not in_view:
+            return
+        x, y = int(u), int(vv)
+        img[max(0, y - rad):min(H, y + rad + 1),
+            max(0, x - rad):min(W, x + rad + 1)] = color
+
+    _marker(gt_centroid, (255, 0, 0))    # red  = ground-truth hole centroid
+    _marker(est_centroid, (0, 220, 0))   # green = estimated hole centroid
+    return img
+
+
+def _debug_cam_view(deform, yaw):
+    """A view matrix at `yaw` (deg) reusing the eval camera's distance/pitch/
+    target — a clear secondary angle to render the prediction from."""
+    import pybullet
+    dist, pitch, _, tx, ty, tz = deform.args.cam_viewmat
+    return pybullet.computeViewMatrixFromYawPitchRoll(
+        distance=dist, pitch=pitch, yaw=float(yaw),
+        cameraTargetPosition=[tx, ty, tz], upAxisIndex=2, roll=0)
+
+
+def _render_from_view(deform, view, proj, size):
+    """Render the current sim from an explicit (view, proj) at size x size."""
+    import pybullet
+    _, _, rgba, _, _ = deform.sim.getCameraImage(
+        width=size, height=size, viewMatrix=view, projectionMatrix=proj,
+        renderer=pybullet.ER_BULLET_HARDWARE_OPENGL)
+    return np.asarray(rgba, dtype=np.uint8).reshape(size, size, 4)[:, :, :3]
+
+
 def _capture_obs_for_policy(deform, obs_mode, state_key,
                             hole_idx, corner_idx,
-                            hole_noise_std=0.0, noise_rng=None):
+                            hole_noise_std=0.0, noise_rng=None,
+                            hole_estimator=None, est_rest=None, est_edges=None):
     """Return one obs sample matching what the dataset saw at training
     time (UN-normalized — the obs_normalizer is applied next).
 
@@ -1260,6 +1528,14 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
         obs = build_privileged_obs(
             deform, state_key, hole_idx, corner_indices=corner_idx)
         noise_vec_m = np.zeros(3, dtype=np.float32)
+        # Estimator path: replace the GT hole-centroid slice with the
+        # UniClothDiff prediction from the point cloud (mutually exclusive
+        # with the synthetic-noise probe — enforced in argparse).
+        if hole_estimator is not None and state_key == 'hole_centroid':
+            obs = obs.copy()
+            obs[_HOLE_CENTROID_SLICE] = _estimate_centroid_norm(
+                deform, hole_idx, hole_estimator, est_rest, est_edges)
+            return obs, noise_vec_m
         if hole_noise_std > 0 and state_key == 'hole_centroid':
             obs = obs.copy()
             perturbed, noise_vec = _perturb_centroid(
@@ -1293,6 +1569,12 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
         sample = {'pcd': pcd, 'grip': grip, 'goal': goal}
         noise_vec_m = _zero_noise
         if obs_mode == 'pcd_priv':
+            # Estimator path: the privileged hole-centroid aux input becomes
+            # the UniClothDiff prediction instead of the GT slice.
+            if hole_estimator is not None:
+                sample['priv'] = _estimate_centroid_norm(
+                    deform, hole_idx, hole_estimator, est_rest, est_edges)
+                return sample, noise_vec_m
             # Privileged hole centroid (/WBOX-normalized) sliced from the
             # same hole_centroid builder the state mode uses, so training and
             # eval share one source of truth. Noisy at eval iff factor > 0.
@@ -1417,6 +1699,15 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         # ([8.8, -12.6, yaw=314, ...]) every reset. Re-lock the correct
         # viewmat so captures and renders always use the collection camera.
         deform.args.cam_viewmat = list(eval_cam_viewmat)
+        # Eval-only camera-yaw override: run the SAME trained policy/estimator
+        # under a different viewpoint (e.g. a clear face-on yaw vs a grazing,
+        # heavily-occluded yaw) without re-collecting demos. Only the obs/PCD
+        # camera moves; the cloth, goal, and dynamics are unchanged. Pairs with
+        # --pf_occlusion_min_points to stress the GNS tracker.
+        if args.eval_cam_yaw is not None:
+            _vm = list(deform.args.cam_viewmat)
+            _vm[2] = float(args.eval_cam_yaw)
+            deform.args.cam_viewmat = _vm
         # Tell dedo to capture post-settle frames during make_final_steps
         # (the 500-step gravity phase that runs inside step() when done
         # fires). MUST be set AFTER e.reset() — collect_bc_demos.py uses
@@ -1452,6 +1743,43 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         hole_noise_std = (args.eval_hole_noise_factor * hole_radius / _WBOX
                           if args.eval_hole_noise_factor > 0 else 0.0)
 
+        # State-estimator conditioning for THIS cloth. The estimator needs a
+        # rest-pose template (step-0 world mesh, same choice the collector
+        # writes) and the mesh edges (from the procedural .obj). None when the
+        # estimator is off.
+        hole_estimator = _get_hole_estimator()
+        est_rest = est_edges = None
+        if hole_estimator is not None:
+            est_rest = np.asarray(verts0, dtype=np.float32)
+            est_edges = _cloth_unique_edges(deform)
+
+        # PF tracker conditioning + reset for THIS episode. The tracker is
+        # stateful, so we reset it here (seed from the first cloud) and step it
+        # each frame below; the resulting hole centroid overrides the obs slot.
+        pf_tracker = _get_pf_tracker()
+        pf_override = None              # /WBOX-normalized centroid to inject
+        pf_actuated_sorted = None      # ascending grasped-vertex indices
+        pf_prev_grasped = None         # last grasped positions (for displacement)
+        if pf_tracker is not None:
+            pf_actuated_sorted = np.array(
+                sorted({int(v) for a in deform.anchors.values()
+                        for v in a['vertices']
+                        if int(v) < len(verts0)}), dtype=np.int64)
+            pf_edges = _cloth_unique_edges(deform)
+            import trimesh as _trimesh
+            pf_faces = np.asarray(_trimesh.load(
+                deform.args.deform_obj, process=False, force='mesh').faces,
+                dtype=np.int64)
+            pf_first_pcd = _capture_dense_pcd(deform, 0)  # always observe on reset
+            centroid_world = pf_tracker.reset(
+                rest_positions=np.asarray(verts0, dtype=np.float32),
+                edges=pf_edges, faces=pf_faces,
+                actuated_vertices=pf_actuated_sorted,
+                hole_vertex_indices=np.asarray(hole_idx, dtype=np.int64),
+                point_cloud=pf_first_pcd)
+            pf_override = (np.asarray(centroid_world, dtype=np.float32) / _WBOX)
+            pf_prev_grasped = _grasped_positions(deform, pf_actuated_sorted)
+
         # Per-episode max_ep_len: mirror collect_bc_demos.py exactly —
         # build the scripted trajectory for THIS cloth (the demo
         # controller would have run it for len(traj) steps), and cap the
@@ -1477,7 +1805,11 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         # Prime obs deque with the initial obs (repeated obs_horizon times).
         first_obs, first_noise_vec = _capture_obs_for_policy(
             deform, args.obs_mode, args.state_key, hole_idx, corner_idx,
-            hole_noise_std=hole_noise_std, noise_rng=noise_rng)
+            hole_noise_std=hole_noise_std, noise_rng=noise_rng,
+            hole_estimator=hole_estimator, est_rest=est_rest,
+            est_edges=est_edges)
+        first_obs = _apply_centroid_override(
+            first_obs, args.obs_mode, args.state_key, pf_override)
         obs_deque = collections.deque(
             [first_obs] * args.obs_horizon, maxlen=args.obs_horizon)
 
@@ -1501,7 +1833,9 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             normed = _apply_normalizer_to_seq(
                 list(obs_deque), obs_normalizer)
             obs_t = _stack_obs_seq(normed)
-            naction = policy.predict_action(obs_t, encoder).squeeze(0)
+            naction = policy.predict_action(
+                obs_t, encoder,
+                num_inference_steps=args.policy_inference_steps).squeeze(0)
             naction = naction.cpu().numpy()
             # 2) Slice the action_horizon middle chunk.
             start = args.obs_horizon - 1
@@ -1509,28 +1843,74 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             chunk = naction[start:end]
             chunk = act_normalizer.unapply(chunk)
             # 3) Execute chunk open-loop, capture obs each step.
-            for a in chunk:
+            for _i_chunk, a in enumerate(chunk):
                 a = np.clip(a, -1.0, 1.0).astype(np.float32)
                 _, rwd, done, info = e.step(a)
                 ep_rwd += float(rwd)
                 step += 1
-                if capture_this_ep:
-                    # Pre-settle policy-phase frame. On the terminal step
-                    # (done=True), dedo's make_final_steps already ran
-                    # INSIDE this step() call, and settle_frames is in
-                    # `info` — we append those below after the loop. We
-                    # still capture this one frame to mark the policy
-                    # handoff. Stamp it with the noise level that was in the
-                    # obs that produced this action (last_noise_pct).
-                    ep_frames.append(deform.render(
-                        mode='rgb_array',
-                        width=args.video_render_size,
-                        height=args.video_render_size))
-                    ep_frame_noise_pct.append(last_noise_pct)
+                # Action chunking: the policy re-plans only every action_horizon
+                # steps and consumes just the last obs_horizon observations, so
+                # estimates for earlier mid-chunk steps get evicted unused. Skip
+                # the expensive GPS estimator on those steps (run it only on the
+                # final obs_horizon of the chunk) — identical policy decisions,
+                # ~action_horizon/obs_horizon fewer estimator calls. Always run
+                # it on recorded episodes so the overlay stays fresh each frame.
+                # (PF tracker is stateful and steps every frame below regardless.)
+                _keep = _i_chunk >= len(chunk) - args.obs_horizon
+                _est = hole_estimator if (_keep or capture_this_ep) else None
+                # Build the obs for the NEXT step first (this is where the GPS
+                # estimator runs, stashing its predicted mesh/centroid), so the
+                # frame we render below can overlay that prediction.
                 new_obs, step_noise_vec = _capture_obs_for_policy(
                     deform, args.obs_mode, args.state_key,
                     hole_idx, corner_idx,
-                    hole_noise_std=hole_noise_std, noise_rng=noise_rng)
+                    hole_noise_std=hole_noise_std, noise_rng=noise_rng,
+                    hole_estimator=_est, est_rest=est_rest,
+                    est_edges=est_edges)
+                # Stateful PF tracker step: drive each grasped vertex by its
+                # measured per-step displacement (known from gripper
+                # proprioception in the real world too), feed the cloud unless
+                # occluded, and override the obs hole-centroid with the tracked
+                # estimate.
+                if pf_tracker is not None:
+                    cur_grasped = _grasped_positions(deform, pf_actuated_sorted)
+                    grasped_vel = (cur_grasped - pf_prev_grasped).astype(np.float32)
+                    pf_prev_grasped = cur_grasped
+                    pcd_obs = _capture_dense_pcd(deform, args.pf_occlusion_min_points)
+                    centroid_world = pf_tracker.step(grasped_vel, point_cloud=pcd_obs)
+                    pf_override = (np.asarray(centroid_world, dtype=np.float32) / _WBOX)
+                    new_obs = _apply_centroid_override(
+                        new_obs, args.obs_mode, args.state_key, pf_override)
+                if capture_this_ep:
+                    # Pre-settle policy-phase frame, stamped with the noise level
+                    # of the obs that produced this action. When an estimator/
+                    # tracker is active, overlay its predicted mesh + estimated
+                    # (green) and GT (red) hole centroids onto the frame.
+                    frame = deform.render(
+                        mode='rgb_array',
+                        width=args.video_render_size,
+                        height=args.video_render_size)
+                    _active_est = pf_tracker if pf_tracker is not None else hole_estimator
+                    if (args.viz_estimate and _active_est is not None
+                            and getattr(_active_est, 'last_mesh', None) is not None):
+                        from _debug_viz import hole_centroid_world as _hcw
+                        _gt_c = _hcw(deform, hole_idx)
+                        _mesh, _est_c = _active_est.last_mesh, _active_est.last_centroid
+                        frame = _overlay_estimate(
+                            frame, deform._cam_viewmat, proj_matrix(),
+                            _mesh, _est_c, _gt_c)
+                        # Optional clear-angle debug panel, same overlay, stitched
+                        # to the right of the (possibly grazing) eval-camera view.
+                        if args.viz_debug_cam_yaw is not None:
+                            _dview = _debug_cam_view(deform, args.viz_debug_cam_yaw)
+                            _dframe = _render_from_view(
+                                deform, _dview, proj_matrix(),
+                                args.video_render_size)
+                            _dframe = _overlay_estimate(
+                                _dframe, _dview, proj_matrix(), _mesh, _est_c, _gt_c)
+                            frame = np.concatenate([frame, _dframe], axis=1)
+                    ep_frames.append(frame)
+                    ep_frame_noise_pct.append(last_noise_pct)
                 step_noise_mag = float(np.linalg.norm(step_noise_vec))
                 last_noise_pct = _noise_pct(step_noise_mag)
                 if hole_noise_std > 0:
@@ -1553,6 +1933,15 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         if capture_this_ep:
             settle_frames = info.get('settle_frames', []) if isinstance(
                 info, dict) else []
+            # When the 2-panel debug view is on, policy-phase frames are double
+            # width; pad the single-view settle frames (no estimate during the
+            # gravity phase) with a blank right panel so frame sizes stay uniform.
+            _two_panel = (args.viz_debug_cam_yaw is not None and args.viz_estimate
+                          and (pf_tracker is not None or hole_estimator is not None))
+            if _two_panel:
+                settle_frames = [
+                    np.concatenate([sf, np.zeros_like(sf)], axis=1)
+                    for sf in settle_frames]
             ep_frames.extend(settle_frames)
             ep_frame_noise_pct.extend([None] * len(settle_frames))
             deform._record_settle_frames = False  # turn off for next ep
@@ -2070,6 +2459,16 @@ if args.eval_all_in:
     if not found:
         raise FileNotFoundError(
             f'no policy_ep*.pt under {args.eval_all_in}; nothing to eval.')
+    if args.eval_all_stride > 1:
+        # Subsample the (epoch-sorted) checkpoints — e.g. stride=2 evaluates
+        # every other one. The newest checkpoint is always kept so the final
+        # epoch is included regardless of stride.
+        kept = found[::args.eval_all_stride]
+        if found[-1] not in kept:
+            kept.append(found[-1])
+        print(f'[eval_all] stride={args.eval_all_stride}: '
+              f'{len(kept)}/{len(found)} checkpoints selected')
+        found = kept
     print(f'\n=== --eval_all_in: re-eval {len(found)} checkpoint(s) '
           f'from {args.eval_all_in} ===')
     for ckpt_path in found:

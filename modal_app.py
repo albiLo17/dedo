@@ -56,7 +56,8 @@ import modal
 
 APP_NAME = "hang-diffusion-bc"
 VOLUME_NAME = "hang-bc-data"
-DEMOS_SUBDIR = "bc_demos_randgoal_0.3_full_cameraview_86"
+# DEMOS_SUBDIR = "bc_demos_randgoal_0.3_full_cameraview_86"
+DEMOS_SUBDIR = "bc_demos_randgoal_0.3_full"
 LOGS_SUBDIR = "diffusion_bc"
 
 app = modal.App(APP_NAME)
@@ -115,6 +116,10 @@ image = (
         "huggingface_hub<0.26",
         "diffusers==0.20.0",
         "einops",
+        # Client for the UniClothDiff state-estimator websocket server, used by
+        # the --use_state_estimator eval path (cloth_state_estimator.py).
+        "websockets>=13.0",
+        "msgpack>=1.0",
     )
     # Mount the repo. Ignored heavy/irrelevant paths so the bundle stays small.
     .add_local_dir(
@@ -229,12 +234,13 @@ _TRAIN_BASE_CMD = [
     "--num_epochs", "500",
     "--lr", "1e-4",
     "--num_workers", "2",
-    "--eval_every_epochs", "20",
-    "--n_eval_episodes", "30",
-    "--n_final_eval_episodes", "100",
+    "--eval_every_epochs", "40", # changed from 20 for speed
+    "--n_eval_episodes", "12", # changed from 30 for speed
+    "--n_final_eval_episodes", "12", # changed from 100 for speed
     "--save_every_epochs", "40",
     "--use_wandb",
-    "--wandb_project", "hang_bc_diffusion_cameraview_86",
+    # "--wandb_project", "hang_bc_diffusion_cameraview_86",
+    "--wandb_project", "hang_bc_diffusion",
     "--seed", "2026",
     "--logdir_root", f"{LOGS_PATH}/runs",
 ]
@@ -419,6 +425,50 @@ def eval_pcd(ckpt: str):
 
 
 # -----------------------------------------------------------------------------
+# Full re-eval of the privileged STATE policy with the hole centroid supplied by
+# the UniClothDiff GPS state estimator instead of the simulator. The estimator
+# runs as a SEPARATE service (different env), so start it first and pass its
+# tunnel address here:
+#
+#   # 1) start the estimator (UniClothDiff app) and read the host:port it prints
+#   modal run --detach UniClothDiff/modal_uniclothdiff.py::serve_estimator
+#   modal app logs uniclothdiff-train          # -> r###.modal.host:#####
+#
+#   # 2) run this eval against that address (policy ckpt lives on this volume)
+#   modal run --detach modal_app.py::eval_state_estimator \
+#       --ckpt /data/diffusion_bc/runs/state/<run>/policy_best.pt \
+#       --estimator r###.modal.host:#####
+#
+# Videos (with the predicted-mesh + estimated/GT-centroid overlay) + log land in
+# diffusion_bc/eval_state_estimator/. Run a GT baseline for comparison with the
+# stock eval_state(ckpt) (no estimator).
+# -----------------------------------------------------------------------------
+@app.function(
+    image=image, gpu="A10G", cpu=4, memory=32768,
+    volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
+    timeout=16 * 3600,
+)
+def eval_state_estimator(ckpt: str, estimator: str,
+                         n_episodes: int = 100, steps: int = 50, # steps changed from 200 for speed
+                         policy_steps: int = 100, n_video: int = 5):
+    _run_eval(
+        ["--obs_mode", "state", "--state_key", "hole_centroid",
+         "--batch_size", "256",
+         "--use_state_estimator", estimator,
+         "--state_estimator_steps", str(steps),
+         "--policy_inference_steps", str(policy_steps),
+         # CRITICAL for throughput: the default records EVERY episode, which
+         # renders each frame AND forces the estimator to run every step
+         # (defeating the action-chunking skip). Record only the first n_video.
+         "--no_record_failed_videos",
+         "--n_final_eval_episodes", str(n_episodes),
+         "--n_video_episodes", str(n_video)],
+        ckpt,
+        "eval_state_estimator.log",
+    )
+
+
+# -----------------------------------------------------------------------------
 # Re-eval EVERY saved checkpoint (policy_ep*.pt) in a run dir, to recreate
 # the mid-training eval curve under the updated eval-time code. Logs to
 # wandb keyed by epoch.
@@ -509,6 +559,42 @@ def eval_all_noisy_pcd_priv(run_dir: str):
          "--eval_hole_noise_factor", "0.2", "--batch_size", "128"],
         run_dir,
         "eval_all_noisy_pcd_priv.log",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Full sweep of the STATE policy across ALL checkpoints in a run dir, with the
+# hole centroid supplied by the GPS state estimator (success curve vs epoch,
+# logged to wandb keyed by epoch). Each checkpoint runs --n_eval episodes.
+#
+#   modal run --detach modal_app.py::eval_all_state_estimator \
+#       --run-dir /data/diffusion_bc/runs/state/<run_dir> \
+#       --estimator r###.modal.host:#####
+#
+# Keep the serve_estimator server up for the WHOLE sweep (n_checkpoints x n_eval
+# episodes can take hours; bump its timeout if needed). n_video defaults to 0 —
+# a sweep would otherwise render videos for every checkpoint.
+# -----------------------------------------------------------------------------
+@app.function(
+    image=image, gpu="A10G", cpu=4, memory=32768,
+    volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
+    timeout=16 * 3600,
+)
+def eval_all_state_estimator(run_dir: str, estimator: str, n_eval: int = 15,
+                             stride: int = 1, steps: int = 100,
+                             policy_steps: int = 100, n_video: int = 2):
+    _run_eval_all(
+        ["--obs_mode", "state", "--state_key", "hole_centroid",
+         "--batch_size", "256",
+         "--use_state_estimator", estimator,
+         "--state_estimator_steps", str(steps),
+         "--policy_inference_steps", str(policy_steps),
+         "--eval_all_stride", str(stride),
+         "--no_record_failed_videos",
+         "--n_eval_episodes", str(n_eval),
+         "--n_video_episodes", str(n_video)],
+        run_dir,
+        "eval_all_state_estimator.log",
     )
 
 
