@@ -580,7 +580,7 @@ def eval_all_noisy_pcd_priv(run_dir: str):
     volumes={DATA_ROOT: volume}, secrets=[wandb_secret],
     timeout=16 * 3600,
 )
-def eval_all_state_estimator(run_dir: str, estimator: str, n_eval: int = 15,
+def eval_all_state_estimator(run_dir: str, estimator: str, n_eval: int = 18,
                              stride: int = 1, steps: int = 100,
                              policy_steps: int = 100, n_video: int = 2):
     _run_eval_all(
@@ -590,7 +590,6 @@ def eval_all_state_estimator(run_dir: str, estimator: str, n_eval: int = 15,
          "--state_estimator_steps", str(steps),
          "--policy_inference_steps", str(policy_steps),
          "--eval_all_stride", str(stride),
-         "--no_record_failed_videos",
          "--n_eval_episodes", str(n_eval),
          "--n_video_episodes", str(n_video)],
         run_dir,

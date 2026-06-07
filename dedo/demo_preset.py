@@ -185,7 +185,7 @@ def build_traj(env, preset_wp, left_or_right, anchor_idx, ctrl_freq, robot,
     else:
         anc_id = list(env.anchors.keys())[anchor_idx]
         init_anc_pos = env.anchors[anc_id]['pos']
-    print(f'init_anc_pos {left_or_right}', init_anc_pos)
+    # print(f'init_anc_pos {left_or_right}', init_anc_pos)
     wp = np.array(preset_wp[left_or_right])
     steps = (wp[:, -1] * ctrl_freq).round().astype(np.int32)  # seconds -> ctrl steps
 
