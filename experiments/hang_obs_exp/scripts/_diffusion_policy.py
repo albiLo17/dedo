@@ -358,6 +358,16 @@ def build_encoder(obs_mode: str, obs_kwargs: dict) -> nn.Module:
             n_points=obs_kwargs.get('n_points', 512),
             pcd_feat_dim=obs_kwargs.get('feat_dim', 256),
             priv_dim=obs_kwargs.get('priv_dim', 0))
+    if obs_mode == 'mesh':
+        # Topology-aware encoder over [pos || rest] + edges. Same input
+        # convention as UniClothDiff's GPSStateEstModel, so a reconstructed
+        # mesh can later be swapped in for the GT one with no change here.
+        from _mesh_encoder import MeshObsEncoder
+        return MeshObsEncoder(
+            mesh_feat_dim=obs_kwargs.get('feat_dim', 256),
+            hidden_dim=obs_kwargs.get('hidden_dim', 128),
+            num_layers=obs_kwargs.get('num_layers', 4),
+            num_heads=obs_kwargs.get('num_heads', 4))
     raise ValueError(f'unknown obs_mode {obs_mode!r}')
 
 
@@ -672,6 +682,13 @@ class ObsNormalizer:
             self.stats['max'] = flat.max(axis=0).astype(np.float32)
         elif self.obs_mode == 'rgb':
             pass  # encoder divides image by 255
+        elif self.obs_mode == 'mesh':
+            # Fit on vertex positions only; the same shift+scale is later
+            # applied to the rest channel so [pos || rest] stays in one frame.
+            flat = primary.reshape(-1, 3)
+            self.stats['mean'] = flat.mean(axis=0).astype(np.float32)
+            self.stats['scale'] = np.float32(
+                max(np.abs(flat - flat.mean(axis=0)).max(), 1e-6))
         elif self.obs_mode in ('pcd', 'pcd_priv'):
             # pcd_priv normalizes its PCD exactly like pcd; the aux priv/
             # grip/goal inputs are pass-through (already /WBOX-normalized).
@@ -693,6 +710,19 @@ class ObsNormalizer:
         if self.obs_mode == 'rgb':
             # `obs` is a dict {'image': ..., 'grip': ...}; both pass-through.
             return obs
+        if self.obs_mode == 'mesh':
+            mean = self.stats['mean']
+            scale = float(self.stats['scale']) or 1.0
+            m = obs['mesh']
+            # ONE transform across both channels: pos and rest must stay in a
+            # common frame or the relative offset the encoder reads is garbage.
+            m = np.concatenate([(m[..., :3] - mean) / scale,
+                                (m[..., 3:] - mean) / scale], axis=-1)
+            out = {'mesh': m.astype(np.float32)}
+            for k, v in obs.items():
+                if k != 'mesh':
+                    out[k] = v          # masks + indices + grip/goal untouched
+            return out
         if self.obs_mode in ('pcd', 'pcd_priv'):
             mean = self.stats['mean']
             scale = float(self.stats['scale']) or 1.0

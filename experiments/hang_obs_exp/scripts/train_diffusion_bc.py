@@ -75,6 +75,7 @@ from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
 
 from _diffusion_policy import (  # noqa: E402
     DiffusionPolicy, build_encoder, ObsNormalizer, ActionNormalizer)
+from _mesh_encoder import faces_to_bidir_edges
 
 
 PRIV_STATE_MODES = ('hole_centroid', 'hole_centroid_corners',
@@ -100,7 +101,7 @@ parser.add_argument('--demo_path', type=str, required=True,
                     help='Directory of demo_NNN.pkl files written by '
                          'collect_bc_demos.py.')
 parser.add_argument('--obs_mode', type=str, default='state',
-                    choices=['state', 'rgb', 'pcd', 'pcd_priv'],
+                    choices=['state', 'rgb', 'pcd', 'pcd_priv', 'mesh'],
                     help='Which obs modality to train on. Each demo pkl '
                          'contains all three; this picks the key to load. '
                          'pcd_priv = PointNet++ on the cloth PCD with the '
@@ -596,6 +597,7 @@ succ_key = succ_key_map[args.success_metric]
 # three-way comparison so the only modality-specific knowledge gap is
 # hole-centroid extraction (the actual privileged advantage).
 obs_buf: list = []
+topo_buf: list = []  # mesh mode: per-episode bidirectional edge arrays
 grip_buf: list = []
 goal_buf: list = []
 act_buf: list = []
@@ -637,12 +639,16 @@ recorded_episode_lengths: list = []
 # loads the privileged 3-d hole centroid (sliced from the recorded
 # hole_centroid state vector) as a third aux input. state mode bakes all of
 # these into its 18-dim vector already.
-needs_grip = args.obs_mode in ('rgb', 'pcd', 'pcd_priv')  # state has grip
-needs_goal = args.obs_mode in ('rgb', 'pcd', 'pcd_priv')  # state has goal
+needs_grip = args.obs_mode in ('rgb', 'pcd', 'pcd_priv', 'mesh')  # state has grip
+needs_goal = args.obs_mode in ('rgb', 'pcd', 'pcd_priv', 'mesh')  # state has goal
 needs_priv = args.obs_mode == 'pcd_priv'
 # Demo-pkl key holding the primary obs for this mode. pcd_priv reuses the
 # 'pcd' tensor (it just adds an aux privileged input on top of it).
-_PRIMARY_OBS_KEY = {'pcd_priv': 'pcd'}.get(args.obs_mode, args.obs_mode)
+# mesh mode consumes the privileged full_mesh vector (12 grip + V*3 positions)
+# and pairs it with the per-episode `cloth_faces` stored at the pkl top level,
+# so no re-collection is needed to train a topology-aware policy.
+_PRIMARY_OBS_KEY = {'pcd_priv': 'pcd', 'mesh': 'full_mesh'}.get(
+    args.obs_mode, args.obs_mode)
 priv_buf: list = []
 n_missing_priv = 0
 n_missing_grip = 0
@@ -681,6 +687,16 @@ for fname in demo_paths:
               f'({len(obs)} vs {len(acts)}), skipping')
         n_skipped += 1
         continue
+    if args.obs_mode == 'mesh':
+        # Per-episode triangle list -> unique bidirectional edges. Each demo is
+        # its own procedural cloth, so topology varies episode to episode; this
+        # is what makes the mode topology-aware rather than a set-of-points.
+        faces = d.get('cloth_faces')
+        if faces is None:
+            print(f'[demo] {fname}: no cloth_faces, skipping (mesh mode)')
+            n_skipped += 1
+            continue
+        topo_buf.append(faces_to_bidir_edges(np.asarray(faces)))
     obs_buf.append(np.asarray(obs))
     act_buf.append(np.asarray(acts, dtype=np.float32))
     recorded_episode_lengths.append(int(len(acts)))
@@ -1014,7 +1030,12 @@ else:
 # Fit normalizers
 # =============================================================================
 obs_normalizer = ObsNormalizer(args.obs_mode)
-obs_normalizer.fit(obs_all)
+# mesh mode: fit on the POSITION channel only. obs_all is the raw 762-vector
+# [12 grip || V*3 pos]; fitting on that would mix grip units into the spatial
+# statistics and shift every vertex.
+obs_normalizer.fit(
+    obs_all[:, 12:].reshape(len(obs_all), -1, 3) if args.obs_mode == 'mesh'
+    else obs_all)
 act_normalizer = ActionNormalizer()
 act_normalizer.fit(acts_all)
 
@@ -1067,7 +1088,13 @@ class DiffusionBCDataset(Dataset):
 
     def __init__(self, obs_all, grip_all, goal_all, priv_all, acts_all,
                  episode_ends, obs_horizon, pred_horizon, action_horizon,
-                 obs_mode, obs_normalizer, act_normalizer):
+                 obs_mode, obs_normalizer, act_normalizer,
+                 topo=None, episode_ends_raw=None, mesh_rest=None):
+        # mesh mode: topology is PER EPISODE (each demo is its own cloth), so a
+        # window has to be mapped back to the episode it came from.
+        self.topo = topo
+        self.episode_ends_raw = episode_ends_raw
+        self.mesh_rest = mesh_rest
         self.obs_all = obs_all
         self.grip_all = grip_all  # None for state-mode
         self.goal_all = goal_all  # None for state-mode
@@ -1124,6 +1151,29 @@ class DiffusionBCDataset(Dataset):
         goal_slice = self.goal_all[bs:be]
         goal_seq = self._pad(goal_slice, self.pred_horizon, ss, se)
         goal_seq = goal_seq[:self.obs_horizon]
+        if self.obs_mode == 'mesh':
+            # full_mesh is [12 grip || V*3 positions]; drop the grip prefix
+            # (it is supplied separately, identically to rgb/pcd) and pair each
+            # frame with this episode's REST pose so the encoder sees
+            # [pos || rest] — the same 6-channel convention GPSStateEstModel
+            # uses, and the channel that gives each vertex a stable identity.
+            ep = int(np.searchsorted(self.episode_ends_raw, bs, side='right'))
+            pos = obs_seq[:, 12:].reshape(len(obs_seq), -1, 3)
+            rest = self.mesh_rest[ep][None].repeat(len(pos), 0)
+            edges, V = self.topo[ep], pos.shape[1]
+            node_mask = np.abs(rest[0]).sum(-1) > 0
+            E = self.max_edges
+            ei = np.zeros((E, 2), np.int64); em = np.zeros(E, bool)
+            n = min(len(edges), E)
+            ei[:n] = edges[:n]; em[:n] = True
+            sample = {
+                'mesh': np.concatenate([pos, rest], -1).astype(np.float32),
+                'edge_index': np.broadcast_to(ei, (len(pos), E, 2)).copy(),
+                'edge_mask': np.broadcast_to(em, (len(pos), E)).copy(),
+                'node_mask': np.broadcast_to(node_mask, (len(pos), V)).copy(),
+                'grip': grip_seq, 'goal': goal_seq}
+            return self.obs_normalizer.apply(sample), act_seq
+
         primary_key = 'image' if self.obs_mode == 'rgb' else 'pcd'
         sample = {primary_key: obs_seq, 'grip': grip_seq, 'goal': goal_seq}
         if self.obs_mode == 'pcd_priv':
@@ -1164,11 +1214,29 @@ def _to_device(obs, device):
     return obs.to(device, non_blocking=True)
 
 
+_mesh_rest = _episode_ends_raw = None
+if args.obs_mode == 'mesh':
+    # Rest pose = each episode's FIRST frame, the convention
+    # collect_state_est_data.py uses (the .obj verts are object-local while the
+    # sim mesh is world-frame; both channels must live in one frame).
+    _episode_ends_raw = np.asarray(episode_ends, dtype=np.int64)
+    starts = np.concatenate([[0], _episode_ends_raw[:-1]])
+    _mesh_rest = [obs_all[s0, 12:].reshape(-1, 3).astype(np.float32)
+                  for s0 in starts]
+    _max_e = max(len(e) for e in topo_buf)
+    print(f'[data] mesh: {len(topo_buf)} cloths, '
+          f'{_mesh_rest[0].shape[0]} vertex slots, max {_max_e} edges, '
+          f'{int((np.abs(_mesh_rest[0]).sum(-1) > 0).sum())} real verts in cloth 0')
+
 dataset = DiffusionBCDataset(
     obs_all, grip_all, goal_all, priv_all, acts_all, episode_ends,
     obs_horizon=args.obs_horizon, pred_horizon=args.pred_horizon,
     action_horizon=args.action_horizon, obs_mode=args.obs_mode,
-    obs_normalizer=obs_normalizer, act_normalizer=act_normalizer)
+    obs_normalizer=obs_normalizer, act_normalizer=act_normalizer,
+    topo=topo_buf if args.obs_mode == 'mesh' else None,
+    episode_ends_raw=_episode_ends_raw, mesh_rest=_mesh_rest)
+if args.obs_mode == 'mesh':
+    dataset.max_edges = max(len(e) for e in topo_buf)
 print(f'[data] dataset windows = {len(dataset)}')
 
 dataloader = DataLoader(
@@ -1184,6 +1252,9 @@ dataloader = DataLoader(
 # =============================================================================
 if args.obs_mode == 'state':
     enc_kwargs = {'state_dim': int(obs_all.shape[-1])}
+elif args.obs_mode == 'mesh':
+    enc_kwargs = {'feat_dim': 256, 'hidden_dim': 128,
+                  'num_layers': 4, 'num_heads': 4}
 elif args.obs_mode == 'rgb':
     enc_kwargs = {'pretrained': args.pretrained_rgb}
 elif args.obs_mode in ('pcd', 'pcd_priv'):
