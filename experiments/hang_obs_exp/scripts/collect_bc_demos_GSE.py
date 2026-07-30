@@ -59,7 +59,7 @@ from dedo.demo_preset import build_traj, merge_traj
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers import RetryResetEnv, build_hole_aware_waypoints  # noqa: E402
 from _bc_obs_helpers import (  # noqa: E402
-    capture_rgb_depth, depth_to_pcd,
+    capture_rgb_depth, cloth_only_pcd,
     get_hole_indices, get_hole_loops, measure_hole_radius,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     resolve_deform)
@@ -295,11 +295,10 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         _, verts_t = get_mesh_data(deform.sim, deform.deform_id)
         ep_pos.append(np.array(verts_t, dtype=np.float32))  # (V, 3)
 
-        rgb, depth, view, proj, seg = capture_rgb_depth(
-            deform, extra.cam_resolution, extra.cam_resolution,
-            return_seg=True)
-        pcd_world = depth_to_pcd(depth, view, proj, extra.pcd_n_points,
-                                 seg_mask=seg, cloth_id=deform.deform_id)
+        rgb, depth, seg, view, proj = capture_rgb_depth(
+            deform, extra.cam_resolution, extra.cam_resolution)
+        pcd_world = cloth_only_pcd(depth, seg, view, proj,
+                                   deform.deform_id, extra.pcd_n_points)
         ep_rgb.append(rgb)
         ep_pcd.append(pcd_world)
 
@@ -324,11 +323,10 @@ while n_kept < extra.n_demos and attempts < max_attempts:
         step += 1
 
     if _is_debug_attempt:
-        rgb_ps, depth_ps, view_ps, proj_ps, seg_ps = capture_rgb_depth(
-            deform, extra.cam_resolution, extra.cam_resolution,
-            return_seg=True)
-        pcd_ps = depth_to_pcd(depth_ps, view_ps, proj_ps, extra.pcd_n_points,
-                              seg_mask=seg_ps, cloth_id=deform.deform_id)
+        rgb_ps, depth_ps, seg_ps, view_ps, proj_ps = capture_rgb_depth(
+            deform, extra.cam_resolution, extra.cam_resolution)
+        pcd_ps = cloth_only_pcd(depth_ps, seg_ps, view_ps, proj_ps,
+                                deform.deform_id, extra.pcd_n_points)
         centroid_ps = hole_centroid_world(deform, hole_idx)
         _post_settle_panel = {
             'rgb': rgb_ps, 'depth': depth_ps, 'pcd': pcd_ps,
