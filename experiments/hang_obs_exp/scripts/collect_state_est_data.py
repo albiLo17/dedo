@@ -208,6 +208,19 @@ parser.add_argument('--depth_noise_std', type=float, default=0.0,
                     help='Gaussian sigma added to the NON-LINEAR depth buffer '
                          'in [0,1) units, per pixel, before back-projection. '
                          '0 = off. Try 1e-3.')
+parser.add_argument('--min_valid_px', type=int, default=256,
+                    help='Truncate the episode when unique cloth pixels drop '
+                         'below this. Late in a hang episode the cloth often '
+                         'rotates edge-on and coverage collapses (observed: '
+                         '3262 -> 1906 -> 40 px over one rollout). Such a frame '
+                         'is not merely occluded, it is unusable supervision: '
+                         'depth_to_pcd up-samples WITH REPLACEMENT, so 40 real '
+                         'points become 2048 duplicated ones that look like a '
+                         'full observation. NB the dataset-side `min_pcd_points` '
+                         'filter cannot catch this — stored clouds are always '
+                         'exactly pcd_n_points long by construction — so the '
+                         'floor has to be enforced here. 0 = only drop empty '
+                         'frames.')
 parser.add_argument('--guard_episodes', type=int, default=3,
                     help='Check cloth-pixel coverage over the first N kept '
                          'episodes and abort if the camera is framing empty '
@@ -623,7 +636,7 @@ def run_episode(source, debug=False):
             # 1-step one and silently corrupt the dynamics targets.
             # Genuinely-occluded frames belong in the eval-time particle-filter
             # path (`step(point_cloud=None)`), not in the training tensors.
-            if valid_px is not None and valid_px == 0:
+            if valid_px is not None and valid_px < extra.min_valid_px:
                 truncated_at = len(positions_seq)
                 break
             if pos is not None and pos.shape[0] == num_verts:
@@ -888,6 +901,7 @@ with open(_stats_path, 'w') as f:
                     'scene_baseline': _BASE_PHYS}],
                 'goal_radius': extra.randomize_goal_radius,
                 'goal_dz': extra.randomize_goal_dz,
+                'min_valid_px': extra.min_valid_px,
                 'depth_noise_std': extra.depth_noise_std,
                 'depth_dropout': extra.depth_dropout,
             },
