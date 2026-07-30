@@ -69,6 +69,59 @@ def gen_procedural_hang_cloth(args, preset_obj_name, deform_info_dict):
     return args.deform_obj
 
 
+def gen_procedural_hang_cloth_real(args, preset_obj_name, deform_info_dict):
+    '''Real-world variant of gen_procedural_hang_cloth.
+    Cloth mesh lies in the XZ plane (y=0 fixed) instead of the YZ plane,
+    matching the real Franka workspace orientation after baking in the
+    sim-to-world transform (scale=0.045, Rz(90°), translation).
+    '''
+    num_holes = args.num_holes
+    node_density = args.node_density
+
+    width_range = [0.5, 2.0]
+    height_range = [0.5, 2.0]
+    w = np.random.uniform(*width_range) / 2
+    h = np.random.uniform(*height_range) / 2
+
+    constraints = {}
+    constraints['x_range'] = (2, args.node_density - 2)
+    constraints['y_range'] = (2, args.node_density - 2)
+    constraints['width_range'] = (1, int(round(node_density * 0.3)))
+    constraints['height_range'] = (1, int(round(node_density * 0.3)))
+    holes = try_gen_holes(args.node_density, num_holes, constraints)
+
+    rand_id = np.random.uniform(1e7)
+    args.deform_obj = os.path.join(tempfile.gettempdir(), f'procedural_hang_real{rand_id}.obj')
+    savepath = args.deform_obj
+
+    cloth_obj_path, cloth_anchor_indices, gt_loop_vertices = create_cloth_obj(
+        min_point=[-w, 0.00, -h], max_point=[w, 0.00, h],
+        node_density=args.node_density,
+        holes=holes,
+        data_path=savepath,
+    )
+
+    # Override anchors: use TOP-LEFT and TOP-RIGHT corners instead of both-left.
+    # Both-left creates an unconstrained y-pendulum when the cloth is pulled in x.
+    # TOP-LEFT = vertex (0, nd-1) = first row, last column → always index nd-1
+    # TOP-RIGHT = vertex (nd-1, nd-1) = last vertex ever added (corners are never
+    #   inside a hole since holes are constrained to x∈[2,nd-3], y∈[2,nd-3]).
+    nd = args.node_density
+    top_left_idx = nd - 1
+    with open(cloth_obj_path) as _f:
+        n_verts = sum(1 for _line in _f if _line.startswith('v '))
+    top_right_idx = n_verts - 1
+    cloth_anchor_indices = ([top_left_idx], [top_right_idx])
+
+    if args.deform_obj not in deform_info_dict.keys():
+        deform_info_dict[args.deform_obj] = deform_info_dict[preset_obj_name].copy()
+
+    deform_info_dict[args.deform_obj]['deform_anchor_vertices'] = list(cloth_anchor_indices)
+    deform_info_dict[args.deform_obj]['deform_true_loop_vertices'] = gt_loop_vertices
+
+    return args.deform_obj
+
+
 def gen_procedural_button_cloth(args, preset_obj_name, deform_info_dict):
     '''
     Button cloth procedural generator, generates one or two holes for the button cloth.

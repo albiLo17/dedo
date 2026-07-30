@@ -70,6 +70,60 @@ the visual observation pipeline differs.
    checkpoint/video infra (best-eval ckpt, periodic ckpts, eval mp4s)
    that hadn't existed at v1 launch time gets used. See "v1 partial
    results" + "v2 — relaunch" sections below.
+7. **v3 — fairness, PCD audit, data scale, chunking fix
+   (2026-05-13).** Eight substantive changes before the comparison
+   runs ship: (a) **pull-taut bug fix**: scripted-controller demos at
+   15 Hz held the trailing waypoint velocity for the entire
+   post-trajectory tail (~5 s at `max_episode_len=120`), training a
+   sim2real anti-pattern of "drag the cloth taut against the peg."
+   Now zero-action hold + a 5-frame brake, with per-episode
+   `max_episode_len = traj_len + tail` so demos end at ~51 control
+   steps with 88% active frames instead of 37% active at v2. (b) **PCD
+   architecture audit**: cloth-only via pybullet seg-mask filter
+   (drops ~30-40% of points previously wasted on the static
+   peg/pole/flag), point count bumped 512 → 2048, PointNet++ SSG
+   ball-query radii tuned from defaults `0.2 / 0.4` (designed for
+   unit-cube-filling objects) to `0.1 / 0.3` so the multi-scale
+   hierarchy actually resolves local vs. regional cloth geometry
+   instead of collapsing to two global features. (c) **Goal
+   conditioning for RGB and PCD**: privileged obs already includes the
+   3-dim hanger goal pose in its last 3 dims; v3 adds the same vector
+   to RGB and PCD encoders via a small projection head so the only
+   asymmetry left across modalities is hole-centroid extraction (the
+   actual privileged advantage). (d) **Same-camera projection
+   matching in debug viz** so settle frames inside `make_final_steps`
+   render with the same fov=60 as the obs camera (was using dedo's
+   default DEFAULT_CAM_PROJECTION fov≈90). (e) **Demo scale 150 →
+   1000**: v2 eval (with brake-tail demos already applied) showed
+   state stalled at 0.5 vs v1's 1.0 — the gap cleanly tracks the 4×
+   drop in obs-action pairs (~7k v2 at 15 Hz × 51 steps vs ~30k v1
+   at 30 Hz × 200 steps), not the design redesign itself. v3 collects
+   1000 demos for ~50k pairs (beyond v1 scale), since visual modes have
+   more headroom to absorb data than identity-encoder state. (f)
+   **`action_horizon` 8 → 4**: at 15 Hz, an 8-step chunk is 533 ms of
+   open-loop execution (v1 at 30 Hz had 267 ms), and with ~51-step
+   episodes that's only ~6 obs-conditioned decisions per rollout vs
+   v1's ~25. Drop to 4 to restore decision density; keep
+   `pred_horizon=16` for diffusion planning depth.
+8. **v4 — randomized hanger xy (2026-05-15).** v3's fixed peg
+   location at world `(0, 0, 8)` lets the visual modes "cheat" by
+   memorizing where the peg appears in the image; goal conditioning
+   becomes load-bearing only for hole-centroid extraction. v4 samples
+   `(dx, dy) ~ Uniform[-r, +r]^2` at every reset and shifts the hanger
+   URDF + tallrod URDF + `goal_pos` together by the same delta, so the
+   peg appears at a different world location each episode. The
+   scripted controller already reads `goal_pos[0]` for its waypoint
+   targets, the per-step `obs['goal']` capture already reads it for
+   normalization, and the three encoders already consume the goal —
+   so the only changes needed were the env-side sampling
+   ([deform_env.py:240-260](../../dedo/envs/deform_env.py#L240-L260))
+   and parity plumbing through collect/train/eval. **Radius not yet
+   tuned** — `--randomize_goal_radius` is a CLI flag with a
+   placeholder default of 1.5 m below; validate camera framing at
+   that radius (or your chosen alternative) with
+   [_diag_goal_randomization.py](scripts/_diag_goal_randomization.py)
+   before launching collection. See "v4 — randomized hanger xy"
+   section for design notes + launch commands.
 
 ---
 
@@ -442,6 +496,514 @@ per eval pass, so the analysis can re-anchor without retraining.
 
 ---
 
+## v3 — fairness, PCD audit, data scale, chunking fix
+
+Decided 2026-05-13 after auditing v2's PCD encoder configuration,
+inspecting v2 debug videos, **and** seeing v2's eval curves stall well
+short of v1 even with v3-style brake-tail demos already in place (state
+0.5 vs v1's 1.0; pcd peak ~0.13 with subsequent overfit drop; rgb
+floored). Eight substantive changes; each addresses a specific risk to
+the cross-modality comparison. Items 1–6 were the original v3 fairness
++ architecture pass; items 7–8 were added after the v2 eval read
+revealed the data scale + chunking issues.
+
+### What changed and why
+
+1. **Pull-taut behavior eliminated.** v2's
+   `collect_bc_demos.py` filled the post-trajectory tail by holding
+   `last_action` (the final waypoint velocity ~0.55 in normalized
+   action space, pointing -y/-z). At 15 Hz × 75 hold frames that was
+   ~5 s of PD-driven drag against the peg — produced 100% success but
+   trained a sim2real-fragile "strain the cloth against the goal"
+   maneuver. v3 commands **zero velocity** after the trajectory ends
+   and the planned `--episode_tail_frames=5` of zero-action gives the
+   PD controller time to brake the anchor before the gravity-settle
+   phase fires. Per-episode `max_episode_len = traj_len + tail` so
+   episodes are ~51 steps instead of 121, with 88% active frames
+   instead of 37%. Empirically the success rate held (5/6 → ~80%) and
+   the topological-success rate *improved* (4 of 5 vs ~1 of 5 in v2)
+   because the cloth drapes cleanly under gravity instead of being
+   dragged past.
+
+2. **Cloth-only PCD via pybullet segmentation mask.** pybullet's
+   `getCameraImage` returns a per-pixel seg-mask alongside depth.
+   `_bc_obs_helpers.cloth_only_pcd` filters the depth back-projection
+   to pixels where `seg_id == deform.deform_id`, so the saved PCD
+   contains 100% cloth surface points instead of ~60% cloth + ~30%
+   peg/pole/flag + ~10% base. The peg's geometry is constant across
+   episodes (HangProcCloth randomizes only the cloth), so dropping it
+   loses no information the policy needs.
+
+3. **PCD point budget 512 → 2048.** With cloth-only filtering, the
+   2048-point budget concentrates ~6× more surface density on the
+   deformable object the policy actually reasons about. Disk cost
+   per demo grows from ~4 MB → ~6 MB; full 150-demo dataset stays
+   under 1 GB.
+
+4. **PointNet++ ball-query radii tuned to cloth-only normalized
+   scale.** v2 used the canonical SSG radii (0.2 / 0.4) which were
+   designed for unit-cube-filling objects (ShapeNet etc.) and on our
+   data caused the multi-scale hierarchy to collapse — layer-1 ball-
+   query at radius 0.2 covered the entire cloth, layer-2 at 0.4
+   covered the entire scene. The empirical per-frame cloth extent
+   in normalized space is ~0.9 × 0.4 × 1.0 (cloth diameter ≈ 1.4),
+   so radii **0.1 / 0.3** correctly resolve local (hole-edge,
+   wrinkles) vs. regional (cloth pose, hole position) features
+   before the group-all global pool. See [`_diffusion_policy.py:195-219`](scripts/_diffusion_policy.py#L195-L219)
+   for the calibration comment.
+
+5. **Goal conditioning for RGB and PCD.** Privileged
+   `hole_centroid` obs already embeds the 3D hanger pose in its last
+   3 dims. v1/v2 visual modes only saw image/PCD + 12-dim gripper
+   proprio, so they had to implicitly learn the (fixed) peg location
+   from data — a free signal the privileged policy got. v3 saves the
+   hanger goal as a separate `goal` key in every demo pkl and the
+   `RGBObsEncoder` / `PointCloudObsEncoder` consume it via a small
+   `_GoalProjection` (3 → 8) concatenated with the visual feature.
+   Now the only privileged-only signal is the cloth-derived hole
+   centroid, which is the actual hypothesis under test.
+
+6. **Settle-frame camera matches obs camera in debug videos.** v2's
+   `deform.render()` used dedo's `DEFAULT_CAM_PROJECTION` (fov≈90)
+   while obs RGB used `proj_matrix()` (fov=60). Settle frames in the
+   debug mp4s appeared zoomed out relative to the policy-phase frames.
+   v3 monkey-patches `deform.render` at `collect_bc_demos.py` startup
+   so both code paths share fov=60. Cosmetic-only — no training-time
+   effect.
+
+7. **Demo scale 150 → 1000.** The v2 eval runs (which already had the
+   v3 brake-tail fix applied — only items 2–8 here postdate them) saw
+   state stall at ~0.5 success vs v1's 1.0, pcd peak at ~0.13 then
+   overfit-decay, rgb_pre floor near 0. Tracing back to data: at 15 Hz
+   × ~51-step demos, 150 demos produces ~7k obs-action pairs vs v1's
+   ~30k at 30 Hz × 200-step demos. **4× less training data is the
+   dominant variable**, not anything inherent to the 15 Hz / brake-tail
+   redesign. The loss curve confirms: all six v2 runs flattened by step
+   ~50 to a noise floor ~0.015–0.02 regardless of obs mode, the textbook
+   small-dataset memorization fingerprint. v3 collects **1000 demos**
+   for ~50k pairs — beyond v1 scale, since visual modes (RGB, PCD) have
+   more headroom to absorb data than the 18-dim identity-encoder state
+   baseline does. Disk cost ~6 GB; collection wall-clock ~75–90 min on
+   L4 (linear in demo count, still cheap relative to per-mode training).
+
+8. **`action_horizon` 8 → 4 at 15 Hz.** At 15 Hz, an 8-step
+   open-loop chunk spans 533 ms vs v1's 267 ms at 30 Hz (8 / 30).
+   Compounded with v3's ~51-step episodes, that left the policy with
+   only ~6 obs-conditioned decision points per rollout vs v1's ~25.
+   Fine-grained threading is precisely the regime where re-anchoring
+   to fresh observations matters — small denoising errors that v1 could
+   correct twice per second, v2 had to live with for half a second.
+   v3 sets `--action_horizon 4` to restore the per-second decision
+   density v1 had, while keeping `pred_horizon=16` so the diffusion
+   model still plans over a 1067 ms horizon (DP-paper recipe: predict
+   more than you execute, throw away the tail).
+
+### Schema additions to demo pkls (v3)
+
+| key | shape | description |
+| --- | ----- | ----------- |
+| `obs['pcd']` | (T, 2048, 3) | **cloth-only** points (was 512 with peg) |
+| `obs['goal']` | (T, 3) | hanger pose / WBOX (constant per episode) |
+| `ctrl_freq` | float | 15.15 Hz actual (500/33) |
+| `sim_freq` | int | 500 (PyBullet step rate) |
+| `sim_steps_per_action` | int | 33 |
+| `max_act_vel` | float | 4.0 |
+| `episode_tail_frames` | — | not stored directly; visible via `len - traj_len` |
+
+### v3 demo collection
+
+```bash
+python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
+    --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_v1 \
+    --n_demos 1000 \
+    --cam_resolution 128 --pcd_n_points 2048 \
+    --max_act_vel 4.0 \
+    --success_metric legacy --success_factor 1.2 \
+    --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 \
+    --debug_viz_first_n 3 --debug_viz_every 100 \
+    --seed 2026
+```
+
+Deltas from the v2 collection command:
+
+| flag | v2 | v3 | reason |
+| ---- | -- | -- | ------ |
+| `--n_demos` | 150 | **1000** | restore data scale lost to the 15 Hz × shorter-episode redesign; ~50k pairs vs v2's ~7k, beyond v1's ~30k |
+| `--pcd_n_points` | 512 | 2048 | 4× cloth-surface density now that peg points are filtered out |
+| `--max_episode_len` | 120 (fixed) | 200 (safety cap) | per-episode length is now `traj_len + tail` (~51); 200 is just an upper bound |
+| `--episode_tail_frames` | (n/a, hold filled tail) | 5 | zero-action brake phase before gravity settle; replaces the trailing-velocity hold |
+| `--debug_viz_every` | 25 | 100 | scaled with demo count — at 1000 demos, every-25 was ~40 mp4s; every-100 gives ~10 spot-check videos |
+| `--demos_dir` | `bc_demos_15hz_v1` | `bc_demos_15hz_pcd2048_n1000_v1` | `pcd2048_n1000` tokens self-document density + demo count |
+| (under the hood) PCD content | cloth + peg + flag + base | **cloth only** (seg-mask filter) | concentrates point budget on the deformable target |
+| (under the hood) hold action | trailing-velocity hold | **zero-action hold** | eliminates the pull-taut sim2real anti-pattern |
+| (under the hood) `goal` field | not saved | **3-dim hanger pose** | parity with privileged obs for RGB/PCD encoders |
+
+Expected dataset characteristics: ~51 control steps per demo (45
+scripted + 5 brake + dedo's 500-tick gravity settle), ~6 MB per pkl
+(2048 cloth-only float32 + 128² uint8 RGB + state + grip + goal),
+**~6 GB total disk for 1000 demos**. Wall-clock **~75–90 min on L4**.
+
+### v3 launch commands
+
+Three-stage pipeline: collect → train → final eval. Stage 2 needs the
+collection from stage 1 to be on disk first (the training script
+validates demo-dir metadata before building any models). New flags vs
+v2: `--action_horizon 4` (was default 8) to restore decision density
+at 15 Hz; `--num_epochs 300` (was 200) since ~7× more data per epoch
+means saturation lands later in epoch count; `--n_final_eval_episodes
+100` (was 50) for tighter SE on the headline cross-modality numbers
+that the whole experiment exists to compare.
+
+```bash
+# Stage 1 — collect 1000 demos. Wait for this tmux to print DONE
+# (~75–90 min on L4) before launching stage 2.
+
+tmux new-session -d -s diff-collect "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/collect_bc_demos.py --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_v1 --n_demos 1000 --cam_resolution 128 --pcd_n_points 2048 --max_act_vel 4.0 --success_metric legacy --success_factor 1.2 --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 --debug_viz_first_n 3 --debug_viz_every 100 --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/collect.log; echo DONE; sleep infinity'"
+
+# Stage 2 — train the three modes in parallel.
+
+export DEMOS=~/github/dedo/logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_v1
+
+tmux new-session -d -s diff-state "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode state --state_key hole_centroid --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 256 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/state.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-rgb "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode rgb --pretrained_rgb --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 64 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/rgb.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-pcd "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode pcd --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 128 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/pcd.log; echo DONE; sleep infinity'"
+```
+
+Expected v3 wandb run names (`_pre` in the rgb suffix marks the
+ImageNet init carried over from v2; `_ah4` marks the shorter action
+chunk; PCD now uses `pcd2048` density but the suffix doesn't change
+because the encoder reads point count from `obs.shape[-2]` at
+construction):
+
+```
+diff<TS>_state_lr1e-4_e300_bs256_ah4_sm-legacy_s2026
+diff<TS>_rgb_pre_lr1e-4_e300_bs64_ah4_sm-legacy_s2026
+diff<TS>_pcd_lr1e-4_e300_bs128_ah4_sm-legacy_s2026
+```
+
+### v3 eval-cap bug + fix (2026-05-14)
+
+The first v3 state run (`diff260514-073100`) hit **0.1 legacy success at
+epoch 20** — wildly off the expected privileged-state ceiling, especially
+worse than v2's 0.5 stall. Pulled the first eval video and saw the
+gripper anchors pulling the cloth **taut against the peg at episode end**,
+exactly the v2 pull-taut anti-pattern that the v3 brake-tail fix was
+supposed to eliminate.
+
+**Root cause.** [collect_bc_demos.py](scripts/collect_bc_demos.py) sets
+`deform.max_episode_len = len(scripted_traj) + episode_tail_frames`
+per-episode (≈51 ctrl steps for v3), but the eval env in
+`train_diffusion_bc.py` was constructed with `args.max_episode_len = 200`
+and never per-episode-overridden. So every eval episode ran for **~4×
+longer than the training distribution** — steps 51-200 fed the diffusion
+policy obs windows it had never seen, and the policy drifted into
+cumulative lateral force impulses on the anchors. By step 200 the
+gripper was way off-axis from the peg, and the gravity-settle phase
+(which doesn't release anchors, only stops applying external force on
+them — see [deform_env.py:412](../../dedo/envs/deform_env.py#L412)) just
+froze the cloth at that stretched configuration.
+
+The bug was masked through v2 because v2 demos had the same
+trailing-velocity tail that pull-taut training data — the policy's OOD
+behavior past step 51 happened to *match* the training distribution by
+luck. v3's clean brake-tail demos exposed it.
+
+**Validation.** Wrote a standalone
+[eval_diffusion_bc.py](scripts/eval_diffusion_bc.py) that loads
+`policy_best.pt` directly (no demo dir needed; reads env config from
+ckpt metadata). On the broken v3 state ckpt:
+
+| `--max_episode_len` | first 12 episodes (legacy success) |
+| ------------------- | ---------------------------------- |
+| 200 (the bug) | 0 / 3 (matches the wandb 0.1 rate) |
+| 56 (in-distribution) | **12 / 12** |
+
+So the policy itself was fine all along — the eval was just measuring
+the wrong thing.
+
+**Fix.** Two-layer:
+
+1. **Per-episode dynamic sizing** in
+   [evaluate_policy](scripts/train_diffusion_bc.py): after `e.reset()`,
+   build the scripted hole-aware trajectory the demo controller WOULD
+   have run for the current cloth (`build_hole_aware_waypoints` +
+   `build_traj` + `merge_traj`, same calls as `collect_bc_demos.py`),
+   set `deform.max_episode_len = len(traj) + args.episode_tail_frames`.
+   This mirrors collect-time per-episode termination exactly. New shared
+   helper `compute_per_episode_max_len` in
+   [_helpers.py](scripts/_helpers.py) used by both the in-training eval
+   and the standalone `eval_diffusion_bc.py`.
+
+2. **`args.max_episode_len`** stays as the hard safety ceiling
+   (default 200) so a runaway cloth can't run unbounded; demoted from
+   "the eval cap" to "the worst-case ceiling."
+
+`episode_tail_frames` defaults to 5 (matches `collect_bc_demos.py`
+default) and is now embedded in every ckpt's metadata so
+`eval_diffusion_bc.py` can recover it without the demo dir.
+
+**Other small things that fell out of this audit:**
+
+- Added `--resume` flag to `train_diffusion_bc.py` (loads weights + EMA
+  shadow + optimizer + scheduler state from a ckpt and continues the
+  epoch counter; ckpts saved by the updated `_save_ema_checkpoint`
+  persist this state). Useful for crash recovery on future runs.
+- `_save_ema_checkpoint` now persists `step_counter`, `best_eval_success`,
+  and `best_eval_epoch` alongside the model state.
+- `make_final_steps()` doesn't release the gripper anchors (commented
+  out in dedo to avoid jerk forces); the gravity-settle drape relies on
+  the anchors having their own mass
+  (`ANCHOR_MASS=0.1 kg`, [anchor_utils.py:18](../../dedo/utils/anchor_utils.py#L18))
+  plus the cloth's distributed weight. This works as long as the anchors
+  enter settle at a sensible position (which the fix now guarantees).
+
+**Relaunch.** Same launch commands as the v3 block below — `--resume` is
+opt-in, and `--episode_tail_frames` defaults to 5, so the existing
+tmux commands work unchanged. The original `diff260514-073100*` runs
+were killed; the relaunched ones supersede them.
+
+### Encoder feat_dim across modes (v3)
+
+| mode | encoder | primary feat | + grip | + goal | total |
+| ---- | ------- | ------------ | ------ | ------ | ----- |
+| state | identity | 18 | (embedded) | (embedded) | 18 |
+| rgb | ResNet-18 GroupNorm (ImageNet) | 512 | 12 | 8 | **532** |
+| pcd | PointNet++ SSG (radii 0.1 / 0.3), 2048 cloth pts | 256 | 12 | 8 | **276** |
+
+global_cond_dim for the U-Net = `obs_horizon * feat_dim`: 36 (state),
+1064 (rgb), 552 (pcd).
+
+### Fairness invariants now enforced across modalities
+
+| invariant | how |
+| --------- | --- |
+| Same trajectory data | one collection, three obs keys in every pkl |
+| Same gripper proprio | 12-dim `grip` saved & consumed by all 3 encoders (state: embedded, rgb/pcd: separate input) |
+| **Same goal info** | 3-dim `goal` saved & consumed by all 3 (state: embedded, rgb/pcd: `_GoalProjection`) |
+| Same camera | one `cam_viewmat`; RGB and PCD use identical render path |
+| Same action normalization | `MAX_ACT_VEL` patched from pkl into eval env |
+| Same ctrl freq | `sim_freq` + `sim_steps_per_action` patched from pkl |
+| Same success metric | `--success_metric legacy`, all 3 also logged for cross-anchor |
+
+The **only** modality-specific knowledge gap is now: privileged
+state gets the cloth-derived 3D hole centroid; RGB and PCD have to
+extract it from raw inputs. That is the experimental quantity under
+test.
+
+---
+
+## v4 — randomized hanger xy
+
+Decided 2026-05-15. v1–v3 used a fixed hanger pose at world
+`(0, 0, 8)` (hanger crossbar) / `(0, 0, 8.2)` (goal_pos). The peg
+therefore appears at the same image-space pixel range in every demo,
+which means RGB and PCD encoders can in principle memorize that the
+threading target lives at a known location and treat the goal-cond
+input as redundant. v4 breaks that shortcut: every reset samples
+`(dx, dy) ~ Uniform[-r, +r]^2` (default placeholder `r = 1.5 m`,
+unvalidated — see below) and shifts the hanger URDF + tallrod URDF +
+`goal_pos[*]` together by the same delta. Same procedural cloth, same
+gripper start pose, same camera viewmat — only the peg moves.
+
+### Hypothesis
+
+- **state** should still saturate near 1.0: privileged obs already
+  embeds the goal in its last 3 dims, so the policy gets the new peg
+  pose for free each episode.
+- **rgb** and **pcd**: with v3 architecture the goal vector reaches
+  the encoder via `_GoalProjection`, but the encoder might not have
+  *needed* to use it under a fixed peg. v4 makes goal conditioning
+  load-bearing: the rate gap between v3 (fixed) and v4 (randomized)
+  is a proxy for "how much did the visual encoder rely on memorized
+  peg location vs. the goal input."
+- Cross-modality gap on v4 (state minus rgb/pcd) is the cleaner
+  measure of the privileged advantage — under v3 the privileged
+  advantage was conflated with the visual-modes' ability to memorize
+  geometry.
+
+### Open question — radius not yet tuned
+
+The 1.5 m placeholder is a reasonable mid-range starting point under
+the v3 camera (yaw=45, pitch=-5, dist=14, target=(0, 0, 5.5)) but has
+**not** been visually verified yet. Two failure modes to check before
+collection:
+
+1. **Camera framing.** At the box corners (`±1.5, ±1.5`), the peg
+   could crop at the image edge, or the cloth (anchored at fixed
+   gripper start positions) could end up outside the camera frustum.
+2. **Scripted-controller reach.** The waypoints in
+   `build_hole_aware_waypoints` are computed as offsets from
+   `goal_pos`; if the goal moves to `+1.5x`, the gripper has to
+   traverse further, and the velocity-clipped trajectory may not
+   reach the threading pose in the time budget. The collector retries
+   failures, so the visible signal is a drop in scripted success rate
+   (logged as `kept/attempts` at the end of collection).
+
+Use [_diag_goal_randomization.py](scripts/_diag_goal_randomization.py)
+to validate camera framing for any (radius, cam_viewmat) pair before
+committing — it renders a 3×3 mosaic showing the scene at the 9 grid
+points (center + 4 edges + 4 corners) of the randomization box, with
+a green marker at the actual `goal_pos`. The script works
+independently of the env-side randomization (re-poses rigid bodies
+via pybullet directly), so you can also use it to pre-screen new
+`--cam_viewmat` candidates for future datasets.
+
+```bash
+# Validate v4 framing at the default 1.5 m radius
+python experiments/hang_obs_exp/scripts/_diag_goal_randomization.py \
+    --radius 1.5 \
+    --save_path logs/hang_obs_exp/diag/cam_v3_r1.5.png
+
+# Compare radii at the same viewpoint
+python experiments/hang_obs_exp/scripts/_diag_goal_randomization.py \
+    --radius 1.0 \
+    --save_path logs/hang_obs_exp/diag/cam_v3_r1.0.png
+python experiments/hang_obs_exp/scripts/_diag_goal_randomization.py \
+    --radius 2.0 \
+    --save_path logs/hang_obs_exp/diag/cam_v3_r2.0.png
+```
+
+Pick the largest radius that keeps the peg fully in frame at all 4
+corners *and* lets the scripted controller maintain ≥80% success at
+collection time (eyeball the `kept/attempts` ratio on a 50-demo
+pilot run). The number locked in for v4 collection will be recorded
+in the demo pkls under `randomize_goal_radius` and propagated to
+training/eval automatically.
+
+### What changed in code
+
+Five touchpoints for the randomization itself, all minimal:
+
+| where | change |
+| ----- | ------ |
+| [dedo/utils/args.py](../../dedo/utils/args.py) | new flag `--randomize_goal_radius` (float, default 0.0). |
+| [dedo/envs/deform_env.py](../../dedo/envs/deform_env.py) `load_objects` | when `scene_name == 'hangcloth'` and radius > 0, sample `goal_dxy ~ Uniform[-r, +r]^2`, apply to hanger + tallrod `basePosition` and to every entry of `goal_poses`. Reproducible via the existing np.random seed; the dxy is stashed on `self._last_goal_dxy` for introspection. |
+| [collect_bc_demos.py](scripts/collect_bc_demos.py) | argparser flag + sys.argv passthrough + per-pkl metadata field `randomize_goal_radius`. The per-step `obs['goal']` capture is unchanged — it already reads `deform.goal_pos[0] / 20.0` each step, which now varies per episode. |
+| [train_diffusion_bc.py](scripts/train_diffusion_bc.py) | parity tracker `recorded_randomize_goal_radii` reads the field from every pkl; mixed values across the demo dir raise (same strict pattern as `max_act_vel`). `eval_randomize_goal_radius` is picked from the demos, threaded into the eval-env `sys.argv`, and saved into the ckpt metadata. No CLI flag — the radius comes from the demos because the policy fits that specific spatial distribution. |
+| [eval_diffusion_bc.py](scripts/eval_diffusion_bc.py) | reads `randomize_goal_radius` from ckpt metadata (defaults to 0.0 for legacy ckpts) and patches eval-env sys.argv. |
+
+In the same pass, the camera-match patch that was previously inlined
+(and conditional on the recording flag) in three places was
+factored into a single helper
+[`patch_deform_render_to_obs_camera`](scripts/_bc_obs_helpers.py)
+and applied **unconditionally at env construction** in
+`collect_bc_demos.py`, `train_diffusion_bc.py._build_eval_env`,
+`eval_diffusion_bc.py`, and `_diag_goal_randomization.py`. This
+guarantees that every `deform.render()` call (policy-phase frames,
+make_final_steps settle frames, debug panels, mosaic tiles) uses
+fov=60 — the same projection as `capture_rgb_depth` feeds the policy
+encoders. The view matrix already came from `args.cam_viewmat`
+(parity-checked against the demos), so the eval-video camera is now
+bit-identically the obs camera by construction. Previously this was
+only true when the recording branch was hit; a missed branch could
+have silently produced fov≈90 frames.
+
+The scripted hole-aware controller required **zero changes** — it
+already reads `underlying.goal_pos[0]` at
+[_helpers.py:87](scripts/_helpers.py#L87) and computes waypoints as
+offsets from it, so per-episode goal movement is automatic. Reward,
+legacy/hanging/topological success metrics, and the `obs['goal']`
+auxiliary input all read `goal_pos[0]` too — verified by grep, none
+hardcode `(0, 0, 8.2)`.
+
+### v4 demo collection
+
+```bash
+python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
+    --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_randgoal_v1 \
+    --n_demos 1000 \
+    --cam_resolution 128 --pcd_n_points 2048 \
+    --max_act_vel 4.0 \
+    --success_metric legacy --success_factor 1.2 \
+    --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 \
+    --randomize_goal_radius 1.5 \
+    --debug_viz_first_n 3 --debug_viz_every 100 \
+    --seed 2026
+```
+
+Deltas from v3 collection:
+
+| flag | v3 | v4 | reason |
+| ---- | -- | -- | ------ |
+| `--randomize_goal_radius` | n/a | **1.5** (placeholder) | per-episode xy randomization of the hanger pose; tune before launch via `_diag_goal_randomization.py` |
+| `--demos_dir` | `bc_demos_15hz_pcd2048_n1000_v1` | `bc_demos_15hz_pcd2048_n1000_randgoal_v1` | `randgoal` token marks the radius>0 dataset |
+
+Everything else identical to v3 (same camera, same MAX_ACT_VEL, same
+2048 cloth-only PCD, same brake-tail).
+
+### v4 launch commands
+
+```bash
+# Stage 1 — collect 1000 demos. Wait for this to print DONE
+# (~75-90 min on L4, possibly longer if the scripted controller's
+# success rate drops near the corners of the randomization box).
+
+tmux new-session -d -s diff-collect "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/collect_bc_demos.py --demos_dir logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_randgoal_v1 --n_demos 1000 --cam_resolution 128 --pcd_n_points 2048 --max_act_vel 4.0 --success_metric legacy --success_factor 1.2 --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 --randomize_goal_radius 1.5 --debug_viz_first_n 3 --debug_viz_every 100 --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/collect.log; echo DONE; sleep infinity'"
+
+# Stage 2 — train the three modes in parallel. NB: no train-side
+# --randomize_goal_radius flag exists; the value is read from the
+# demo pkls and parity-checked across the directory.
+
+export DEMOS=~/github/dedo/logs/hang_obs_exp/bc_demos_15hz_pcd2048_n1000_randgoal_v1
+
+tmux new-session -d -s diff-state "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode state --state_key hole_centroid --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 256 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/state.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-rgb "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode rgb --pretrained_rgb --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 64 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/rgb.log; echo DONE; sleep infinity'"
+
+tmux new-session -d -s diff-pcd "bash -lc 'source ~/miniforge3/etc/profile.d/conda.sh && conda activate dedo38 && cd ~/github/dedo && python experiments/hang_obs_exp/scripts/train_diffusion_bc.py --demo_path $DEMOS --obs_mode pcd --action_horizon 4 --success_metric legacy --success_factor 1.2 --num_epochs 300 --batch_size 128 --lr 1e-4 --num_workers 2 --eval_every_epochs 20 --n_eval_episodes 30 --n_final_eval_episodes 100 --save_every_epochs 20 --use_wandb --wandb_project hang_bc_diffusion --seed 2026 2>&1 | tee logs/hang_obs_exp/diffusion_bc/pcd.log; echo DONE; sleep infinity'"
+```
+
+**Eval-video cadence + camera (relevant for every run, called out
+here because v4 is the first run where video sanity-checking
+genuinely matters — varied goals = visible spatial signal).** The
+launch commands above don't pass any `--video_*` flag, so defaults
+apply: `--video_every_evals=1` × `--n_video_episodes=3` ×
+`--eval_every_epochs=20` = an mp4 with 3 episodes uploaded to wandb
+every 20 epochs, plus an extra mp4 at final eval. The recorded
+frames go through the same camera (view matrix + fov=60 projection)
+as the policy's obs encoder — guaranteed by
+`patch_deform_render_to_obs_camera` applied unconditionally at env
+construction — so the videos are a direct visual transcript of what
+the policy is conditioning on. To slow the cadence (e.g. record
+every other eval pass), pass `--video_every_evals=2`; to disable
+training-time videos entirely, `--video_every_evals=0` (the final-
+eval pass still records one mp4 unconditionally).
+
+Expected v4 wandb run names — identical scheme to v3 (the run-name
+suffix doesn't encode the randomization radius since that's a dataset
+property, not a model knob, and downstream filtering happens via the
+`bc_demos_*_randgoal_v1` dataset path stored in `config.json`):
+
+```
+diff<TS>_state_lr1e-4_e300_bs256_ah4_sm-legacy_s2026
+diff<TS>_rgb_pre_lr1e-4_e300_bs64_ah4_sm-legacy_s2026
+diff<TS>_pcd_lr1e-4_e300_bs128_ah4_sm-legacy_s2026
+```
+
+To keep v3 and v4 runs distinguishable in the wandb runs table, use
+the `--wandb_run_name` flag at launch (e.g. `--wandb_run_name v4`) to
+prefix the suffix, or filter by `config.demo_path` containing
+`randgoal`.
+
+### Fairness invariants — v4 update
+
+Same table as v3 with one row added:
+
+| invariant | how |
+| --------- | --- |
+| Same trajectory data | one collection, three obs keys in every pkl |
+| Same gripper proprio | 12-dim `grip` saved & consumed by all 3 encoders |
+| Same goal info | 3-dim `goal` saved & consumed by all 3 (state: embedded, rgb/pcd: `_GoalProjection`) — **now varies per episode** |
+| Same camera | one `cam_viewmat`; RGB and PCD use identical render path |
+| Same action normalization | `MAX_ACT_VEL` patched from pkl into eval env |
+| Same ctrl freq | `sim_freq` + `sim_steps_per_action` patched from pkl |
+| Same success metric | `--success_metric legacy`, all 3 also logged |
+| **Same goal-randomization radius** | `randomize_goal_radius` patched from pkl into eval env; mixed values across demo dir raise |
+
+---
+
 ## Output artifacts per run
 
 Each logdir at `logs/hang_obs_exp/diffusion_bc/<obs_mode>/<run_name>/`
@@ -559,7 +1121,9 @@ pass. See [RUNS.md](RUNS.md) for context.
 3. Sanity-check `eval/success_legacy` vs `eval/success_hanging` per
    mode. If they diverge dramatically, that's a useful artifact for
    the success-metric discussion (RUNS.md "Success-metric discovery").
-4. If the visual modes underperform expectations, the first
-   experimental knob to turn is **dataset size** (collect 300-500
-   demos) rather than architecture — diffusion policy paper consistently
-   shows BC scaling with data when the architecture is correct.
+4. If the visual modes still underperform after v3's 1000-demo
+   baseline, the next experimental knob is **dataset size again**
+   (collect 2000–3000 demos) rather than architecture — diffusion
+   policy paper consistently shows BC scaling with data when the
+   architecture is correct, and v3 itself is the existence proof that
+   stepping up data 4× was the right first move.

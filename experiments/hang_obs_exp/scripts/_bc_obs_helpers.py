@@ -38,36 +38,80 @@ def proj_matrix(near=_PCD_NEAR, far=_PCD_FAR, fov=60.0, aspect=1.0):
         fov=fov, aspect=aspect, nearVal=near, farVal=far)
 
 
-def capture_rgb_depth(deform_env, width, height, return_seg=False):
-    """Render RGB + depth using deform_env's cached cam_viewmat.
+def patch_deform_render_to_obs_camera(deform_env):
+    """Replace `deform_env.render()` so captured frames use the SAME
+    projection as the obs camera (fov=60, near=0.1, far=30 — i.e.
+    `proj_matrix()`). The view matrix already comes from
+    `deform_env._cam_viewmat` (built from `args.cam_viewmat`) and is
+    unchanged.
 
-    Returns (rgb uint8 (H,W,3), depth float64 (H,W) ∈ [0,1), view, proj).
-    When return_seg=True, also returns seg int32 (H,W) as a 5th element,
-    where each pixel value is the PyBullet body unique ID (-1 = background).
+    Why this exists: without the patch, `deform_env.render()` uses dedo's
+    `DEFAULT_CAM_PROJECTION` (fov≈90), so any saved video would have a
+    visibly wider field of view than the policy's actual obs camera. The
+    policy was trained on fov=60 RGB / depth, so videos should look the
+    same. This call site also covers `make_final_steps` — pybullet's
+    settle-phase frames go through `self.render()` too, so the post-
+    policy gravity-drape phase ends up consistent with the policy phase.
+
+    Apply this UNCONDITIONALLY at env construction (right after
+    `gym.make`) — it's idempotent, cheap (replaces one method
+    reference), and makes any future render call in this env safe by
+    default. Gating it on a flag like `record_videos > 0` makes the
+    invariant fragile: anyone who adds a debug `deform.render()` later
+    silently gets the wrong fov.
+
+    Returns the patched method (handy if a caller wants to hold onto a
+    direct reference, e.g. for a 3-panel video builder).
+    """
+    import types as _types
+    matched_proj = proj_matrix()
+
+    def _matched_render(self, mode='rgb_array', width=300, height=300):
+        assert mode == 'rgb_array'
+        _, _, rgba, _, _ = self.sim.getCameraImage(
+            width=width, height=height,
+            renderer=pybullet.ER_BULLET_HARDWARE_OPENGL,
+            viewMatrix=self._cam_viewmat,
+            projectionMatrix=matched_proj)
+        return np.asarray(rgba)[:, :, :3]
+
+    deform_env.render = _types.MethodType(_matched_render, deform_env)
+    return deform_env.render
+
+
+def capture_rgb_depth(deform_env, width, height):
+    """Render RGB + depth (+ seg mask) using deform_env's cached cam_viewmat.
+
+    Returns (rgb uint8 (H,W,3), depth float64 (H,W) ∈ [0,1),
+             seg int32 (H,W), view, proj).
+
+    `seg[i, j]` is pybullet's per-pixel object ID. -1 = background (e.g.
+    sky, no hit). For dedo HangProcCloth-v1, valid IDs include the
+    deform (cloth) body, the procedural peg/pole/flag rigid bodies, and
+    the anchors. The deform's ID is `deform_env.deform_id` — filter the
+    seg mask to only those pixels to get a cloth-only depth buffer
+    suitable for back-projection.
     """
     view = deform_env._cam_viewmat
     proj = proj_matrix()
-    _, _, rgb_raw, depth_buf, seg_buf = deform_env.sim.getCameraImage(
+    _, _, rgb_raw, depth_buf, seg_raw = deform_env.sim.getCameraImage(
         width=width, height=height,
         viewMatrix=view, projectionMatrix=proj,
         renderer=pybullet.ER_BULLET_HARDWARE_OPENGL)
     rgb = np.asarray(rgb_raw, dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
     depth = np.asarray(depth_buf, dtype=np.float64).reshape(height, width)
-    if return_seg:
-        seg = np.asarray(seg_buf, dtype=np.int32).reshape(height, width)
-        return rgb, depth, view, proj, seg
-    return rgb, depth, view, proj
+    seg = np.asarray(seg_raw, dtype=np.int32).reshape(height, width)
+    return rgb, depth, seg, view, proj
 
 
-def depth_to_pcd(depth, view, proj, n_points,
-                 seg_mask=None, cloth_id=None):
+def depth_to_pcd(depth, view, proj, n_points, mask=None):
     """Back-project a non-linear depth buffer to world coords, mask out
     background (depth ≈ 1.0) and NaN, then sub-/over-sample to exactly
     n_points. Returns (n_points, 3) float32 in WORLD meters.
 
-    When seg_mask (H,W) int32 and cloth_id are provided, only pixels whose
-    segmentation ID matches cloth_id are kept, removing the hanger and any
-    other rigid bodies from the point cloud.
+    If `mask` is provided (boolean array of depth's shape), restrict the
+    back-projection to pixels where `mask` is True (use e.g. a seg-mask
+    filter to keep only cloth points and drop the peg/pole/flag).
     """
     H, W = depth.shape
     v = np.asarray(view, dtype=np.float64).reshape(4, 4, order='F')
@@ -84,8 +128,8 @@ def depth_to_pcd(depth, view, proj, n_points,
     world_h = clip @ inv_vp.T
     world = world_h[:, :3] / world_h[:, 3:4]
     valid = (depth.reshape(-1) < 0.999) & ~np.isnan(world).any(axis=1)
-    if seg_mask is not None and cloth_id is not None:
-        valid &= seg_mask.reshape(-1) == cloth_id
+    if mask is not None:
+        valid = valid & np.asarray(mask).reshape(-1).astype(bool)
     pts = world[valid]
     n = len(pts)
     if n == 0:
@@ -93,6 +137,14 @@ def depth_to_pcd(depth, view, proj, n_points,
     idx = (np.random.choice(n, n_points, replace=False) if n >= n_points
            else np.random.choice(n, n_points, replace=True))
     return pts[idx].astype(np.float32)
+
+
+def cloth_only_pcd(depth, seg, view, proj, deform_id, n_points):
+    """Back-project depth to world points keeping ONLY pixels whose
+    segmentation ID matches the cloth body. Filters out peg / pole /
+    flag / anchors / background. Returns (n_points, 3) float32."""
+    mask = (seg == int(deform_id))
+    return depth_to_pcd(depth, view, proj, n_points, mask=mask)
 
 
 # ---------------------------------------------------------------------------

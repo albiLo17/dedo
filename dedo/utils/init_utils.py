@@ -78,13 +78,13 @@ def load_rigid_object(sim, obj_file_name, scale, init_pos, init_ori,
 def load_deform_object(sim, obj_file_name, texture_file_name,
                        scale, init_pos, init_ori,
                        bending_stiffness, damping_stiffness, elastic_stiffness,
-                       friction_coeff, self_collision, debug):
+                       friction_coeff, self_collision, debug, mass=1.0):
     """Load object from obj file with pybullet's loadSoftBody()."""
     if debug:
         print('Loading filename', obj_file_name)
     # Note: do not set very small mass (e.g. 0.01 causes instabilities).
     deform_id = sim.loadSoftBody(
-        mass=1,  # 1kg is default; bad sim with lower mass
+        mass=mass,  # 1kg default; scaled-down cloths need this lowered
         fileName=str(Path(obj_file_name)),
         scale=scale,
         basePosition=init_pos,
@@ -115,7 +115,9 @@ def load_deform_object(sim, obj_file_name, texture_file_name,
 
     if debug:
         print('Loaded deform_id', deform_id, 'with',
-              num_mesh_vertices, 'mesh vertices', 'init_pos', init_pos)
+              num_mesh_vertices, 'mesh vertices', 'init_pos', init_pos,
+              'mass', mass, 'scale', scale,
+              'elastic', elastic_stiffness, 'bending', bending_stiffness)
     # Pybullet will struggle with very large meshes, so we should keep mesh
     # sizes to a limited number of vertices and faces.
     # Large meshes will load on Linux/Ubuntu, but sim will run too slowly.
@@ -196,7 +198,8 @@ def load_deformable(args, sim, deform_obj, data_path='deps/dedo/dedo/data/', deb
         args.deform_init_pos, args.deform_init_ori,
         args.deform_bending_stiffness, args.deform_damping_stiffness,
         args.deform_elastic_stiffness, args.deform_friction_coeff,
-        not args.disable_self_collision, debug)
+        not args.disable_self_collision, debug,
+        mass=getattr(args, 'deform_mass', 1.0))
 
     return deform_id
 

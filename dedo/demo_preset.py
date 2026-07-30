@@ -178,13 +178,14 @@ def merge_traj(traj_a, traj_b):
     return traj
 
 
-def build_traj(env, preset_wp, left_or_right, anchor_idx, ctrl_freq, robot):
+def build_traj(env, preset_wp, left_or_right, anchor_idx, ctrl_freq, robot,
+               interp_kind='linear'):
     if robot is not None:
         init_anc_pos = env.robot.get_ee_pos(left=anchor_idx > 0)
     else:
         anc_id = list(env.anchors.keys())[anchor_idx]
         init_anc_pos = env.anchors[anc_id]['pos']
-    print(f'init_anc_pos {left_or_right}', init_anc_pos)
+    # print(f'init_anc_pos {left_or_right}', init_anc_pos)
     wp = np.array(preset_wp[left_or_right])
     steps = (wp[:, -1] * ctrl_freq).round().astype(np.int32)  # seconds -> ctrl steps
 
@@ -195,7 +196,6 @@ def build_traj(env, preset_wp, left_or_right, anchor_idx, ctrl_freq, robot):
     from scipy.interpolate import interp1d
     wpt = np.concatenate([[init_anc_pos], wp[:, :3]], axis=0)
     ids = np.arange(wpt.shape[0])
-    interp_type = 'linear'
     # Creates the respective time interval for each way point
     interp_i = []
     for i, num_step in enumerate(steps):
@@ -203,9 +203,19 @@ def build_traj(env, preset_wp, left_or_right, anchor_idx, ctrl_freq, robot):
 
     interp_i = np.concatenate(interp_i)
     # interp_i = np.linspace(0, 1, steps[0], endpoint=False) # np.arange(0, wpt.shape[0]-1, 0.1)
-    xi = interp1d(ids, wpt[:, 0], kind=interp_type)(interp_i)
-    yi = interp1d(ids, wpt[:, 1], kind=interp_type)(interp_i)
-    zi = interp1d(ids, wpt[:, 2], kind=interp_type)(interp_i)
+    if interp_kind == 'pchip':
+        # PCHIP: C1-continuous (continuous velocity across waypoints, so no
+        # force-PD jerk at segment boundaries) AND shape-preserving (no
+        # overshoot past a waypoint, unlike cubic). Used by the metre-scale
+        # real-hang collector where a light cloth crumples on velocity jerks.
+        from scipy.interpolate import PchipInterpolator
+        xi = PchipInterpolator(ids, wpt[:, 0])(interp_i)
+        yi = PchipInterpolator(ids, wpt[:, 1])(interp_i)
+        zi = PchipInterpolator(ids, wpt[:, 2])(interp_i)
+    else:
+        xi = interp1d(ids, wpt[:, 0], kind=interp_kind)(interp_i)
+        yi = interp1d(ids, wpt[:, 1], kind=interp_kind)(interp_i)
+        zi = interp1d(ids, wpt[:, 2], kind=interp_kind)(interp_i)
 
     traj = np.array([xi, yi, zi]).T
 
