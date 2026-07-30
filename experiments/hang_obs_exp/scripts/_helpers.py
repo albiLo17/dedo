@@ -66,7 +66,7 @@ class RetryResetEnv(gym.Wrapper):
 #      at the apex; the post-trajectory zero-velocity hold and
 #      make_final_steps then let the hanger catch the hole.
 # ---------------------------------------------------------------------------
-def build_hole_aware_waypoints(underlying, waypoint_scale=1.0):
+def build_hole_aware_waypoints(underlying, waypoint_scale=None):
     from dedo.utils.mesh_utils import get_mesh_data
 
     if not hasattr(underlying.args, 'deform_true_loop_vertices'):
@@ -115,10 +115,63 @@ def build_hole_aware_waypoints(underlying, waypoint_scale=1.0):
     #               catch on the trailing edge of the hole. The cloth
     #               weight then drapes around the hanger arms during
     #               the make_final_steps gravity settle.
+    # The offsets below were authored for the `hangcloth` scene, where the cloth
+    # starts at y=+5 and the peg sits at y=0, so "thread" means sweeping along
+    # -y. Two things are therefore scene-specific and must NOT stay hardcoded:
+    #
+    #  1. THE AXIS. hangcloth_real puts the cloth in the XZ plane approaching
+    #     along +x (init x=0.275 -> goal x=0.5, dy=0). Sweeping -y there is
+    #     ORTHOGONAL to the direction the cloth has to travel, so the hole never
+    #     reaches the peg. We recover the approach direction from the geometry
+    #     instead: the horizontal vector from the hole to the goal.
+    #  2. THE MAGNITUDE. The offsets are absolute scene units. hangcloth_real is
+    #     ~22x smaller (deform_scale 0.135 vs 3.0), where +1.8 above the peg is
+    #     13.3 cloth-lengths rather than 0.6 — the gripper flies 1.8 m up inside
+    #     a 0.3 m workspace. Default the scale to the ratio of this scene's cloth
+    #     to the reference one, which is exactly the 0.045 sim->real factor in
+    #     frame_transforms.md.
+    #
+    # On the reference scene this reduces EXACTLY to the original numbers
+    # (u = -y, s = 1.0), so the validated hangcloth behaviour is unchanged.
     s = waypoint_scale
-    hole_hover = np.array([hanger[0], hanger[1] + 0.2 * s, hanger[2] + 1.8 * s])
-    hole_thread = np.array([hanger[0], hanger[1] - 1.0 * s, hanger[2] + 0.4 * s])
-    hole_hold = np.array([hanger[0], hanger[1] - 1.2 * s, hanger[2] - 0.5 * s])
+    if s is None:
+        ref_scale = 3.0  # deform_scale of the reference `hangcloth` scene
+        s = float(getattr(underlying.args, 'deform_scale', ref_scale)) / ref_scale
+
+    # The approach axis comes from SCENE geometry (where the cloth spawns vs
+    # where the peg is), NOT from this episode's hole centroid. Using the hole
+    # would tilt the sweep by the hole's random in-cloth offset and lose the
+    # "drive the hole directly over the peg in the perpendicular axis" property
+    # that the original hanger[0] pin provided — measured as a real regression
+    # on the reference scene (8/11 kept vs 8/9 on the same seed).
+    init = np.array(getattr(underlying.args, 'deform_init_pos',
+                            [0.0, 5.0, 8.0]), dtype=np.float32)
+    approach = hanger - init
+    approach[2] = 0.0  # horizontal only; height is handled by the z terms
+    norm = float(np.linalg.norm(approach))
+    if norm > 1e-6:
+        u = approach / norm
+        # Snap to the dominant axis. Both shipped scenes travel along exactly
+        # one horizontal axis (-y for hangcloth, +x for hangcloth_real);
+        # snapping keeps the perpendicular coordinate pinned to the peg's,
+        # which is what makes the hole line up for the descent.
+        k = int(np.argmax(np.abs(u[:2])))
+        u = np.array([0.0, 0.0, 0.0], np.float32)
+        u[k] = np.sign(approach[k])
+    else:
+        u = np.array([0.0, -1.0, 0.0], np.float32)
+
+    def _wp(along, up):
+        """`along` is signed distance past the peg in the approach direction;
+        `up` is height above it. Both in reference-scene units, scaled by s.
+        The perpendicular horizontal coordinate stays at the peg's."""
+        p = hanger + u * (along * s)
+        p[2] = hanger[2] + up * s
+        return p
+
+    hole_hover = _wp(along=-0.2, up=+1.8)   # behind + above: line up the descent
+    hole_thread = _wp(along=+1.0, up=+0.4)  # sweep the hole past the apex
+    hole_hold = _wp(along=+1.2, up=-0.5)    # drop so the apex catches the rim
 
     def grip_target(hole_target, delta):
         return [float(hole_target[0] + delta[0]),
