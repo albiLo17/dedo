@@ -260,13 +260,27 @@ class DeformEnv(gym.Env):
         # automatically — every downstream consumer already reads
         # self.goal_pos[0]). Uses np.random, so a prior env.seed() call
         # makes the dxy reproducible across collection/eval.
+        # The z component is sampled separately (--randomize_goal_dz) because
+        # peg HEIGHT has a different physical meaning and a much tighter safe
+        # range than lateral placement: it changes how far the gripper has to
+        # lift, so it stops the policy learning a fixed lift amplitude.
         goal_dxy = np.zeros(2, dtype=np.float32)
+        goal_dz = np.float32(0.0)
         randomize_r = float(getattr(args, 'randomize_goal_radius', 0.0))
+        randomize_dz = float(getattr(args, 'randomize_goal_dz', 0.0))
         _is_hangcloth_scene = scene_name in ('hangcloth', 'hangcloth_real')
         if _is_hangcloth_scene and randomize_r > 0.0:
             goal_dxy = np.random.uniform(
                 -randomize_r, randomize_r, size=2).astype(np.float32)
+        if _is_hangcloth_scene and randomize_dz > 0.0:
+            goal_dz = np.float32(np.random.uniform(-randomize_dz, randomize_dz))
         self._last_goal_dxy = goal_dxy
+        self._last_goal_dz = goal_dz
+        # Single delta applied to every peg body and to goal_pos, so the peg
+        # structure and all downstream consumers stay consistent.
+        goal_delta = np.array([goal_dxy[0], goal_dxy[1], goal_dz],
+                              dtype=np.float32)
+        self._last_goal_delta = goal_delta
 
         # Load rigid objects.
         rigid_ids = []
@@ -278,8 +292,9 @@ class DeformEnv(gym.Env):
             # Apply the same dxy shift to hanger + tallrod for hangcloth scenes.
             base_position = list(kwargs['basePosition'])
             if _is_hangcloth_scene:
-                base_position[0] = float(base_position[0]) + float(goal_dxy[0])
-                base_position[1] = float(base_position[1]) + float(goal_dxy[1])
+                base_position[0] = float(base_position[0]) + float(goal_delta[0])
+                base_position[1] = float(base_position[1]) + float(goal_delta[1])
+                base_position[2] = float(base_position[2]) + float(goal_delta[2])
             id = load_rigid_object(
                 sim, os.path.join(data_path, name), kwargs['globalScaling'],
                 base_position, kwargs['baseOrientation'],
@@ -288,11 +303,11 @@ class DeformEnv(gym.Env):
 
         # Mark the goal and store intermediate info for reward computations.
         goal_poses = SCENE_INFO[scene_name]['goal_pos']
-        if _is_hangcloth_scene and randomize_r > 0.0:
+        if _is_hangcloth_scene and (randomize_r > 0.0 or randomize_dz > 0.0):
             goal_poses = [
-                [float(p[0]) + float(goal_dxy[0]),
-                 float(p[1]) + float(goal_dxy[1]),
-                 float(p[2])]
+                [float(p[0]) + float(goal_delta[0]),
+                 float(p[1]) + float(goal_delta[1]),
+                 float(p[2]) + float(goal_delta[2])]
                 for p in goal_poses
             ]
         if args.viz and debug:

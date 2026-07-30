@@ -139,6 +139,19 @@ def get_args_parser():
                              'as the cloth procedural gen (np.random), so '
                              'env.seed() makes the rollout reproducible. '
                              'Default 0 keeps the legacy fixed-goal behavior.')
+    parser.add_argument('--randomize_goal_dz', type=float, default=0.0,
+                        help='HangProcCloth only: half-extent (scene units) of '
+                             'a uniform shift along z for the hanger goal, '
+                             'sampled independently of --randomize_goal_radius. '
+                             'Randomizes peg HEIGHT so the policy cannot learn '
+                             'a fixed lift amplitude. Shifts hanger + tallrod + '
+                             'goal_pos[*] together. NB the tallrod is a static '
+                             '(mass=0) body, so a positive dz leaves a cosmetic '
+                             'gap under it and a negative dz sinks it into the '
+                             'floor - dynamically harmless, but keep |dz| small '
+                             'relative to the rod length. Units follow the '
+                             'scene: sim units for hangcloth (~22x real), '
+                             'metres for hangcloth_real. Default 0 = off.')
     #
     # Training args.
     parser.add_argument('--lr', type=float, default=1e-4,
