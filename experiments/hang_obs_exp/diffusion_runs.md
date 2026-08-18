@@ -1127,3 +1127,429 @@ pass. See [RUNS.md](RUNS.md) for context.
    policy paper consistently shows BC scaling with data when the
    architecture is correct, and v3 itself is the existence proof that
    stepping up data 4× was the right first move.
+
+---
+
+## v5 — goal-chained demos, calibration-error augmentation, coverage audit
+
+v4's problem is structural, not a hyperparameter: every episode has ONE fixed
+peg goal driven by a single open-loop 3-waypoint trajectory, and both anchors
+get the same velocity. So `obs['goal']` is constant within an episode (nothing
+forces the policy to read it) and the cloth only ever *translates* (the policy
+never sees deformation). v5 keeps v4's episodes and adds a second kind.
+
+### Two episode kinds, one directory
+
+| kind | controller | goal | keep criterion |
+|---|---|---|---|
+| `thread` | v4's `build_hole_aware_waypoints` + `build_traj`, unchanged | the peg, constant | the three peg success metrics |
+| `chain` | new closed-loop `HoleServo` | resampled 1.5-4.0 units from the CURRENT hole centroid, changes mid-episode | `chain_goals_reached >= --chain_min_goals` |
+
+`--chain_fraction` (default 0.5) picks per episode. Everything the training
+script parity-checks (`cam_resolution`, `pcd_n_points`, `max_act_vel`,
+`ctrl_freq`, `sim_freq`, `sim_steps_per_action`, `randomize_goal_radius`,
+`demo_speed`) is identical across both kinds, so a mixed dir loads cleanly.
+
+**`success_*` keys are redefined for chain demos.** `train_diffusion_bc.py`
+filters on ONE key (whichever `--success_metric` picks), so a chain demo writes
+its chain result into all three of `success_hanging/topological/legacy`. They
+therefore mean "achieved what it was asked to do", not "threaded the peg".
+Branch on **`episode_kind`** when the strict meaning matters.
+
+### Four things that were wrong and are worth not rediscovering
+
+1. **`deform_env.anchors[id]['pos']` never updates.** It holds the pose the
+   anchor was *created* at. A controller closing the loop on it commands a
+   constant correction and stretches the cloth until the env aborts. Use
+   `_helpers.anchor_positions()` (reads `getBasePositionAndOrientation`).
+2. **The hole normal is horizontal, always.** The cloth hangs in the XZ plane,
+   so measured `|cos(normal, world z)| = 0.015`. Goals sampled uniformly on the
+   sphere therefore *cannot* satisfy an orientation-based arrival test. The
+   sampler bounds elevation to +-35 deg and samples azimuth within +-60 deg of
+   where the hole currently points; successive goals compound, so a full chain
+   still covers all azimuths.
+3. **Anchors get flung by the cloth.** dedo drives them with a force-limited
+   velocity PD (`command_anchor_velocity`: `clip(50*dv, +-10)` on a 0.1 kg
+   anchor) while the cloth is 1.0 kg, and the env ends the episode as soon as a
+   measured anchor velocity exceeds `MAX_OBS_VEL` (20 units/s). Measured:
+   `|linvel|/20` ran 0.49 -> 1.01 over five steps with commands never above
+   1.2. Mitigated by a slew limit, a total-speed cap and an active brake — but
+   **not eliminated**: a step can still go from safe to abort within its 33 sim
+   substeps. That is why an aborted chain episode is KEPT (minus
+   `--chain_abort_trim` frames, which contain the spike) rather than dropped.
+   Measured after mitigation: 2/10 episodes end early.
+4. **`pcd` is stored raw, `grip`/`goal` are stored `/20`.** Any augmentation
+   that touches both has to scale the goal or it lands 20x too small.
+5. **Obs are captured BEFORE the step.** Any path that leaves the rollout loop
+   between the capture and `env.step()` — goal reached, segment timeout, hole
+   lost, mesh explosion — leaves one more obs frame than actions.
+   `train_diffusion_bc.py` only WARNS on that mismatch and skips the demo, so
+   it silently cost 8 of 12 demos before it was caught. The collector now trims
+   every obs buffer to `len(ep_act)`. Verified after the fix: kept 14/14.
+
+### Calibration-error augmentation (`train_diffusion_bc.py`)
+
+The `pcd` obs is in WORLD frame, so a camera-extrinsic error is exactly a rigid
+transform of the cloud — and `goal` comes from `hanger_tracker` through the
+*same* extrinsic, so it moves with it. `grip` is robot-derived and must not
+move: that vision-vs-proprioception mismatch is the real failure mode.
+
+    --aug_calib_trans_mm 15   (truncated at 40)   <- 38.6 mm cross-arm disagreement
+    --aug_calib_rot_deg  1.5  (truncated at 4)    <- 2.17 deg cross-arm disagreement
+
+One transform per training window (not per frame — per-frame would make the
+cloud jitter inside a single observation horizon). Verified: mean displacement
+23.7 mm, p90 37.8 mm, pairwise distances preserved. The normalizer is fitted on
+unaugmented pcd; the script now *prints* how much the augmentation would
+inflate the per-axis std and raises if that exceeds 5%.
+
+### Camera randomization and the parity trap
+
+Per-episode yaw +-8, pitch +-5, dist +-15%, target +-0.5, roll +-jitter. Roll is
+newly expressible at all (`deform_env.py` hardcoded `roll: 0`; there is now a
+`--cam_roll_deg`), but for a WORLD-frame point cloud roll rotates the sampling
+lattice, not the visible surface set — include it for the rgb mode, do not
+expect pcd gains.
+
+**The trap:** `cam_viewmat` is recorded per demo and `train_diffusion_bc.py`
+does *not* raise on mixed values — it warns and takes `sorted(...)[0]`, which
+would silently run eval at an arbitrary sampled viewpoint. Every pkl now also
+carries `cam_viewmat_nominal`, the eval env is built from that, and mixed
+nominals raise.
+
+### Coverage audit — run it before any full-size collection
+
+`_diag_dataset_coverage.py` prints one row per randomized axis: sim p1-p99, the
+measured real value, and **the real value's percentile within the sim
+distribution**. The rule is that real sits inside p5-p95. It is the fastest way
+to catch "we randomized the wrong thing".
+
+Measured progression on 12-demo pilots:
+
+| configuration | axes failing |
+|---|---|
+| v4 defaults (yaw 45, no roll, fixed start) | **14 / 17** |
+| real camera pose + roll + start jitter, goal radius 1.5 | 1 / 17 (goal y) |
+| + goal radius 2.0 | **0 / 17** |
+
+Three axes sit in the 5-15 percentile "warn" band at 14 demos (goal z, start x,
+cloth diagonal); they should centre up with a full run, but re-check rather than
+assume.
+
+and the deformation check, which is the whole point of chain episodes:
+
+    out-of-plane RMS / cloth width:  thread 0.0022   chain 0.0083   ratio 3.7x
+
+### Launch
+
+```bash
+python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
+  --demos_dir logs/hang_obs_exp/bc_demos_v5 --n_demos 1000 \
+  --cam_resolution 320 --pcd_n_points 2048 --max_act_vel 4.0 \
+  --success_metric legacy --success_factor 1.2 \
+  --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 \
+  --demo_speed 0.25 \
+  --randomize_goal_radius 2.0 \
+  --chain_fraction 0.5 --chain_n_goals 4 --chain_min_goals 2 \
+  --cam_viewmat 14 -24 316.5 0 0 5.5 --cam_roll_deg 6.0 \
+  --cam_jitter_roll_deg 4.0 \
+  --deform_init_pos 0 3.2 8.0 \
+  --debug_viz_first_n 5 --seed 2026
+
+python experiments/hang_obs_exp/scripts/_diag_dataset_coverage.py \
+  --demo_path logs/hang_obs_exp/bc_demos_v5 --out coverage_v5.png
+```
+
+`--demo_speed 0.25` is not optional: `build_traj` produces ~3.3 units/s for
+thread episodes, 1.7x the fastest motion ever recorded in teleop (real p50 0.60,
+p90 1.02, max 1.89). At 0.25 the collected p90 lands at 1.08x real. The
+collector prints this comparison at the end of every run and warns if the
+trajectory peak exceeds the real max.
+
+`--cam_resolution 320`: at 128 the cloth yields only 666 distinct 3D points, so
+a 2048-point obs is 67% duplicated. 256 gives 2697 *at reset* (the best case);
+320 leaves margin as the cloth recedes.
+
+### Known gaps
+
+- **Kept mix drifts from the requested mix.** `--chain_fraction 0.5` gates
+  ATTEMPTS, and thread attempts fail the peg success check more often than
+  chain attempts fail their goal count, so the kept mix skews toward chain
+  (measured: 8 chain / 6 thread at 14 demos, 10/2 on an earlier 12-demo run).
+  Raise the thread attempt fraction if a balanced kept dataset matters.
+- 1/8 chain episodes still end on the velocity abort (see trap 3).
+- Chain episodes run longer (up to ~290 steps) than real demos (200-230).
+- Three coverage axes sit in the "warn" band at pilot size; re-run the audit on
+  the full collection.
+
+---
+
+## v6 — v5 at scale, and the last generation before real2sim
+
+v6 is v5's recipe run to 300 kept demos. Nothing conceptual changed; it exists
+so the v5 pilot numbers had a full-size dataset behind them.
+
+| | |
+|---|---|
+| kept | 300 (781 attempts, 15.6 s/demo, 4675 s) |
+| mix | **256 chain / 44 thread** — `--chain_fraction 0.5` gates ATTEMPTS, and thread attempts fail the peg check far more often, so the kept mix skews hard toward chain (the v5 "known gap", now measured at full size) |
+| success filter | `legacy` |
+| camera | nominal `14 -24 316.5 0 0 5.5`, roll 6.0°, **roll jitter 4.0°** |
+| cloth | fully procedural: sampled `cloth_width` 2.07–7.70, `rest_extent` 5.10–8.94, `hole_radius` 0.46–1.03 |
+| speed vs real | collected p50/p90 = 0.95/1.10 against real 0.60/1.02 → p90 ratio **1.08×** |
+
+A second collection, `bc_demos_v6_thread` (58 demos, thread-only), was run to
+rebalance the mix. `bc_demos_v6_merged` is the union actually used for
+training — **it is a directory of symlinks**, not copies, so it dies with either
+source directory.
+
+v6's flaw is the one v7/v8 exist to fix: nothing about the scene was tied to the
+real rig. The peg, the camera and the cloth were all whatever the sim's defaults
+had always been.
+
+## v7 — real2sim: the peg moves, and the expert collapses
+
+Not a dataset. v7 is two pilot collections (6 and 9 demos, `v7_ref` / `v7_peg`)
+that validated a scene re-centred on the **measured** rig before spending 90
+minutes on a full collection.
+
+### What moved
+
+`task_info.py`, `hangcloth`: the peg was at `[0, 0, 8.2]`. The real hanger tip
+triangulates to `[1.366, -1.266, 6.213]` in sim units (world
+`[0.557, 0.0615, 0.2406]` m — see `HANDOFF_real2sim.md`). The old placement put
+every threading goal **89 mm above** the real one, and since
+`--randomize_goal_radius` only jitters (dx, dy), *no training goal ever reached
+the real height*: nearest thread goal to the real operating point was 91.7 mm,
+0 % within 90 mm. Everything trained up to v6 was aiming at a peg that does not
+exist.
+
+### The trap that cost 42 % → 2 %
+
+`tallrod.urdf` is 8.0 sim units tall at `globalScaling=10`, so its top is always
+`base + 8.0`. The original preset paired hanger z=8.0 with rod z=0 *precisely
+so the peg sat on the post*. Re-centring the hanger to 6.013 while leaving the
+rod at 0 left a bare post standing 1.79 units (80 mm) **above** the goal: the
+scripted expert was threading the cloth onto a spike, and its success rate fell
+from 42 % to 2 %.
+
+Fix: `base = hanger_z - 8.0` (→ `-1.987`), and in `deform_env.py` the dz of
+`--randomize_goal_dz` now shifts hanger **and** rod together. Sinking the rod
+into the floor is correct — a lower peg is a *shorter post*, and the floor hides
+the remainder. The previous comment in that function argued the opposite and was
+wrong; with `--randomize_goal_dz` on, it re-created the spike on every episode.
+
+### The camera
+
+`--cam_roll_deg` is new, and deliberately kept OUT of `--cam_viewmat` so the
+existing 6-element arity and every recorded pkl stay valid. The real ZED carries
+~6° of roll, which the hardcoded `roll=0` could not express. Note it barely
+affects a **world-frame** point cloud — it rotates the sampling lattice, not the
+set of visible surface points — so it matters for `rgb`, not `pcd`.
+
+v8's nominal camera is the measured one: `12.9307 -23.9624 316.496 -2.9135
+1.8052 5.1593`, roll `5.8429°`, and **roll jitter set to 0** (the pose is now a
+measurement, not a guess, so jittering it only blurs the match).
+
+## v8 — the reference generation
+
+**v8 is the generation we build on.** It is the only one whose peg, camera,
+cloth size and gripper poses are all tied to measurements of the real rig.
+
+### Collection
+
+```bash
+python experiments/hang_obs_exp/scripts/collect_bc_demos.py \
+  --demos_dir <SCRATCH>/data/bc_demos_v8 --n_demos 600 \
+  --cam_resolution 320 --pcd_n_points 2048 --max_act_vel 4.0 \
+  --success_metric hanging --success_factor 1.2 \
+  --ctrl_freq 15 --max_episode_len 200 --episode_tail_frames 5 \
+  --demo_speed 0.25 --randomize_goal_radius 2.0 \
+  --chain_fraction 0.0 \
+  --cam_viewmat 12.9307 -23.9624 316.496 -2.9135 1.8052 5.1593 \
+  --cam_roll_deg 5.8429 --cam_jitter_roll_deg 0.0 \
+  --proc_hole_frac_range 0.1 0.3 \
+  --debug_viz_first_n 6 --seed 2026
+```
+
+600 kept from 945 attempts, 9.0 s/demo, 5406 s. 34 GB on disk (62 MB/demo,
+up from v6's 32 MB because the cloth is larger).
+
+### What changed from v6
+
+| | v6 | v8 |
+|---|---|---|
+| episode kinds | 256 chain / 44 thread | **600 thread / 0 chain** |
+| success filter | `legacy` | **`hanging`** |
+| peg | sim default `[0, 0, 8.2]` | measured `[1.366, -1.266, 6.213]` |
+| camera | guessed, 4° roll jitter | measured, **0°** roll jitter |
+| cloth size | sampled, `width` 2.07–7.70 | **pinned**, `width` 5.738, `rest_extent` 7.838 |
+| hole | `radius` 0.46–1.03 | `radius` 0.84–1.06, `--proc_hole_frac_range 0.1 0.3` |
+| episode length | mean 174, max **401** | mean 176, max **186** |
+| speed p90 vs real | 1.08× | 1.20× |
+
+Two of these deserve the emphasis:
+
+**Chain episodes are gone.** v5 introduced `HoleServo` chaining specifically so
+`obs['goal']` would vary within an episode and the cloth would deform rather
+than translate. v8 drops it. That was the right call for real alignment — the
+robot does one threading motion, not a chain of servo goals — but it means v8
+re-inherits v5's original complaint, and the goal-generalisation numbers below
+should be read with that in mind.
+
+**The cloth is pinned, not sampled.** The anchors are grid corners `(0,0)` and
+`(0,nd-1)`, i.e. the two ends of one edge, so the cloth's *height is exactly the
+gripper separation*. Initialising the grippers at a measured real pose therefore
+forces the cloth to be sized to it. Every v8 demo has the same `cloth_width`
+5.7384 and `rest_extent` 7.8378; only the hole varies. **v8 trains on one cloth
+geometry.** This is the price of real alignment and the most likely reason a v8
+policy will not transfer to a differently-sized cloth.
+
+### The randomization knobs that landed but were NOT used
+
+v8 ships a lot of new machinery that its own collection left off. All of it is
+available and untested at scale:
+
+- `--node_density_range lo hi` — per-episode mesh resolution
+  (`_sample_node_density`). Every cloth ever generated before this was pinned at
+  15, so the policy never saw a coarser or finer triangulation than it trained
+  on. v8 demos record `node_density: 15`.
+- `--proc_cloth_shapes` — non-rectangular outlines, with `_shape_cut_cells` /
+  `_validated_cuts`. The validator rejects cuts that leave an **island** or a
+  **pinch point** (two quads meeting at a single vertex): pybullet's soft-body
+  loader does not error on these, it *wedges*, and the collector simply stops
+  mid-run. Cheaper to reject the sample than to debug the hang. v8 demos record
+  `cloth_shape: 'rect'`.
+- `--proc_cloth_size_range` — upper bound raised 2.0 → 2.8 so the real cloth
+  (measured 0.344 × 0.292 m = 2.55 × 2.16 sim) is *inside* the training
+  distribution. At 2.0 the real cloth was larger than anything ever trained on.
+  v8 records `None` because `--proc_cloth_wh` pinned it instead.
+- `--slack_fraction` and the `SlackPhase` controller — episodes that squeeze the
+  cloth before threading. v8 demos record `slack_used: False`.
+
+If v8 policies plateau, turning these on (and re-collecting) is the first move,
+not more epochs.
+
+### `full_mesh` obs — the silent crop, fixed
+
+`build_privileged_obs` padded vertices to 250 slots and kept `flat_verts[:250]`.
+Vertices come out in **grid order**, so that is a crop of one corner of the
+cloth: above ~250 verts the mesh obs silently lost the far half, hole included,
+instead of losing resolution uniformly. Now it takes an evenly spaced subsample.
+The budget is `GCE_MAX_MESH_VERTS` (default 250) — raising it changes the mesh
+obs **dimension**, so any policy, estimator or dynamics model trained on the old
+width must be retrained. Override deliberately.
+
+### Training (all three modes, v8 demos, seed 2026)
+
+| mode | epochs | note |
+|---|---|---|
+| `state` (`--state_key hole_centroid`, 18-dim) | 300/300 | best mid-train eval SR **0.650 @ ep150** |
+| `pcd` (PointNet++ SSG) | **327/500** | stopped early to free the 4090 for the eval sweep; `policy_ep0300.pt` is what was evaluated |
+| `mesh` (topology-aware) | 300 | finished *after* the sweep had started — see the gap below |
+
+`obs_horizon=2, pred_horizon=16, action_horizon=8, num_diffusion_iters=100,
+bs=64, lr=1e-4, wd=1e-6, warmup=500, ema_power=0.75`. 101,537 dataset windows.
+Calibration-error augmentation on by default (`--aug_calib_trans_mm 15`, max 40;
+`--aug_calib_rot_deg 1.5`, max 4).
+
+### Results — Exp 1, goal generalisation (n=50, seed 12026, all at ep300)
+
+`success_hanging`, ±1.96 SE:
+
+| mode | goal_train (r=2.0) | goal_wide (r=3.5) |
+|---|---|---|
+| `state` (privileged) | **0.640** ±0.133 | 0.460 ±0.138 |
+| `pcd` | 0.340 ±0.131 | 0.420 ±0.137 |
+| `mesh` | 0.540 * | 0.360 * |
+
+\* mesh was **skipped by the sweep** (`!! no ep0300 checkpoint for mesh`, six
+times) because its training had not reached ep300 when the script polled. The
+two numbers above are from separate manual runs on 2026-08-14
+(`v8_evals/mesh_goal_2.0`, `mesh_goal_3.5`) and are directly comparable — same
+checkpoint epoch, same eval seed, same n.
+
+Reading: `state` degrades from 0.64 → 0.46 outside the training radius, so it
+tracks the goal input but only over the band it saw. `pcd` is flat-to-noisy
+across both (0.34 → 0.42, overlapping CIs), which is what "never really reads
+the goal" looks like.
+
+### Results — Exp 2, occlusion sweep. **Read the caveat.**
+
+| mode | occ 0.0 | 0.2 | 0.35 | 0.5 |
+|---|---|---|---|---|
+| `pcd` | 0.480 | 0.480 | 0.400 | 0.500 |
+| `state` | 0.480 | 0.480 | 0.480 | 0.480 |
+
+**The `state` row is vacuous and the low end of the `pcd` row is inert.** The
+blocker (`--eval_img_occ_frac`) is applied in `capture_rgb_depth`, i.e. at
+render time, and works by setting `seg = -1` over a rectangle so those pixels
+drop out of the cloud. The `state` policy consumes the privileged
+`hole_centroid` straight from the sim and never renders anything, so all four
+of its rows are the *same rollout* — identical to 13 decimal places, which is
+the tell. And `pcd` at 0.0 and 0.2 is likewise bit-identical, meaning the left
+20 % of the frame contains no cloth pixels at all; only ≥0.35 actually starts
+removing points.
+
+So Exp 2 as run contains two real measurements (`pcd` at 0.35 and 0.5), no
+`mesh` row, and six repetitions. `evals_v8.sh` loops `for m in pcd mesh state`
+over four fractions — the `state` arm of that loop should be deleted, the
+`--eval_img_occ_side left` start point moved to where the cloth actually is, and
+the sweep re-run before any of this is quoted. There is a second, unused
+mechanism (`--eval_occluder_size`, a physical body via `add_occluder`) that does
+degrade the privileged path too, and is the right tool if `state` needs an
+occlusion row.
+
+### Results — Exp 3, GSE in the loop (2026-08-15)
+
+The `state` policy, unchanged, with `hole_centroid` served by the trained GPS
+state estimator instead of the simulator
+(`--use_state_estimator 127.0.0.1:8123`):
+
+| | privileged | GSE |
+|---|---|---|
+| `success_hanging` | **0.640** | **0.360** |
+| `success_legacy` | 0.180 | 0.000 |
+| centroid err mean / p50 / p90 | — | 1.166 / 0.990 / 2.208 |
+
+That is the headline v8 result and it is not yet explained. Note the error is
+quoted in **sim units** (÷22 for metres): a p50 of 0.99 sim units ≈ 45 mm, well
+above the 22.3 mm the estimator scored on its own cross-topology benchmark
+(`gce-manager/memory/76-state-est-quality.md`). Candidate causes, untested: the
+`gse_to_train` axis convention in the h5 conversion, the pinned v8 cloth being
+out of the estimator's training distribution, or the estimator simply being
+served from a checkpoint that stopped improving (see below).
+
+### The state estimator behind Exp 3
+
+Trained on `v8_state_est.h5` (3.2 GB, 600 episodes → 540 train / 60 val
+clothes), converted from the v8 demos by
+`scripts/bc_demos_to_state_est_h5.py`. `GPSStateEstModel` d128 L8 H8, lr 1e-3,
+bs 4, DDPM 1000 steps with `chamfer_weight 0.5`.
+
+**It ran ~23.5 h to step 3.10 M, and `checkpoint-best` was written at 17:35 on
+day one** (val loss 2.096e-5) and never improved for the remaining ~22 h. The
+served checkpoint is that early one. Either the val metric saturated and the run
+should have been stopped, or it is measuring the wrong thing — worth resolving
+before blaming the 0.64 → 0.36 drop on the estimator's accuracy.
+
+### Where v8 lives, and the risk
+
+Everything — the 34 GB `bc_demos_v8`, the 3.2 GB `v8_state_est.h5`, all policy
+and estimator checkpoints, and all eval outputs — is under
+`/tmp/user/25330/claude-25330/-juno-u-alberta-code-GCE/0621e330-.../scratchpad/`.
+`logs/hang_obs_exp/bc_demos_v6` is a **symlink** into a sibling scratchpad. None
+of it is on AFS and none of it is backed up; when those scratchpads are reaped,
+~56 GB of demos and every v8 checkpoint go with them. Moving v8 to durable
+storage is a prerequisite for anything downstream, not a chore.
+
+### Next, in order
+
+1. Move `bc_demos_v8` + `v8_state_est.h5` + `v8_policies` off `/tmp`.
+2. Re-run Exp 2 with the `state` arm dropped and the blocker aimed at the cloth
+   (or with `--eval_occluder_size`, which affects the privileged path).
+3. Fill the `mesh` row of Exp 2 — the checkpoint exists now.
+4. Resolve the GSE gap: check the `gse_to_train` axis convention and whether the
+   estimator's val loss saturating at 17 h is real.
+5. Only then consider resuming `pcd` 327 → 500, or turning on the unused
+   randomization knobs and re-collecting.
