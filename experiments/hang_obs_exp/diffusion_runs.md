@@ -1446,7 +1446,7 @@ width must be retrained. Override deliberately.
 |---|---|---|
 | `state` (`--state_key hole_centroid`, 18-dim) | 300/300 | best mid-train eval SR **0.650 @ ep150** |
 | `pcd` (PointNet++ SSG) | **327/500** | stopped early to free the 4090 for the eval sweep; `policy_ep0300.pt` is what was evaluated |
-| `mesh` (topology-aware) | 300 | finished *after* the sweep had started — see the gap below |
+| `mesh` (topology-aware) | **500/500** | ran on the juno Slurm cluster (`--gres=gpu:a5000:1`), finished 08-14 18:30. Final eval `success_hanging` **0.44**, best **0.500 @ ep250**. The scratchpad `policy_ep0300.pt` used by the sweep is a mid-run copy |
 
 `obs_horizon=2, pred_horizon=16, action_horizon=8, num_diffusion_iters=100,
 bs=64, lr=1e-4, wd=1e-6, warmup=500, ema_power=0.75`. 101,537 dataset windows.
@@ -1462,6 +1462,9 @@ Calibration-error augmentation on by default (`--aug_calib_trans_mm 15`, max 40;
 | `state` (privileged) | **0.640** ±0.133 | 0.460 ±0.138 |
 | `pcd` | 0.340 ±0.131 | 0.420 ±0.137 |
 | `mesh` | 0.540 * | 0.360 * |
+
+Mesh is the best non-privileged mode, and the cluster run carries it further
+than the sweep did: 0.500 at ep250 against `pcd`'s 0.34–0.42 anywhere.
 
 \* mesh was **skipped by the sweep** (`!! no ep0300 checkpoint for mesh`, six
 times) because its training had not reached ep300 when the script polled. The
@@ -1533,19 +1536,21 @@ served checkpoint is that early one. Either the val metric saturated and the run
 should have been stopped, or it is measuring the wrong thing — worth resolving
 before blaming the 0.64 → 0.36 drop on the estimator's accuracy.
 
-### Where v8 lives, and the risk
+### Where v8 lives
 
-Everything — the 34 GB `bc_demos_v8`, the 3.2 GB `v8_state_est.h5`, all policy
-and estimator checkpoints, and all eval outputs — is under
-`/tmp/user/25330/claude-25330/-juno-u-alberta-code-GCE/0621e330-.../scratchpad/`.
-`logs/hang_obs_exp/bc_demos_v6` is a **symlink** into a sibling scratchpad. None
-of it is on AFS and none of it is backed up; when those scratchpads are reaped,
-~56 GB of demos and every v8 checkpoint go with them. Moving v8 to durable
-storage is a prerequisite for anything downstream, not a chore.
+**Authoritative copy: `/juno/u/alberta/data/`** — `bc_demos_v8` (34 GB, 600
+demos), `v8_state_est.h5` (3.0 GB), `v8_policies` (14 GB). That filesystem has
+~2.9 TB free.
+
+Scratchpad-only, and therefore genuinely at risk when the session scratchpad is
+reaped: `v8_evals` (16 GB, including the GSE eval), the estimator checkpoint the
+GSE eval was served from, and the v6 demos (21 GB — `logs/hang_obs_exp/
+bc_demos_v6` is a **symlink** into a sibling scratchpad, not a copy).
 
 ### Next, in order
 
-1. Move `bc_demos_v8` + `v8_state_est.h5` + `v8_policies` off `/tmp`.
+1. Copy `v8_evals` and the served estimator checkpoint out of the scratchpad —
+   the demos, the h5 and the policies are already safe on `/juno/u/alberta/data`.
 2. Re-run Exp 2 with the `state` arm dropped and the blocker aimed at the cloth
    (or with `--eval_occluder_size`, which affects the privileged path).
 3. Fill the `mesh` row of Exp 2 — the checkpoint exists now.
