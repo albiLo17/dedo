@@ -36,6 +36,8 @@ The wrapper:
   - normalises all positions into ~[-1,1] using the workspace box size
 """
 
+import os
+
 import numpy as np
 import gym
 from gym import spaces
@@ -44,6 +46,12 @@ from dedo.utils.mesh_utils import get_mesh_data
 
 _WBOX = 20.0
 _MAX_HOLE_VERTS = 40
+# Vertex budget for the `full_mesh` obs. 250 fits node_density=15 (~215 verts)
+# with room to spare, which is every cloth generated before mesh-resolution
+# randomization existed. Raising it changes the mesh obs DIMENSION, so any
+# policy, state estimator or dynamics model trained on the old width must be
+# retrained -- override deliberately, not incidentally.
+_MAX_MESH_VERTS = int(os.environ.get('GCE_MAX_MESH_VERTS', 250))
 _NUM_CORNERS = 4
 
 
@@ -165,11 +173,18 @@ def build_privileged_obs(deform_env, obs_mode, hole_vertex_indices,
         obs = np.concatenate([grip, padded.reshape(-1)]).astype(np.float32)
 
     elif obs_mode == 'full_mesh':
-        flat_verts = (verts / _WBOX).reshape(-1)
-        full = np.zeros(250 * 3, dtype=np.float32)
-        n = min(len(flat_verts), 250 * 3)
-        full[:n] = flat_verts[:n]
-        obs = np.concatenate([grip, full]).astype(np.float32)
+        # Vertices are stored padded to _MAX_MESH_VERTS. When the cloth has
+        # MORE than that -- which any node_density above ~16 produces -- take an
+        # evenly spaced subsample rather than the first N. The old code kept
+        # flat_verts[:N], and since vertices come out in grid order that is a
+        # crop of one corner of the cloth: the mesh obs silently lost the far
+        # half, hole included, instead of losing resolution uniformly.
+        v = verts / _WBOX
+        if len(v) > _MAX_MESH_VERTS:
+            v = v[np.linspace(0, len(v) - 1, _MAX_MESH_VERTS).astype(np.int64)]
+        full = np.zeros((_MAX_MESH_VERTS, 3), dtype=np.float32)
+        full[:len(v)] = v
+        obs = np.concatenate([grip, full.reshape(-1)]).astype(np.float32)
 
     else:
         raise ValueError(f'unknown obs_mode {obs_mode!r}')
@@ -352,7 +367,7 @@ class PrivilegedObsWrapper(gym.ObservationWrapper):
         elif obs_mode == 'hole_vertices':
             obs_dim = grip_dim + _MAX_HOLE_VERTS * 3
         elif obs_mode == 'full_mesh':
-            obs_dim = grip_dim + 250 * 3
+            obs_dim = grip_dim + _MAX_MESH_VERTS * 3
 
         self.observation_space = spaces.Box(
             low=-np.ones(obs_dim, dtype=np.float32) * 2.0,

@@ -65,10 +65,12 @@ from _helpers import RetryResetEnv, compute_per_episode_max_len  # noqa: E402
 # Reuse the camera and success-check helpers so eval-time RGB/PCD/success
 # match collection-time bit-for-bit.
 from _bc_obs_helpers import (  # noqa: E402
-    capture_rgb_depth, depth_to_pcd, proj_matrix,
+    capture_rgb_depth, depth_to_pcd, proj_matrix, set_image_occlusion,
     check_hanging_on_peg, check_threaded_topological, check_legacy,
     measure_hole_radius, get_hole_indices, get_hole_loops,
-    resolve_deform, patch_deform_render_to_obs_camera)
+    resolve_deform, patch_deform_render_to_obs_camera,
+    add_occluder, add_static_occluder, move_occluder, remove_occluder,
+    hole_visibility)
 
 from experiments.hang_obs_exp.envs.privileged_env import (  # noqa: E402
     build_privileged_obs, identify_cloth_corners)
@@ -100,6 +102,21 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--demo_path', type=str, required=True,
                     help='Directory of demo_NNN.pkl files written by '
                          'collect_bc_demos.py.')
+# --- v5: calibration-error augmentation (pcd modes) ------------------------
+# The pcd obs is in WORLD frame, so a real camera-extrinsic error is exactly a
+# rigid transform of the cloud. `goal` comes from hanger_tracker through the
+# SAME extrinsic and so moves with it; `grip` comes from robot FK and must NOT
+# move — that vision-vs-proprioception mismatch is the real failure mode and
+# the policy has to see it. Defaults are sized from the measured cam->base
+# solve: 38.6 mm cross-arm position disagreement, 2.17 deg rotation
+# disagreement, plus a +-16 mm unresolved axial offset.
+parser.add_argument('--aug_calib_trans_mm', type=float, default=15.0,
+                    help='Std of the rigid translation applied to pcd+goal, '
+                         'in REAL mm (1 sim unit = 45 mm). 0 disables.')
+parser.add_argument('--aug_calib_trans_max_mm', type=float, default=40.0)
+parser.add_argument('--aug_calib_rot_deg', type=float, default=1.5,
+                    help='Std of the rigid rotation applied to pcd+goal.')
+parser.add_argument('--aug_calib_rot_max_deg', type=float, default=4.0)
 parser.add_argument('--obs_mode', type=str, default='state',
                     choices=['state', 'rgb', 'pcd', 'pcd_priv', 'mesh'],
                     help='Which obs modality to train on. Each demo pkl '
@@ -313,6 +330,13 @@ parser.add_argument('--eval_seed_offset', type=int, default=9999,
 # mean 0, regenerated independently every timestep and per xyz coordinate.
 # Applies to obs_mode=state (state_key=hole_centroid) and obs_mode=pcd_priv,
 # both of which expose a hole-centroid triple to perturb. 0 = off (default).
+parser.add_argument('--eval_goal_radius', type=float, default=None,
+                    help='EVAL-ONLY override of the peg goal xy randomization '
+                         'radius, which otherwise mirrors the demos. Raising '
+                         'it above the training value tests whether the policy '
+                         'GENERALISES over goals or has memorised the training '
+                         'band; leaving it equal tests only that it reads the '
+                         'goal input at all.')
 parser.add_argument('--eval_hole_noise_factor', type=float, default=0.0,
                     help='Eval-only: add N(0, factor*hole_radius) noise to '
                          'the hole-centroid xyz every timestep. 0 = off. '
@@ -342,6 +366,45 @@ parser.add_argument('--state_estimator_pcd_res', type=int, default=128,
                          'the state estimator (independent of the policy obs '
                          'camera). 128 matches the collector default. Shared by '
                          'the GPS estimator and the PF tracker.')
+
+# --- Controls for "why does the ESTIMATED centroid beat the PRIVILEGED one?" ---
+# The gse row scores 0.96-0.98 against 0.84 for the same policy weights, the same
+# eval seed and the same 50 episodes, differing only in dims 12:15 of the obs.
+# Two mechanisms could do that, and they need separating before either row is
+# reportable:
+#   (a) the GT centroid is intermittently DEGENERATE. build_privileged_obs drops
+#       NaN hole vertices and falls back to exactly (0,0,0) when none survive, so
+#       the "oracle" occasionally hands the policy the world origin. An estimator
+#       never does. --eval_centroid_repair carries the last valid centroid
+#       forward instead, which is what a well-behaved oracle would do.
+#   (b) the GT centroid JITTERS frame to frame as the hole deforms, while the
+#       estimator returns a smoothed, canonical-looking mesh. --eval_centroid_ema
+#       applies an exponential moving average to the privileged centroid to see
+#       how much of the gap is explained by smoothing alone.
+# Both act on the PRIVILEGED path only, so they isolate the input from the
+# estimator entirely.
+parser.add_argument('--eval_centroid_ema', type=float, default=0.0,
+                    help='Eval-only: EMA coefficient in [0,1) applied to the '
+                         'privileged hole centroid (0 = off, raw GT). '
+                         'c_t = a*c_{t-1} + (1-a)*c_gt. Tests how much of the '
+                         'estimated-beats-privileged gap is just smoothing.')
+parser.add_argument('--eval_centroid_repair', action='store_true',
+                    help='Eval-only: when the GT hole centroid degenerates to '
+                         'exactly (0,0,0) (all hole vertices NaN), carry the '
+                         'last valid centroid forward instead of feeding the '
+                         'world origin to the policy.')
+parser.add_argument('--eval_centroid_offset', type=str, default='',
+                    help='Eval-only: "x,y,z" constant offset in SIM UNITS of '
+                         'the eval env (this env is ~22.2x real scale, so 1 sim '
+                         'unit = 45 mm real) added to the privileged hole '
+                         'centroid. Set it to the mean '
+                         '(estimate - truth) measured from a trace to test '
+                         'whether a systematic bias, rather than estimation, '
+                         'explains the estimated-beats-privileged gap.')
+parser.add_argument('--eval_centroid_trace', action='store_true',
+                    help='Eval-only: record (episode, step, gt_xyz, used_xyz) '
+                         'for every policy step to <label>_centroid_trace.npz. '
+                         'Diagnoses degenerate-GT rate, jitter and bias.')
 
 # Eval-time GPS+GNS particle-filter tracker (UniClothDiff). EVAL-ONLY, and an
 # alternative to --use_state_estimator: instead of an independent per-frame GPS
@@ -385,6 +448,91 @@ parser.add_argument('--eval_cam_yaw', type=float, default=None,
                          'from the demos. Lets you score ONE trained model under '
                          'a clear vs a grazing/occluded viewpoint without '
                          're-collecting demos. None = use the demo yaw.')
+
+# --- Occlusion sweep. A VISUAL-ONLY box on the camera->hole ray, so the
+# physics and therefore the task are untouched and every modality loses the
+# same information (see _bc_obs_helpers.add_occluder). The x-axis of the
+# experiment is NOT this size — it is the MEASURED hole_visibility reported
+# alongside the success rate, which is comparable across scenes and cameras.
+# Calibration on the 22x env at the training viewpoint: 0 -> 50% visible,
+# 0.30 -> 16.7%, 0.50 -> 0%. Above ~0.5 the whole cloth disappears and the
+# run stops measuring hole occlusion and starts measuring blindness.
+# --- lens-blocker occlusion (image space, fixed) -------------------------
+# A rectangle of the CAMERA IMAGE is blanked, as if something sat in front of
+# the lens. Unlike --eval_occluder_size (a 3D box that re-aims at the cloth
+# every step), this stays put in image coordinates, so how much it hides
+# depends on where the cloth happens to be — which is what a real obstruction
+# does. Privileged obs modes (state / mesh) read the simulator and are
+# unaffected by construction; that contrast is the point.
+parser.add_argument('--eval_img_occ_frac', type=float, default=0.0,
+                    help='Final blocked fraction of the image (0 = off). For '
+                         'top/bottom/left/right this is the fraction of the '
+                         'height/width; for center, of the AREA.')
+parser.add_argument('--eval_img_occ_side', type=str, default='bottom',
+                    choices=('bottom', 'top', 'left', 'right', 'center'))
+parser.add_argument('--eval_img_occ_start_step', type=int, default=0,
+                    help='Episode step at which the blocker appears. Steps '
+                         'before this are FULLY observable, which is what '
+                         'lets an episode start clear and degrade later.')
+parser.add_argument('--eval_img_occ_ramp_steps', type=int, default=0,
+                    help='Grow the blocker linearly from 0 to --eval_img_occ_'
+                         'frac over this many steps after it starts. '
+                         '0 = appear at full size instantly.')
+parser.add_argument('--eval_occluder_size', type=float, default=0.0,
+                    help='Eval-only: half-extent of a NON-COLLIDING visual '
+                         'occluder placed on the camera->hole ray every '
+                         'episode. 0 = no occluder. Keep <= ~0.5 on the 22x '
+                         'env.')
+parser.add_argument('--eval_occluder_frac', type=float, default=0.45,
+                    help='Where the occluder sits along the camera->hole '
+                         'segment (0 = at the camera, 1 = at the hole).')
+parser.add_argument('--eval_occluder_start_step', type=int, default=0,
+                    help='Introduce the occluder at this step instead of at '
+                         'reset (0 = from the start). The scene is observable '
+                         'before it, which is what a BELIEF needs: '
+                         'ParticleFilter.reset() seeds its particles from the '
+                         'first point cloud, so occluding from t=0 seeds it '
+                         'from nothing and measures initialisation rather than '
+                         'memory. A stateless per-frame estimator is '
+                         'indifferent to this flag by construction, which is '
+                         'exactly why it separates the two.')
+parser.add_argument('--eval_occluder_track', action='store_true', default=True,
+                    help='Re-aim the occluder at the hole every step so the '
+                         'observability level holds for the whole episode. On '
+                         'by default: the hang task lifts the cloth far enough '
+                         'that a box placed once at reset stops occluding '
+                         '(measured 0.44 -> 0.39 visibility at half-extent '
+                         '0.30, vs 0.50 -> 0.17 predicted from a single '
+                         'frame). Pass --no_eval_occluder_track for a fixed '
+                         'world obstacle instead.')
+parser.add_argument('--no_eval_occluder_track', dest='eval_occluder_track',
+                    action='store_false')
+parser.add_argument('--eval_occluder_anchor', choices=('hole', 'goal'),
+                    default='hole',
+                    help='What the occluder is aimed at. "hole" (default) '
+                         'aims at the cloth hole, which combined with tracking '
+                         'holds visibility roughly CONSTANT — a controlled '
+                         'axis. "goal" aims at the hanger peg and never moves, '
+                         'so the cloth flies past a FIXED obstacle and '
+                         'visibility varies within the episode as a '
+                         'consequence of the task motion. The second is the '
+                         'realistic setting and the only one where a belief '
+                         'has dips to ride through; the first is the one that '
+                         'sweeps a clean x-axis. Implies no tracking.')
+parser.add_argument('--eval_occluder_halfextents', type=str, default='',
+                    help='"sx,sy,sz" half-extents for the occluder box, '
+                         'overriding the cube implied by --eval_occluder_size. '
+                         'A slab (wide and thin) gives a visibility profile '
+                         'that dips and RECOVERS as the cloth passes it, which '
+                         'separates "carried the belief through a gap" from '
+                         '"never saw it again".')
+parser.add_argument('--measure_hole_visibility', action='store_true',
+                    help='Measure the fraction of the hole loop the eval '
+                         'camera can actually see, every policy step, and '
+                         'report mean/std over the eval. Implied whenever '
+                         '--eval_occluder_size > 0. Costs one extra small '
+                         'render per step in obs modes that do not already '
+                         'render (state, mesh).')
 
 # Failed-episode full videos. Independent of --video_every_evals (which only
 # records the first --n_video_episodes into a single highlight mp4). When on,
@@ -611,6 +759,8 @@ recorded_success_factors = set()
 # stored in every pkl as [dist, pitch, yaw, tx, ty, tz]; tuple-ifying lets
 # us put it in a set to detect mixed-camera demo dirs.
 recorded_cam_viewmats: set = set()
+recorded_cam_viewmats_nominal: set = set()
+recorded_cam_rolls_nominal: set = set()
 recorded_max_act_vels: set = set()  # critical parity invariant; see import block
 recorded_ctrl_freqs: set = set()    # control-freq parity (same kind of invariant
                                     # as max_act_vel: trajectory was recorded at
@@ -622,6 +772,7 @@ recorded_sim_steps_per_action: set = set()
 # demo pkls (not a CLI flag) since the policy trained on a specific spatial
 # distribution and eval must mirror it. Mixed values raise.
 recorded_randomize_goal_radii: set = set()
+recorded_randomize_goal_dzs: set = set()
 # Demo-speed slowdown factor (1.0 = unmodified, 0.5 = half-speed commanded
 # velocities with 2x trajectory length). Demos with non-1.0 demo_speed have
 # more steps per episode AND smaller per-step displacements, so the eval env
@@ -740,6 +891,15 @@ for fname in demo_paths:
         recorded_success_factors.add(float(d['success_factor']))
     if 'cam_viewmat' in d:
         recorded_cam_viewmats.add(tuple(float(x) for x in d['cam_viewmat']))
+    # v5 records the per-episode (jittered) viewmat above AND the constant
+    # nominal one. Eval must use the nominal: mixed per-episode viewmats do
+    # not raise below, they warn and fall back to sorted(...)[0], which would
+    # put eval at an arbitrary sampled viewpoint.
+    if 'cam_viewmat_nominal' in d:
+        recorded_cam_viewmats_nominal.add(
+            tuple(float(x) for x in d['cam_viewmat_nominal']))
+    if 'cam_roll_deg_nominal' in d:
+        recorded_cam_rolls_nominal.add(float(d['cam_roll_deg_nominal']))
     if 'max_act_vel' in d:
         recorded_max_act_vels.add(float(d['max_act_vel']))
     # round to 4 dp so 15.151515... and 15.15151515 don't trigger a false
@@ -750,6 +910,11 @@ for fname in demo_paths:
         recorded_sim_freqs.add(int(d['sim_freq']))
     if 'sim_steps_per_action' in d:
         recorded_sim_steps_per_action.add(int(d['sim_steps_per_action']))
+    if 'randomize_goal_dz' in d:
+        # Recorded for provenance only: the eval env is configured with
+        # randomize_goal_radius alone, so goal HEIGHT jitter is not reproduced
+        # at eval time. Goal-generalisation tests vary the xy radius.
+        recorded_randomize_goal_dzs.add(round(float(d['randomize_goal_dz']), 6))
     if 'randomize_goal_radius' in d:
         # round to 6 dp so float-repr noise across collection runs doesn't
         # produce false mismatches.
@@ -832,7 +997,17 @@ eval_cam_resolution = args.eval_cam_resolution or collection_cam_res
 # If no demo records a viewmat (legacy pkls), fall back to the same default
 # collect_bc_demos.py now uses, so eval and a fresh re-collect would agree.
 _DEFAULT_VIEWMAT = (14.0, -5.0, 45.0, 0.0, 0.0, 5.5)
-if len(recorded_cam_viewmats) == 0:
+if len(recorded_cam_viewmats_nominal) > 1:
+    raise SystemExit(
+        f'demos use mixed cam_viewmat_nominal {sorted(recorded_cam_viewmats_nominal)}. '
+        f'The nominal viewpoint defines the eval camera, so it must be '
+        f'identical across the demo dir.')
+if len(recorded_cam_viewmats_nominal) == 1:
+    eval_cam_viewmat = next(iter(recorded_cam_viewmats_nominal))
+    print(f'[data] eval cam_viewmat (NOMINAL, from demos) = {eval_cam_viewmat}; '
+          f'{len(recorded_cam_viewmats)} distinct per-episode viewmats were '
+          f'used for collection (camera randomization)')
+elif len(recorded_cam_viewmats) == 0:
     eval_cam_viewmat = _DEFAULT_VIEWMAT
     print(f'[data] no cam_viewmat in demos (legacy pkls); using default '
           f'{eval_cam_viewmat}')
@@ -962,6 +1137,10 @@ if recorded_randomize_goal_radii:
     print(f'[data] eval randomize_goal_radius (from demos) = '
           f'{eval_randomize_goal_radius} m'
           f'{" (off — fixed goal)" if eval_randomize_goal_radius <= 0 else ""}')
+if args.eval_goal_radius is not None:
+    print(f'[eval] goal radius OVERRIDDEN {eval_randomize_goal_radius} -> '
+          f'{args.eval_goal_radius} (goal-generalisation test)')
+    eval_randomize_goal_radius = float(args.eval_goal_radius)
 else:
     eval_randomize_goal_radius = 0.0
     print(f'[data] no randomize_goal_radius in demos (legacy pkls); '
@@ -1039,6 +1218,31 @@ obs_normalizer.fit(
 act_normalizer = ActionNormalizer()
 act_normalizer.fit(acts_all)
 
+# Calibration-error augmentation parameters, or None when disabled.
+_CALIB_AUG = None
+if args.aug_calib_trans_mm > 0 or args.aug_calib_rot_deg > 0:
+    _CALIB_AUG = (args.aug_calib_trans_mm, args.aug_calib_trans_max_mm,
+                  args.aug_calib_rot_deg, args.aug_calib_rot_max_deg)
+    if args.obs_mode in ('pcd', 'pcd_priv'):
+        # The normalizer is fitted on UNAUGMENTED pcd above. That is safe only
+        # because the perturbation is zero-mean and small next to the cloud's
+        # own spread; the check below makes that quantitative instead of
+        # assumed, and fails loudly if the assumption ever stops holding.
+        _sd = float(np.std(obs_all.reshape(-1, 3), axis=0).mean())
+        _aug_sd = args.aug_calib_trans_mm / 45.0
+        _shift = (np.sqrt(_sd ** 2 + _aug_sd ** 2) - _sd) / max(_sd, 1e-9)
+        print(f'[aug] calibration-error augmentation ON: '
+              f'trans {args.aug_calib_trans_mm} mm (max '
+              f'{args.aug_calib_trans_max_mm}), rot {args.aug_calib_rot_deg} deg '
+              f'(max {args.aug_calib_rot_max_deg}); applied to pcd+goal, not grip')
+        print(f'[aug] normalizer fitted on unaugmented pcd; augmentation '
+              f'inflates the per-axis std by {_shift*100:.2f}%')
+        if _shift > 0.05:
+            raise SystemExit(
+                f'augmentation would shift the obs-normalizer std by '
+                f'{_shift*100:.1f}% (>5%). Refit the normalizer on augmented '
+                f'samples or lower --aug_calib_trans_mm.')
+
 
 # =============================================================================
 # Dataset — sample (obs_horizon, pred_horizon) windows with padding.
@@ -1088,7 +1292,7 @@ class DiffusionBCDataset(Dataset):
 
     def __init__(self, obs_all, grip_all, goal_all, priv_all, acts_all,
                  episode_ends, obs_horizon, pred_horizon, action_horizon,
-                 obs_mode, obs_normalizer, act_normalizer,
+                 obs_mode, obs_normalizer, act_normalizer, calib_aug=None,
                  topo=None, episode_ends_raw=None, mesh_rest=None):
         # mesh mode: topology is PER EPISODE (each demo is its own cloth), so a
         # window has to be mapped back to the episode it came from.
@@ -1116,6 +1320,7 @@ class DiffusionBCDataset(Dataset):
         self.obs_mode = obs_mode
         self.obs_normalizer = obs_normalizer
         self.act_normalizer = act_normalizer
+        self.calib_aug = calib_aug
 
     def __len__(self):
         return len(self.indices)
@@ -1175,12 +1380,65 @@ class DiffusionBCDataset(Dataset):
             return self.obs_normalizer.apply(sample), act_seq
 
         primary_key = 'image' if self.obs_mode == 'rgb' else 'pcd'
+        if primary_key == 'pcd' and self.calib_aug is not None:
+            # ONE transform per window — sampling per frame would make the
+            # cloud jitter inside a single observation horizon, which is not
+            # what a calibration error looks like.
+            R, t = sample_calib_perturbation(np.random.default_rng(), *self.calib_aug)
+            obs_seq, goal_seq = apply_calib_perturbation(obs_seq, goal_seq, R, t)
         sample = {primary_key: obs_seq, 'grip': grip_seq, 'goal': goal_seq}
         if self.obs_mode == 'pcd_priv':
             priv_slice = self.priv_all[bs:be]
             priv_seq = self._pad(priv_slice, self.pred_horizon, ss, se)
             sample['priv'] = priv_seq[:self.obs_horizon]
         return self.obs_normalizer.apply(sample), act_seq
+
+
+_AUG_SIM_PER_MM = 1.0 / 45.0     # 1 sim unit = 45 mm
+_AUG_WBOX = 20.0                 # grip/goal are stored pre-divided by this
+
+
+def sample_calib_perturbation(rng, trans_mm, trans_max_mm, rot_deg, rot_max_deg):
+    """A rigid (R, t) standing in for a camera-extrinsic error, in SIM units.
+
+    Truncated normal on both magnitudes so a rare tail draw cannot hand the
+    policy a perturbation larger than the calibration could plausibly be
+    wrong by.
+    """
+    t = rng.normal(0.0, trans_mm, size=3)
+    n = float(np.linalg.norm(t))
+    if n > trans_max_mm and n > 0:
+        t *= trans_max_mm / n
+    t = t * _AUG_SIM_PER_MM
+
+    axis = rng.normal(size=3)
+    axis /= max(float(np.linalg.norm(axis)), 1e-9)
+    ang = float(np.clip(rng.normal(0.0, rot_deg), -rot_max_deg, rot_max_deg))
+    ang = np.radians(ang)
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]], dtype=np.float64)
+    R = np.eye(3) + np.sin(ang) * K + (1 - np.cos(ang)) * (K @ K)
+    return R.astype(np.float32), t.astype(np.float32)
+
+
+def apply_calib_perturbation(pcd_seq, goal_seq, R, t):
+    """Rigidly move the cloud and the goal together; leave grip alone.
+
+    Rotation is taken about the CLOUD CENTROID rather than the real camera
+    centre. A true extrinsic rotation pivots about the camera, which for this
+    rig differs by an extra near-constant translation of order 16 mm — already
+    inside the span of the translation term, which is why the simpler pivot is
+    used. `pcd` is stored in raw sim units but `goal` is stored pre-divided by
+    WBOX, so the goal has to be scaled up, transformed, and scaled back or the
+    same perturbation lands 20x too small on it.
+    """
+    c = pcd_seq.reshape(-1, 3).mean(axis=0)
+    pcd_out = (pcd_seq.reshape(-1, 3) - c) @ R.T + c + t
+    pcd_out = pcd_out.reshape(pcd_seq.shape).astype(np.float32)
+    g = goal_seq.astype(np.float32) * _AUG_WBOX
+    g = (g - c) @ R.T + c + t
+    return pcd_out, (g / _AUG_WBOX).astype(np.float32)
 
 
 def _collate(batch):
@@ -1233,6 +1491,7 @@ dataset = DiffusionBCDataset(
     obs_horizon=args.obs_horizon, pred_horizon=args.pred_horizon,
     action_horizon=args.action_horizon, obs_mode=args.obs_mode,
     obs_normalizer=obs_normalizer, act_normalizer=act_normalizer,
+    calib_aug=(_CALIB_AUG if args.obs_mode in ('pcd', 'pcd_priv') else None),
     topo=topo_buf if args.obs_mode == 'mesh' else None,
     episode_ends_raw=_episode_ends_raw, mesh_rest=_mesh_rest)
 if args.obs_mode == 'mesh':
@@ -1419,6 +1678,73 @@ def _perturb_centroid(centroid_norm, hole_noise_std, noise_rng):
 # State estimator (UniClothDiff) — lazy singleton + per-cloth conditioning.
 # ---------------------------------------------------------------------------
 _hole_estimator = None
+# Per-call ||estimate - ground truth|| for the hole centroid, in METRES of the
+# eval env. Reset at the start of each eval pass and summarised into the
+# metrics, so a gse row always carries the accuracy of the thing it swapped in.
+_CENTROID_ERRS = []
+# The same errors PAIRED with the hole visibility measured at that step, so the
+# error can be conditioned on how much was actually observable at the moment it
+# was produced. Under a STATIC obstacle the visibility swings within an episode
+# (clear while the cloth is low, blocked as it rises past the box), and an
+# episode-mean error averages the belief's whole reason for existing away: a
+# filter that carries the estimate through a dip and a per-frame model that
+# loses it there can post identical means. Appended as (visibility, error).
+_CENTROID_VIS_ERRS = []
+# Visibility at the current step, stashed when it is measured so the two
+# estimator paths below can pair against it without recomputing the render.
+# One-element list rather than a bare float so the eval loop can update it
+# without a `global` declaration.
+_LAST_VIS = [float('nan')]
+# (episode, step, gt_xyz, used_xyz) for every policy step, in METRES, recorded
+# under --eval_centroid_trace. `used` is whatever actually reached the policy
+# after any estimator / PF / EMA / repair path, so the trace is what separates
+# "the estimate is better" from "the oracle is intermittently broken".
+_CENTROID_TRACE = []
+# Rolling state for --eval_centroid_ema / --eval_centroid_repair. Both are
+# per-episode, so evaluate_policy clears them at every episode boundary; a
+# one-element list keeps _capture_obs_for_policy free of `global`.
+_CENTROID_EMA_PREV = [None]
+_CENTROID_LAST_VALID = [None]
+_CENTROID_OFFSET_VEC = (
+    np.asarray([float(x) for x in args.eval_centroid_offset.split(',')],
+               dtype=np.float32)
+    if args.eval_centroid_offset else np.zeros(3, dtype=np.float32))
+
+
+def _privileged_centroid_hooks(obs):
+    """Apply --eval_centroid_repair then --eval_centroid_ema to the privileged
+    hole-centroid slice of `obs`, in place on a copy. Returns the (possibly
+    unchanged) obs.
+
+    Order matters: repair first, so the EMA is never fed the (0,0,0) fallback
+    that repair exists to remove — smoothing a degenerate sample would drag the
+    average toward the origin for several steps afterwards and confound the two
+    controls we are trying to separate.
+    """
+    if not (args.eval_centroid_repair or args.eval_centroid_ema > 0
+            or args.eval_centroid_offset):
+        return obs
+    cur = np.asarray(obs[_HOLE_CENTROID_SLICE], dtype=np.float32)
+    if args.eval_centroid_repair:
+        # build_privileged_obs emits exactly zeros when no hole vertex survives
+        # the NaN filter; an all-zero centroid is otherwise unreachable (the
+        # cloth never sits at the world origin in this env).
+        if not np.any(cur):
+            if _CENTROID_LAST_VALID[0] is not None:
+                cur = _CENTROID_LAST_VALID[0].copy()
+        else:
+            _CENTROID_LAST_VALID[0] = cur.copy()
+    if args.eval_centroid_ema > 0:
+        a = float(args.eval_centroid_ema)
+        prev = _CENTROID_EMA_PREV[0]
+        cur = cur if prev is None else (a * prev + (1.0 - a) * cur)
+        _CENTROID_EMA_PREV[0] = cur.copy()
+    if args.eval_centroid_offset:
+        # Offset is given in metres; the obs slot is /WBOX-normalized.
+        cur = cur + (_CENTROID_OFFSET_VEC / _WBOX)
+    obs = obs.copy()
+    obs[_HOLE_CENTROID_SLICE] = cur
+    return obs
 
 
 def _get_hole_estimator():
@@ -1458,6 +1784,40 @@ def _cloth_unique_edges(deform):
     return np.array(sorted(es), dtype=np.int64) if es else None
 
 
+def _occluder_half_extents():
+    """Half-extents for the eval occluder box: explicit if given, else a cube
+    of --eval_occluder_size."""
+    if args.eval_occluder_halfextents:
+        he = [float(x) for x in args.eval_occluder_halfextents.split(',')]
+        if len(he) != 3:
+            raise ValueError('--eval_occluder_halfextents wants "sx,sy,sz"')
+        return he
+    s = args.eval_occluder_size
+    return [s, s, s]
+
+
+def _make_occluder(deform, hole_idx):
+    """Spawn this episode's occluder per --eval_occluder_anchor.
+
+    `goal` anchors on the hanger peg and never moves, so the cloth's own motion
+    past a fixed obstacle produces the visibility profile; `hole` keeps the
+    original camera->hole placement.
+    """
+    if args.eval_occluder_anchor == 'goal':
+        return add_static_occluder(
+            deform, np.asarray(deform.goal_pos[0], dtype=np.float64),
+            _occluder_half_extents(), frac=args.eval_occluder_frac)
+    if args.eval_occluder_halfextents:
+        from _bc_obs_helpers import _occluder_position, _spawn_occluder
+        pos = _occluder_position(deform, hole_idx, args.eval_occluder_frac)
+        if pos is None:
+            return None
+        return _spawn_occluder(deform, pos, _occluder_half_extents(),
+                               (0.15, 0.15, 0.18, 1.0))
+    return add_occluder(deform, hole_idx, args.eval_occluder_size,
+                        frac=args.eval_occluder_frac)
+
+
 def _estimate_centroid_norm(deform, hole_idx, est, est_rest, est_edges):
     """Capture a dense cloth PCD and run the state estimator to get the hole
     centroid, returned /WBOX-normalized to match the stored centroid frame."""
@@ -1469,7 +1829,26 @@ def _estimate_centroid_norm(deform, hole_idx, est, est_rest, est_edges):
     centroid_world = est.estimate(
         pcd, est_rest, hole_idx, edges=est_edges,
         num_inference_steps=args.state_estimator_steps)
-    return (np.asarray(centroid_world, dtype=np.float32) / _WBOX)
+    centroid_world = np.asarray(centroid_world, dtype=np.float32)
+    # Measure the estimate against the truth it replaces, every call. Success
+    # rate alone cannot distinguish an accurate estimator from a policy that
+    # tolerates a bad one — and the hole-centroid noise probe shows this policy
+    # survives noise ~1x the hole radius before collapsing by 5x, so there is a
+    # wide band where a poor estimate still scores well.
+    try:
+        _, _verts = get_mesh_data(deform.sim, deform.deform_id)
+        _v = np.asarray(_verts, dtype=np.float32)
+        _idx = np.asarray(hole_idx, dtype=np.int64)
+        _idx = _idx[_idx < len(_v)]
+        if len(_idx):
+            gt_world = _v[_idx].mean(axis=0)
+            _err = float(np.linalg.norm(centroid_world - gt_world))
+            _CENTROID_ERRS.append(_err)
+            if np.isfinite(_LAST_VIS[0]):
+                _CENTROID_VIS_ERRS.append((float(_LAST_VIS[0]), _err))
+    except Exception:
+        pass
+    return (centroid_world / _WBOX)
 
 
 # ---------------------------------------------------------------------------
@@ -1574,10 +1953,24 @@ def _render_from_view(deform, view, proj, size):
     return np.asarray(rgba, dtype=np.uint8).reshape(size, size, 4)[:, :, :3]
 
 
+def _img_occ_frac_at(step):
+    """Blocked image fraction at this episode step (0 before it starts)."""
+    if args.eval_img_occ_frac <= 0.0:
+        return 0.0
+    if step < args.eval_img_occ_start_step:
+        return 0.0
+    if args.eval_img_occ_ramp_steps <= 0:
+        return args.eval_img_occ_frac
+    prog = (step - args.eval_img_occ_start_step) / float(
+        args.eval_img_occ_ramp_steps)
+    return args.eval_img_occ_frac * min(1.0, max(0.0, prog))
+
+
 def _capture_obs_for_policy(deform, obs_mode, state_key,
                             hole_idx, corner_idx,
                             hole_noise_std=0.0, noise_rng=None,
-                            hole_estimator=None, est_rest=None, est_edges=None):
+                            hole_estimator=None, est_rest=None, est_edges=None,
+                            mesh_rest=None):
     """Return one obs sample matching what the dataset saw at training
     time (UN-normalized — the obs_normalizer is applied next).
 
@@ -1607,6 +2000,8 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
             obs[_HOLE_CENTROID_SLICE] = _estimate_centroid_norm(
                 deform, hole_idx, hole_estimator, est_rest, est_edges)
             return obs, noise_vec_m
+        if state_key == 'hole_centroid':
+            obs = _privileged_centroid_hooks(obs)
         if hole_noise_std > 0 and state_key == 'hole_centroid':
             obs = obs.copy()
             perturbed, noise_vec = _perturb_centroid(
@@ -1625,6 +2020,30 @@ def _capture_obs_for_policy(deform, obs_mode, state_key,
     goal = np.asarray(deform.goal_pos[0], dtype=np.float32) / 20.0
     _zero_noise = np.zeros(3, dtype=np.float32)
 
+    if obs_mode == 'mesh':
+        # Must mirror DiffusionBCDataset.__getitem__ exactly: same padded
+        # layout, same [pos || rest] channel order, same node/edge masking.
+        pos = build_privileged_obs(
+            deform, 'full_mesh', hole_idx,
+            corner_indices=corner_idx)[12:].reshape(-1, 3).astype(np.float32)
+        rest = mesh_rest if mesh_rest is not None else pos
+        # node_mask keyed off REST, matching training: a real vertex that
+        # happens to pass through the origin mid-episode must not vanish.
+        node_mask = np.abs(rest).sum(-1) > 0
+        # _cloth_unique_edges returns UNDIRECTED unique edges; the encoder sums
+        # over incoming edges only, so mirror them (training does the same via
+        # faces_to_bidir_edges).
+        if est_edges is not None and len(est_edges):
+            ed = np.unique(
+                np.concatenate([est_edges, est_edges[:, ::-1]], 0), axis=0)
+        else:
+            ed = np.zeros((0, 2), dtype=np.int64)
+        E = max(len(ed), 1)
+        ei = np.zeros((E, 2), np.int64); em = np.zeros(E, bool)
+        ei[:len(ed)] = ed; em[:len(ed)] = True
+        return {'mesh': np.concatenate([pos, rest], -1).astype(np.float32),
+                'edge_index': ei, 'edge_mask': em, 'node_mask': node_mask,
+                'grip': grip, 'goal': goal}, _zero_noise
     if obs_mode == 'rgb':
         rgb, _, _, _, _ = capture_rgb_depth(
             deform, eval_cam_resolution, eval_cam_resolution)
@@ -1738,6 +2157,26 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
     n_failed = 0
     n_failed_logged = 0
 
+    # Occlusion sweep bookkeeping. `vis_series` collects one measured
+    # hole-visibility per policy step across ALL episodes of this pass; its
+    # mean is the x-axis coordinate this (condition, occluder size) lands on.
+    # Episodes whose cloth has no hole return NaN and are dropped rather than
+    # scored 0, so the axis stays a measurement of the hole we can see.
+    measure_vis = bool(args.measure_hole_visibility
+                       or args.eval_occluder_size > 0)
+    vis_series = []
+    # Same measurements kept PER EPISODE. The pooled mean is the right summary
+    # for a tracking occluder (which holds visibility flat on purpose), but it
+    # destroys exactly what a static obstacle is for: a profile that starts
+    # clear, dips as the cloth passes behind the box, and may recover. A belief
+    # is supposed to pay inside those dips, so the dips have to survive into
+    # the output.
+    vis_series_by_ep = []
+    del _CENTROID_ERRS[:]
+    del _CENTROID_VIS_ERRS[:]
+    del _CENTROID_TRACE[:]
+    _LAST_VIS[0] = float('nan')
+
     # Dedicated RNG for eval-time hole-centroid noise, seeded off the eval
     # seed so the noisy-privileged eval is reproducible across passes without
     # disturbing the global np.random stream (which env resampling relies on).
@@ -1754,6 +2193,10 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
     s_hanging = s_topo = s_legacy = 0
     ep_rwds = []
     ep_lens = []
+    ep_success_hanging = []
+    ep_success_topo = []
+    ep_success_legacy = []
+    ep_skipped = []   # episode indices dropped for a degenerate cloth
     for ep in range(n_episodes):
         is_recorded = ep < record_video_episodes
         # Capture frames for this episode if it's a highlight episode OR if
@@ -1761,6 +2204,11 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         # we only know after it finishes — so we must capture eagerly).
         capture_this_ep = is_recorded or args.record_failed_videos
         ep_frames = []  # filled only if capture_this_ep
+        # The EMA and the carry-forward buffer are per-episode: leaking either
+        # across a reset would smooth the first frames of episode N toward
+        # wherever episode N-1's cloth ended up.
+        _CENTROID_EMA_PREV[0] = None
+        _CENTROID_LAST_VALID[0] = None
         e.reset()
         # DeformEnv.reset() calls load_objects() → preset_override_util(),
         # which reads sys.argv to decide which args to preserve. Since
@@ -1801,9 +2249,25 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             # Skip degenerate clothes — count as failure to keep n_episodes honest.
             ep_rwds.append(0.0)
             ep_lens.append(0)
+            # Keep the per-episode arrays index-aligned with `ep` so two rows
+            # can be compared episode-by-episode; record WHICH indices were
+            # skipped, because a differing skip set between two rows means the
+            # two rows did not see the same cloths and are not paired at all.
+            ep_success_hanging.append(0)
+            ep_success_topo.append(0)
+            ep_success_legacy.append(0)
+            ep_skipped.append(int(ep))
             n_failed += 1
             continue
         hole_loops = get_hole_loops(deform)
+        # Non-colliding visual occluder for THIS episode. Placed after the
+        # no-hole skip above so it always has a hole to aim at, and removed in
+        # the finally-equivalent at the end of the episode body — it lives in
+        # the sim, not the env, so a reset does not clear it.
+        occluder_id = None
+        _ep_vis = []                 # this episode's visibility profile
+        if args.eval_occluder_size > 0 and args.eval_occluder_start_step <= 0:
+            occluder_id = _make_occluder(deform, hole_idx)
         _, verts0 = get_mesh_data(deform.sim, deform.deform_id)
         corner_idx = identify_cloth_corners(verts0)
         hole_radius = measure_hole_radius(deform, hole_idx)
@@ -1820,9 +2284,16 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         # estimator is off.
         hole_estimator = _get_hole_estimator()
         est_rest = est_edges = None
-        if hole_estimator is not None:
+        if hole_estimator is not None or args.obs_mode == 'mesh':
             est_rest = np.asarray(verts0, dtype=np.float32)
             est_edges = _cloth_unique_edges(deform)
+        mesh_rest_padded = None
+        if args.obs_mode == 'mesh':
+            # Rest pose in the SAME padded layout the training data used, so a
+            # checkpoint sees an identically-shaped mesh at eval as in training.
+            mesh_rest_padded = build_privileged_obs(
+                deform, 'full_mesh', hole_idx,
+                corner_indices=corner_idx)[12:].reshape(-1, 3).astype(np.float32)
 
         # PF tracker conditioning + reset for THIS episode. The tracker is
         # stateful, so we reset it here (seed from the first cloud) and step it
@@ -1877,6 +2348,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         first_obs, first_noise_vec = _capture_obs_for_policy(
             deform, args.obs_mode, args.state_key, hole_idx, corner_idx,
             hole_noise_std=hole_noise_std, noise_rng=noise_rng,
+            mesh_rest=mesh_rest_padded,
             hole_estimator=hole_estimator, est_rest=est_rest,
             est_edges=est_edges)
         first_obs = _apply_centroid_override(
@@ -1899,7 +2371,11 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         ep_rwd = 0.0
         step = 0
         done = False
+        # Episode starts fully observable; the schedule takes over below.
+        set_image_occlusion(_img_occ_frac_at(0), args.eval_img_occ_side)
         while not done and step < _per_ep_max:
+            set_image_occlusion(_img_occ_frac_at(step),
+                                args.eval_img_occ_side)
             # 1) Apply obs normalizer per frame, stack to (1, To, *), run policy.
             normed = _apply_normalizer_to_seq(
                 list(obs_deque), obs_normalizer)
@@ -1919,6 +2395,36 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
                 _, rwd, done, info = e.step(a)
                 ep_rwd += float(rwd)
                 step += 1
+                # Delayed occlusion: drop the box in mid-episode so the scene is
+                # observable first. A particle filter is SEEDED from the first
+                # point cloud, so occluding from t=0 hands it garbage to
+                # propagate and tests initialisation, not memory — while a
+                # stateless per-frame estimator is indifferent to history. This
+                # is the only setup in which the two are compared fairly.
+                if (occluder_id is None and args.eval_occluder_size > 0
+                        and 0 < args.eval_occluder_start_step <= step):
+                    occluder_id = _make_occluder(deform, hole_idx)
+                # A goal-anchored occluder is a FIXED world obstacle by
+                # definition — re-aiming it would destroy the very thing it is
+                # there to produce (visibility that varies as the cloth moves).
+                if (occluder_id is not None and args.eval_occluder_track
+                        and args.eval_occluder_anchor != 'goal'):
+                    move_occluder(deform, occluder_id, hole_idx,
+                                  frac=args.eval_occluder_frac)
+                # Measure the axis, do not assume it: how much of the hole
+                # loop this camera can actually see right now, through both
+                # the occluder and the cloth's own self-occlusion.
+                if measure_vis:
+                    _, _vis_d, _vis_s, _vis_v, _vis_p = capture_rgb_depth(
+                        deform, eval_cam_resolution, eval_cam_resolution)
+                    _vis_frac, _, _ = hole_visibility(
+                        deform, hole_idx, _vis_d, _vis_s, _vis_v, _vis_p)
+                    if np.isfinite(_vis_frac):
+                        vis_series.append(float(_vis_frac))
+                        _ep_vis.append(float(_vis_frac))
+                    # Stash for the estimator/PF error pairing below, whether or
+                    # not it was finite (NaN simply drops that pair).
+                    _LAST_VIS[0] = float(_vis_frac)
                 # Action chunking: the policy re-plans only every action_horizon
                 # steps and consumes just the last obs_horizon observations, so
                 # estimates for earlier mid-chunk steps get evicted unused. Skip
@@ -1936,6 +2442,7 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
                     deform, args.obs_mode, args.state_key,
                     hole_idx, corner_idx,
                     hole_noise_std=hole_noise_std, noise_rng=noise_rng,
+                    mesh_rest=mesh_rest_padded,
                     hole_estimator=_est, est_rest=est_rest,
                     est_edges=est_edges)
                 # Stateful PF tracker step: drive each grasped vertex by its
@@ -1949,9 +2456,52 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
                     pf_prev_grasped = cur_grasped
                     pcd_obs = _capture_dense_pcd(deform, args.pf_occlusion_min_points)
                     centroid_world = pf_tracker.step(grasped_vel, point_cloud=pcd_obs)
-                    pf_override = (np.asarray(centroid_world, dtype=np.float32) / _WBOX)
+                    centroid_world = np.asarray(centroid_world, dtype=np.float32)
+                    # Same accuracy measurement as the per-frame estimator path,
+                    # so the two are comparable on ESTIMATE QUALITY and not only
+                    # on success — which saturates, and would hide a better
+                    # belief that the policy's tolerance band absorbs anyway.
+                    try:
+                        _, _pv = get_mesh_data(deform.sim, deform.deform_id)
+                        _pv = np.asarray(_pv, dtype=np.float32)
+                        _pi = np.asarray(hole_idx, dtype=np.int64)
+                        _pi = _pi[_pi < len(_pv)]
+                        if len(_pi):
+                            _perr = float(np.linalg.norm(
+                                centroid_world - _pv[_pi].mean(axis=0)))
+                            _CENTROID_ERRS.append(_perr)
+                            if np.isfinite(_LAST_VIS[0]):
+                                _CENTROID_VIS_ERRS.append(
+                                    (float(_LAST_VIS[0]), _perr))
+                    except Exception:
+                        pass
+                    pf_override = (centroid_world / _WBOX)
                     new_obs = _apply_centroid_override(
                         new_obs, args.obs_mode, args.state_key, pf_override)
+                # Trace what the policy was ACTUALLY handed against the truth it
+                # replaces, after every override path has run. Recorded here
+                # rather than inside the estimator helper so the privileged rows
+                # produce a trace too — the comparison needs both sides.
+                if (args.eval_centroid_trace and args.obs_mode == 'state'
+                        and args.state_key == 'hole_centroid'):
+                    try:
+                        _, _tv = get_mesh_data(deform.sim, deform.deform_id)
+                        _tv = np.asarray(_tv, dtype=np.float32)
+                        _ti = np.asarray(hole_idx, dtype=np.int64)
+                        _ti = _ti[_ti < len(_tv)]
+                        _hv = _tv[_ti]
+                        _hv = _hv[~np.isnan(_hv).any(axis=1)]
+                        _gt = (_hv.mean(axis=0) if len(_hv)
+                               else np.zeros(3, dtype=np.float32))
+                        _used = np.asarray(
+                            new_obs[_HOLE_CENTROID_SLICE], np.float32) * _WBOX
+                        _CENTROID_TRACE.append(
+                            [float(ep), float(step),
+                             float(_gt[0]), float(_gt[1]), float(_gt[2]),
+                             float(_used[0]), float(_used[1]), float(_used[2]),
+                             float(len(_hv))])
+                    except Exception:
+                        pass
                 if capture_this_ep:
                     # Pre-settle policy-phase frame, stamped with the noise level
                     # of the obs that produced this action. When an estimator/
@@ -2017,6 +2567,14 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
             ep_frame_noise_pct.extend([None] * len(settle_frames))
             deform._record_settle_frames = False  # turn off for next ep
 
+        # The occluder is visual-only, but it is a body in the sim: drop it
+        # before scoring so nothing downstream (renders, later episodes) sees
+        # a stack of leftover boxes.
+        remove_occluder(deform, occluder_id)
+        occluder_id = None
+        if _ep_vis:
+            vis_series_by_ep.append(_ep_vis)
+
         # Score this episode with all three metrics for cross-comparison.
         ep_hanging = int(check_hanging_on_peg(
             deform, hole_idx, hole_radius, args.success_factor))
@@ -2027,6 +2585,14 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         s_hanging += ep_hanging
         s_topo += ep_topo
         s_legacy += ep_legacy
+        # Per-episode outcomes, kept so rows sharing an eval seed can be
+        # compared PAIRWISE (McNemar on the discordant episodes). Aggregate
+        # rates cannot do this: two rows differing by 0.12 at n=50 is ~2 SE
+        # unpaired but can be decisive paired, and every row here is run on
+        # the same episode set by construction.
+        ep_success_hanging.append(int(ep_hanging))
+        ep_success_topo.append(int(ep_topo))
+        ep_success_legacy.append(int(ep_legacy))
         # Per-episode pass/fail under the headline metric.
         ep_primary = {'hanging': ep_hanging, 'topological': ep_topo,
                       'legacy': ep_legacy}[args.success_metric]
@@ -2131,6 +2697,83 @@ def evaluate_policy(n_episodes: int, eval_seed: int, label: str = 'eval',
         f'{label}/n_episodes': n_episodes,
         f'{label}/n_failed': n_failed,
     }
+    # The measured occlusion axis. Reported next to the success rate so a
+    # sweep row is (visibility, success) rather than (occluder setting,
+    # success) — the former is comparable across scenes, cameras and cloths.
+    metrics[f'{label}/occluder_size'] = float(args.eval_occluder_size)
+    # Per-episode outcomes + the skip set, for paired comparison across rows.
+    try:
+        np.savez(
+            os.path.join(logdir, f'{label}_per_episode.npz'),
+            success_hanging=np.asarray(ep_success_hanging, dtype=np.int8),
+            success_topological=np.asarray(ep_success_topo, dtype=np.int8),
+            success_legacy=np.asarray(ep_success_legacy, dtype=np.int8),
+            skipped=np.asarray(ep_skipped, dtype=np.int32),
+            ep_len=np.asarray(ep_lens, dtype=np.int32),
+            eval_seed=np.asarray([eval_seed], dtype=np.int64))
+        metrics[f'{label}/n_skipped_cloths'] = int(len(ep_skipped))
+    except Exception as _pe_err:
+        print(f'  [eval] WARN: per-episode dump failed: {_pe_err!r}')
+    if _CENTROID_TRACE:
+        _tr = np.asarray(_CENTROID_TRACE, dtype=np.float32)
+        np.save(os.path.join(logdir, f'{label}_centroid_trace.npy'), _tr)
+        # Degenerate-GT rate is the headline diagnostic: it is the one mechanism
+        # that would make the privileged row genuinely WORSE than an estimated
+        # one rather than merely noisier.
+        _deg = float((_tr[:, 8] == 0).mean())
+        metrics[f'{label}/gt_centroid_degenerate_frac'] = _deg
+        metrics[f'{label}/centroid_trace_n'] = int(_tr.shape[0])
+    if _CENTROID_ERRS:
+        _ce = np.asarray(_CENTROID_ERRS, dtype=np.float64)
+        metrics[f'{label}/centroid_err_mean'] = float(_ce.mean())
+        metrics[f'{label}/centroid_err_p50'] = float(np.percentile(_ce, 50))
+        metrics[f'{label}/centroid_err_p90'] = float(np.percentile(_ce, 90))
+        metrics[f'{label}/centroid_err_n'] = int(_ce.size)
+    if _CENTROID_VIS_ERRS:
+        # Error binned by the visibility present when it was produced. This is
+        # the comparison a belief lives or dies by: pooled means let a filter
+        # that holds through the dark stretches and a per-frame model that only
+        # works in the clear ones tie. Bins are coarse (n is per-step, but the
+        # episodes are few) and reported with their counts so a bin with three
+        # samples cannot be read as a result.
+        _pairs = np.asarray(_CENTROID_VIS_ERRS, dtype=np.float64)
+        np.save(os.path.join(logdir, f'{label}_centroid_vis_errs.npy'), _pairs)
+        for _lo, _hi in ((0.0, 0.05), (0.05, 0.2), (0.2, 0.5), (0.5, 1.01)):
+            _m = (_pairs[:, 0] >= _lo) & (_pairs[:, 0] < _hi)
+            if _m.sum() >= 3:
+                _tag = f'vis{_lo:g}_{_hi:g}'
+                metrics[f'{label}/centroid_err_{_tag}'] = float(
+                    np.median(_pairs[_m, 1]))
+                metrics[f'{label}/centroid_err_{_tag}_n'] = int(_m.sum())
+    if measure_vis and vis_series:
+        _vs = np.asarray(vis_series, dtype=np.float64)
+        metrics[f'{label}/hole_visibility'] = float(_vs.mean())
+        metrics[f'{label}/hole_visibility_std'] = float(_vs.std())
+        metrics[f'{label}/hole_visibility_p10'] = float(np.percentile(_vs, 10))
+        metrics[f'{label}/hole_visibility_p50'] = float(np.percentile(_vs, 50))
+        metrics[f'{label}/hole_visibility_p90'] = float(np.percentile(_vs, 90))
+        metrics[f'{label}/hole_visibility_n'] = len(vis_series)
+        # Keep the raw per-step series: the mean alone cannot tell a level
+        # that held all episode from one that spiked at the start and decayed
+        # as the cloth climbed out from behind the occluder.
+        np.save(os.path.join(logdir, f'{label}_hole_visibility.npy'), _vs)
+        if vis_series_by_ep:
+            # Ragged (episodes differ in length) -> pad with NaN so it saves as
+            # one array and the profile plot can just nanmean down the columns.
+            _w = max(len(v) for v in vis_series_by_ep)
+            _prof = np.full((len(vis_series_by_ep), _w), np.nan)
+            for _i, _v in enumerate(vis_series_by_ep):
+                _prof[_i, :len(_v)] = _v
+            np.save(os.path.join(logdir, f'{label}_hole_visibility_by_ep.npy'),
+                    _prof)
+            # Within-episode SWING: how much visibility moves during a single
+            # rollout. ~0 means the occluder held a constant level (the
+            # tracking case) and the run cannot speak to riding through dips,
+            # whatever its mean says.
+            _swing = np.nanmax(_prof, axis=1) - np.nanmin(_prof, axis=1)
+            metrics[f'{label}/hole_visibility_swing_mean'] = float(_swing.mean())
+            metrics[f'{label}/hole_visibility_ep_min_mean'] = float(
+                np.nanmin(_prof, axis=1).mean())
     # Stash the on-disk video path for the caller (so it can wandb.log
     # the wandb.Video with the right epoch-tagged caption alongside the
     # numeric metrics, in a single wandb.log call).
@@ -2610,6 +3253,28 @@ else:
     print('\nFinal eval:')
     for k, v in sorted(final_metrics.items()):
         print(f'  {k}: {v}')
+    # Machine-readable copy so a sweep can aggregate runs without re-parsing
+    # stdout. One file per run dir; the run dir is unique per invocation.
+    _final_json = os.path.join(logdir, 'final_eval_metrics.json')
+    with open(_final_json, 'w') as _fj:
+        # `obs_mode` alone cannot name the row: gse and gse+belief both run with
+        # obs_mode=state and differ only in who fills the hole-centroid slot, so
+        # keyed on obs_mode they would collide with the privileged oracle in
+        # every table and plot.
+        _row = ('gse+belief' if args.use_pf_tracker
+                else 'gse' if args.use_state_estimator
+                else args.obs_mode)
+        json.dump({'row': _row,
+                   'obs_mode': args.obs_mode,
+                   'use_state_estimator': args.use_state_estimator,
+                   'use_pf_tracker': args.use_pf_tracker,
+                   'resume': args.resume,
+                   'eval_seed': args.seed + args.eval_seed_offset + 1,
+                   'n_final_eval_episodes': args.n_final_eval_episodes,
+                   **{k: v for k, v in final_metrics.items()
+                      if isinstance(v, (int, float, str))}},
+                  _fj, indent=2)
+    print(f'[metrics] wrote {_final_json}')
     if args.use_wandb:
         log_dict = dict(final_metrics)
         if final_video_path:

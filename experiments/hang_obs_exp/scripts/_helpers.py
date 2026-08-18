@@ -609,3 +609,453 @@ def build_run_name_suffix(extra_args, *, algo='PPO', obs_kind=None,
         parts.append(f'_{extra_tag}')
 
     return ''.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Closed-loop hole servo for goal-chained ("chain") demo episodes.
+#
+# The waypoint builder above plans ONCE, in hole space, using a Δ = grip - hole
+# offset frozen at episode start, and both anchors then receive the same
+# velocity. Two consequences: the plan drifts off the hole as the cloth
+# deforms, and the cloth only ever TRANSLATES. This servo fixes both — it
+# recomputes the hole frame every control step, and adds a differential term
+# that varies the inter-anchor geometry, which is what actually folds the
+# cloth.
+#
+# Velocity is capped to real-rig scale, not to what the sim can do. Measured
+# on 0807_demos (8 demos, both arms): p50 0.60, p90 1.02, max 1.89 sim
+# units/s. DEFAULT_V_MAX sits just above p90 so demos look like teleop rather
+# than like a robot flinging cloth; MAX_ACT_VEL (4.0) is ~4x that and must
+# NOT become the operative limit.
+# ---------------------------------------------------------------------------
+REAL_SPEED_P50 = 0.60      # sim units/s, measured on 0807_demos
+REAL_SPEED_P90 = 1.02
+REAL_SPEED_MAX = 1.89
+
+DEFAULT_V_MAX = 1.2        # common-mode cap
+DEFAULT_V_DIFF_MAX = 0.5   # differential cap, deliberately < common mode
+
+
+def sample_chain_goal(rng, centroid, normal, r_min, r_max, in_view_fn,
+                      z_min=1.0, box=None, max_tries=64,
+                      elev_max_deg=35.0, azim_span_deg=60.0):
+    """A hole-centroid goal `r ~ U(r_min, r_max)` away, in a *reachable* place.
+
+    Direction is NOT uniform on the sphere, and that is deliberate. A hole in a
+    hanging cloth faces horizontally — measured: the normal sits at
+    |cos(normal, world z)| = 0.015 — so a goal with a large vertical component
+    can never satisfy the hole-orientation arrival test no matter how well the
+    servo tracks it. Elevation is therefore bounded, and azimuth is sampled
+    within `azim_span_deg` of where the hole currently points so the required
+    re-aiming stays inside one segment's time budget. Successive goals compound,
+    so the cloth can still end up facing anywhere over a full chain.
+
+    This also matches the real task, where the approach to the peg is
+    essentially horizontal followed by a drop.
+
+    Rejects goals that leave the workspace, sink to/below the table, or fall
+    outside the camera frustum. The last matters more than it looks: the cloth
+    already contributes few pixels, and a goal that drags it out of frame
+    starves the point cloud without failing anything loudly.
+    """
+    base_azim = float(np.arctan2(normal[1], normal[0])) \
+        if normal is not None else float(rng.uniform(-np.pi, np.pi))
+    # The normal's sign is arbitrary, so either facing is equally valid.
+    if rng.random() < 0.5:
+        base_azim += np.pi
+    for _ in range(max_tries):
+        azim = base_azim + np.radians(rng.uniform(-azim_span_deg, azim_span_deg))
+        elev = np.radians(rng.uniform(-elev_max_deg, elev_max_deg))
+        d = np.array([np.cos(elev) * np.cos(azim),
+                      np.cos(elev) * np.sin(azim),
+                      np.sin(elev)], dtype=np.float64)
+        g = centroid + d * rng.uniform(r_min, r_max)
+        if g[2] < z_min:
+            continue
+        if box is not None and np.abs(g).max() > box:
+            continue
+        if in_view_fn is not None and not in_view_fn(g):
+            continue
+        return g.astype(np.float32)
+    return None
+
+
+class HoleServo:
+    """Drives the cloth's hole to a sequence of sampled goals.
+
+    Per control step returns a 6-dim UNSCALED velocity (anchor0 xyz, anchor1
+    xyz) — the same layout dedo's action expects before the
+    `/ MAX_ACT_VEL` normalization the collector applies.
+    """
+
+    def __init__(self, rng, cloth_width, r_min=1.5, r_max=4.0,
+                 v_max=DEFAULT_V_MAX, v_diff_max=DEFAULT_V_DIFF_MAX,
+                 k_p=1.0, k_d=0.8, dwell=3, timeout_steps=90,
+                 pos_tol_radii=1.0, pos_tol_floor=0.5, orient_tol_deg=45.0,
+                 sep_lo=0.70, sep_hi=1.05, rot_deg=30.0,
+                 z_min=1.0, box=None, in_view_fn=None,
+                 slew_max=0.35, brake_speed=4.0):
+        self.rng = rng
+        self.cloth_width = float(cloth_width)
+        self.r_min, self.r_max = r_min, r_max
+        self.v_max, self.v_diff_max = v_max, v_diff_max
+        self.k_p, self.k_d = k_p, k_d
+        self.dwell, self.timeout_steps = dwell, timeout_steps
+        self.pos_tol_radii, self.pos_tol_floor = pos_tol_radii, pos_tol_floor
+        self.cos_tol = float(np.cos(np.radians(orient_tol_deg)))
+        self.sep_lo, self.sep_hi, self.rot_deg = sep_lo, sep_hi, rot_deg
+        self.z_min, self.box, self.in_view_fn = z_min, box, in_view_fn
+        self.slew_max = slew_max          # max change in commanded v per step
+        self.brake_speed = brake_speed    # measured |v| that triggers braking
+        self.n_brake_steps = 0
+        self._v_prev = np.zeros((2, 3), dtype=np.float64)
+
+        self.goal = None
+        self.approach = None
+        self.sep_target = None
+        self.rot_target = None
+        self._dwell_count = 0
+        self._seg_steps = 0
+        self.goals_reached = 0
+        self.goals_attempted = 0
+        self.segment_steps = []
+        self.goal_positions = []
+        self.n_unreliable_frames = 0
+
+    # -- goal lifecycle -----------------------------------------------------
+    def new_goal(self, centroid, anchor_a, anchor_b, normal=None):
+        g = sample_chain_goal(self.rng, centroid, normal, self.r_min,
+                              self.r_max, self.in_view_fn, self.z_min, self.box)
+        if g is None:
+            return False
+        self.goal = g
+        self.approach = g - centroid
+        n = float(np.linalg.norm(self.approach))
+        self.approach = (self.approach / n if n > 1e-9
+                         else np.array([0.0, 0.0, 1.0], np.float32))
+        # Per-segment inter-anchor target. Clamped to the rest width so the
+        # spring mesh is never asked to stretch past it.
+        self.sep_target = float(min(
+            self.cloth_width * self.rng.uniform(self.sep_lo, self.sep_hi),
+            self.cloth_width))
+        # Aim the anchor baseline PERPENDICULAR to the approach. The cloth
+        # hangs from the two anchors, so its plane contains the baseline and
+        # the hole normal is perpendicular to it — putting the baseline across
+        # the approach is what turns the hole to face where it is going, which
+        # the orientation arrival test then requires. The random term on top
+        # is the deformation knob, not the aiming mechanism.
+        a_h = np.array([self.approach[0], self.approach[1], 0.0])
+        if float(np.linalg.norm(a_h)) > 1e-6:
+            perp = np.cross(np.array([0.0, 0.0, 1.0]), a_h)
+            aim = float(np.arctan2(perp[1], perp[0]))
+        else:
+            aim = 0.0
+        self.rot_target = float(
+            aim + np.radians(self.rng.uniform(-self.rot_deg, self.rot_deg)))
+        self._dwell_count = 0
+        self._seg_steps = 0
+        self.goals_attempted += 1
+        self.goal_positions.append(np.asarray(g, dtype=np.float32))
+        return True
+
+    def reached(self, centroid, normal, radius, reliable):
+        """Position AND hole-plane orientation, held for `dwell` steps.
+
+        Position alone is satisfiable with the hole edge-on to the approach,
+        which would never thread a real peg — the orientation term is what
+        makes this transfer. |cos| because the PCA normal's sign is arbitrary.
+        Orientation is skipped on unreliable (collapsed) hole frames.
+        """
+        tol = max(self.pos_tol_radii * radius, self.pos_tol_floor)
+        ok = bool(np.linalg.norm(centroid - self.goal) < tol)
+        if ok and reliable and normal is not None:
+            ok = abs(float(normal @ self.approach)) > self.cos_tol
+        elif ok and not reliable:
+            self.n_unreliable_frames += 1
+        self._dwell_count = self._dwell_count + 1 if ok else 0
+        return self._dwell_count >= self.dwell
+
+    def timed_out(self):
+        return self._seg_steps >= self.timeout_steps
+
+    def close_segment(self, reached):
+        self.segment_steps.append(int(self._seg_steps))
+        if reached:
+            self.goals_reached += 1
+
+    # -- control ------------------------------------------------------------
+    def action(self, centroid, anchor_a, anchor_b, vel_a=None, vel_b=None):
+        """6-dim unscaled velocity: common-mode goal tracking + differential.
+
+        Two limits here are not cosmetic. dedo drives anchors with a
+        force-limited velocity PD (`command_anchor_velocity`: force =
+        clip(50*dv, +-10) on a 0.1 kg anchor), so a STEP change in the target
+        saturates that force and a taut cloth then flings the anchor past the
+        env's 20 units/s abort threshold -- measured: the episode died at step
+        23 with anchor linvel ~15 units/s while the command never exceeded
+        1.9. Hence the slew limit. And the cap is applied to the TOTAL
+        (common + differential) per anchor, not to each term separately, so
+        the realized speed actually matches the real-rig envelope the cap was
+        sized from rather than their sum.
+        """
+        self._seg_steps += 1
+
+        v = np.clip(self.k_p * (self.goal - centroid), -self.v_max, self.v_max)
+        v_common = np.repeat(v[None, :], 2, axis=0)
+
+        # Differential term: servo the anchor baseline toward this segment's
+        # (separation, yaw) target. Applied antisymmetrically so it deforms
+        # the cloth without moving its centre.
+        base = anchor_b - anchor_a
+        sep = float(np.linalg.norm(base))
+        if sep < 1e-6:
+            out = v_common
+        else:
+            u = base / sep
+            yaw = float(np.arctan2(u[1], u[0]))
+            # The baseline direction is defined only up to sign (b-a vs a-b),
+            # so aiming at rot_target must not force a needless 180 deg swing:
+            # take whichever of rot_target, rot_target+pi is the shorter turn,
+            # then wrap the error into (-pi, pi] before rate-limiting it.
+            def _wrap(x):
+                return (x + np.pi) % (2 * np.pi) - np.pi
+            cand = [_wrap(self.rot_target - yaw),
+                    _wrap(self.rot_target + np.pi - yaw)]
+            err = min(cand, key=abs)
+            desired_yaw = yaw + float(np.clip(err, -0.35, 0.35))
+            desired = np.array([np.cos(desired_yaw), np.sin(desired_yaw), u[2]],
+                               dtype=np.float64)
+            desired /= max(float(np.linalg.norm(desired)), 1e-9)
+            target_base = desired * self.sep_target
+            d_half = self.k_d * 0.5 * (target_base - base)
+            d_half = np.clip(d_half, -self.v_diff_max, self.v_diff_max)
+            out = np.stack([v_common[0] - d_half, v_common[1] + d_half])
+
+        # Cap the TOTAL per-anchor speed.
+        for i in range(2):
+            n = float(np.linalg.norm(out[i]))
+            if n > self.v_max:
+                out[i] *= self.v_max / n
+
+        # Active brake. dedo ends the episode the moment a measured anchor
+        # velocity exceeds MAX_OBS_VEL (20 units/s), and a 1 kg cloth swinging
+        # on 0.1 kg anchors gets there on its own -- measured: |linvel|/20 ran
+        # 0.49 -> 1.01 over five steps while the command never exceeded 1.2.
+        # When an anchor is already moving too fast, command a target OPPOSING
+        # its motion so the velocity PD spends its force budget decelerating
+        # instead of chasing the goal.
+        meas = [vel_a, vel_b]
+        for i in range(2):
+            if meas[i] is None:
+                continue
+            sp = float(np.linalg.norm(meas[i]))
+            if sp > self.brake_speed:
+                self.n_brake_steps += 1
+                out[i] = -(meas[i] / sp) * min(sp - self.brake_speed, self.v_max)
+        delta = out - self._v_prev
+        for i in range(2):
+            n = float(np.linalg.norm(delta[i]))
+            if n > self.slew_max:
+                delta[i] *= self.slew_max / n
+        out = self._v_prev + delta
+        self._v_prev = out.copy()
+        return out.reshape(-1).astype(np.float32)
+
+
+def cloth_min_z(deform_env):
+    """Height of the LOWEST cloth vertex above the ground plane."""
+    from dedo.utils.mesh_utils import get_mesh_data
+    _, verts = get_mesh_data(deform_env.sim, deform_env.deform_id)
+    v = np.asarray(verts, dtype=np.float32)
+    v = v[~np.isnan(v).any(axis=1)]
+    return float(v[:, 2].min()) if len(v) else float('inf')
+
+
+class SlackPhase:
+    """Put real slack and folds into the cloth before the goal-chasing starts.
+
+    A cloth held taut between two anchors is a flat sheet, and a flat sheet is
+    the easy case. Two motions run together to break that, both of them the
+    kind a real arm can execute:
+
+      CONVERGE — bring the anchors toward each other, to `squeeze` of the
+        cloth's rest width. This is the only direction we ever drive the
+        separation: pulling the anchors APART past the rest width stretches
+        the spring mesh, which is elastic deformation rather than folding and
+        does not correspond to anything the real cloth does.
+
+      LOWER — descend until the lowest cloth vertex is within `floor_clear`
+        of the ground, so the fabric piles against the floor and folds instead
+        of hanging flat.
+
+    Then hold, so the folds are settled rather than mid-swing when the goal
+    servo takes over. Speeds are capped by the same real-rig envelope the
+    chain controller uses, so these frames stay replayable on the robot.
+    """
+
+    def __init__(self, rng, cloth_width, squeeze_range=(0.45, 0.80),
+                 floor_clear=0.4, v_max=REAL_SPEED_P90, hold_steps=8,
+                 max_steps=120, slew_max=0.30, brake_speed=4.0,
+                 abort_guard=11.0):
+        self.rng = rng
+        self.cloth_width = float(cloth_width)
+        self.squeeze = float(rng.uniform(*squeeze_range))
+        self.sep_target = self.cloth_width * self.squeeze
+        self.floor_clear = float(floor_clear)
+        self.v_max = float(v_max)
+        self.hold_steps, self.max_steps = int(hold_steps), int(max_steps)
+        self.slew_max = float(slew_max)
+        self.brake_speed = float(brake_speed)
+        self.abort_guard = float(abort_guard)   # dedo aborts at 20 units/s
+        self.n_brake_steps = 0
+        self.n_guard_trips = 0
+        self._v_prev = np.zeros((2, 3), dtype=np.float64)
+        self._steps = 0
+        self._held = 0
+        self.reached_floor = False
+        self.min_z_seen = float('inf')
+        self.sep_start = None
+        self._last_min_z = None
+        self._stalled = 0
+
+    def action(self, a_pos, b_pos, min_z, v_a=None, v_b=None):
+        """6-dim unscaled velocity, or None when the phase is finished.
+
+        `v_a`/`v_b` are the MEASURED anchor velocities and are not optional in
+        practice: the anchors are 0.1 kg against a 1.0 kg cloth, so a swinging
+        or floor-piling cloth flings them far faster than anything commanded,
+        and dedo ends the episode above 20 units/s. Without braking on the
+        measured value this phase silently truncated 5 episodes in 6.
+        """
+        self._steps += 1
+        self.min_z_seen = min(self.min_z_seen, min_z)
+        a = np.asarray(a_pos, dtype=np.float64)
+        b = np.asarray(b_pos, dtype=np.float64)
+        if self.sep_start is None:
+            self.sep_start = float(np.linalg.norm(a - b))
+
+        sep = float(np.linalg.norm(a - b))
+        low_enough = min_z <= self.floor_clear
+        # Contact detection. Once the fabric is piling on the floor its lowest
+        # point stops descending however far the anchors keep going, and
+        # driving into the ground spikes the anchor velocity — dedo aborts the
+        # episode above 20 units/s, which silently truncated every slack
+        # episode before this check existed. Treat "stopped falling" as
+        # arrival, not just the height threshold.
+        if self._last_min_z is not None and min_z > self._last_min_z - 0.01:
+            self._stalled += 1
+        else:
+            self._stalled = 0
+        self._last_min_z = min_z
+        if self._stalled >= 4:
+            low_enough = True
+        self.reached_floor = self.reached_floor or low_enough
+        close_enough = sep <= self.sep_target
+
+        if (low_enough and close_enough) or self._steps > self.max_steps:
+            self._held += 1
+            if self._held >= self.hold_steps:
+                return None
+            return np.zeros(6, dtype=np.float32)   # settle in place
+
+        v = np.zeros((2, 3), dtype=np.float64)
+        if not close_enough:
+            # Antisymmetric: each anchor moves toward the midpoint, so the
+            # cloth's centre stays put and only the separation changes.
+            axis = (a - b)
+            n = float(np.linalg.norm(axis))
+            if n > 1e-9:
+                axis = axis / n
+                gain = min(1.0, (sep - self.sep_target) / max(self.cloth_width, 1e-6))
+                v[0] -= axis * self.v_max * 0.6 * max(gain, 0.25)
+                v[1] += axis * self.v_max * 0.6 * max(gain, 0.25)
+        if not low_enough:
+            drop = min(1.0, (min_z - self.floor_clear) / max(self.cloth_width, 1e-6))
+            v[:, 2] -= self.v_max * 0.30 * max(drop, 0.2)
+
+        # Brake on MEASURED velocity, exactly as HoleServo does: when the
+        # cloth has flung an anchor, the only useful command is one that
+        # opposes it, whatever the phase would otherwise like to do.
+        meas = np.zeros((2, 3), dtype=np.float64)
+        if v_a is not None and v_b is not None:
+            meas[0] = np.asarray(v_a, dtype=np.float64)
+            meas[1] = np.asarray(v_b, dtype=np.float64)
+        fastest = max(float(np.linalg.norm(meas[i])) for i in range(2))
+        for i in range(2):
+            sp = float(np.linalg.norm(meas[i]))
+            if sp > self.brake_speed:
+                self.n_brake_steps += 1
+                v[i] = -(meas[i] / sp) * min(sp - self.brake_speed, self.v_max)
+
+        # Bail out before dedo does. The env ends the episode once an anchor
+        # exceeds MAX_OBS_VEL (20 units/s), and a 1 kg cloth piling against the
+        # floor can fling a 0.1 kg anchor there faster than a 1 unit/s command
+        # can pull it back -- braking is far too weak an authority to win that
+        # race. Ending the phase hands control to the goal servo, which is
+        # proven stable, instead of losing the whole episode.
+        if fastest > self.abort_guard:
+            self.n_guard_trips += 1
+            if self.n_guard_trips >= 2:
+                return None
+            return np.zeros(6, dtype=np.float32)
+
+        # Same slew limit as the chain controller: a step change in commanded
+        # velocity flings the 0.1 kg anchors and trips the env's velocity abort.
+        delta = np.clip(v - self._v_prev, -self.slew_max, self.slew_max)
+        out = self._v_prev + delta
+        self._v_prev = out.copy()
+        return out.reshape(-1).astype(np.float32)
+
+
+def anchor_velocities(deform_env):
+    """LIVE anchor linear velocities from the sim.
+
+    Needed because the anchors are 0.1 kg and the cloth is 1.0 kg: a swinging
+    cloth flings them far faster than anything commanded. dedo aborts the
+    episode when |linvel| exceeds MAX_OBS_VEL (20 units/s), so the controller
+    has to watch the measured velocity, not just its own setpoint.
+    """
+    out = []
+    for aid in deform_env.anchor_ids:
+        _, linvel = deform_env.sim.getBaseVelocity(aid)
+        out.append(np.asarray(linvel, dtype=np.float32))
+    return out
+
+
+def anchor_positions(deform_env):
+    """LIVE anchor positions from the sim.
+
+    Not `deform_env.anchors[id]['pos']` — that dict holds the pose the anchor
+    was CREATED at and never updates, so a controller that closes the loop on
+    it silently commands a constant correction and stretches the cloth until
+    the env aborts the episode. That is a real bug this cost an hour to find.
+    """
+    out = []
+    for aid in deform_env.anchor_ids:
+        pos, _ = deform_env.sim.getBasePositionAndOrientation(aid)
+        out.append(np.asarray(pos, dtype=np.float32))
+    return out
+
+
+def make_in_view_fn(view, proj, margin=0.12):
+    """world point -> bool, is it comfortably inside the camera frustum.
+
+    Same projection convention as overlay_pcd_on_rgb / _diag_pcd_framing
+    (clip = proj @ view @ p, column-major reshape). `margin` shrinks the NDC
+    box so a goal never lands right at the image edge — the cloth hangs BELOW
+    the hole, so a hole at the border puts most of the cloth outside.
+    """
+    v = np.asarray(view, dtype=np.float64).reshape(4, 4, order='F')
+    p = np.asarray(proj, dtype=np.float64).reshape(4, 4, order='F')
+    m = p @ v
+    lim = 1.0 - float(margin)
+
+    def _in_view(pt):
+        clip = m @ np.array([pt[0], pt[1], pt[2], 1.0], dtype=np.float64)
+        if abs(clip[3]) < 1e-9:
+            return False
+        ndc = clip[:3] / clip[3]
+        return bool(abs(ndc[0]) < lim and abs(ndc[1]) < lim
+                    and -1.0 < ndc[2] < 1.0)
+
+    return _in_view

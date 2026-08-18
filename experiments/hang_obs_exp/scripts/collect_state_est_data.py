@@ -221,6 +221,18 @@ parser.add_argument('--min_valid_px', type=int, default=256,
                          'exactly pcd_n_points long by construction — so the '
                          'floor has to be enforced here. 0 = only drop empty '
                          'frames.')
+parser.add_argument('--max_edge_stretch', type=float, default=3.0,
+                    help='Truncate the episode at the first frame whose max '
+                         'edge length exceeds this multiple of its rest '
+                         'length — i.e. when the explicit spring solver has '
+                         'gone unstable and the mesh is inflating. Such frames '
+                         'are physically invalid GT but structurally perfect '
+                         '(right shape, no NaNs), so nothing downstream '
+                         'complains: the 2026-07-30 collection shipped with '
+                         '100% of random-action and 26% of scripted episodes '
+                         'affected, peaking at 22.7x. Default 3.0 sits above '
+                         'the 2.94x worst case across the 854 clean BC demos. '
+                         '0 = off.')
 parser.add_argument('--guard_episodes', type=int, default=3,
                     help='Check cloth-pixel coverage over the first N kept '
                          'episodes and abort if the camera is framing empty '
@@ -639,6 +651,29 @@ def run_episode(source, debug=False):
             if valid_px is not None and valid_px < extra.min_valid_px:
                 truncated_at = len(positions_seq)
                 break
+            # Stop at the first frame where the SOLVER has gone unstable.
+            # dedo's explicit springs diverge when the cloth is driven hard;
+            # the mesh then inflates into a ball and never recovers, while the
+            # arrays stay perfectly well-formed (right shape, no NaNs), so
+            # nothing downstream can tell. Measured on the 2026-07-30
+            # collection: 100% of random-action and 26% of scripted episodes
+            # contained such frames, peaking at 22.7x rest edge length.
+            # Truncate rather than skip, for the same reason as above.
+            if (extra.max_edge_stretch > 0 and pos is not None
+                    and pos.shape[0] == num_verts and len(edges)):
+                _e = np.asarray(edges, dtype=np.int64)
+                _rl = np.linalg.norm(rest_pos[_e[:, 0]] - rest_pos[_e[:, 1]],
+                                     axis=-1)
+                _ok = _rl > 1e-9
+                _cur = np.linalg.norm(pos[_e[_ok, 0]] - pos[_e[_ok, 1]],
+                                      axis=-1)
+                _stretch = float((_cur / _rl[_ok]).max()) if _ok.any() else 0.0
+                if not np.isfinite(pos).all() or _stretch > extra.max_edge_stretch:
+                    print(f'    [guard] solver blow-up at frame '
+                          f'{len(positions_seq)} (max edge stretch '
+                          f'{_stretch:.1f}x) — truncating episode')
+                    truncated_at = len(positions_seq)
+                    break
             if pos is not None and pos.shape[0] == num_verts:
                 positions_seq.append(pos)
                 pcd_seq.append(pcd)

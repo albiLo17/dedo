@@ -128,23 +128,40 @@ SCENE_INFO = {
         },
         'goal_pos': [[0.00, 1.28, 9]],
     },
+    # Peg re-centred on the MEASURED real hanger tip, 2026-08-09.
+    # It was [0, 0, 8.2]; the real tip triangulates to [1.366, -1.266, 6.213]
+    # in sim units (world [0.557, 0.0615, 0.2406] m — see
+    # HANDOFF_real2sim.md). The old placement put every peg-threading goal
+    # 89 mm ABOVE the real one, and --randomize_goal_radius only jitters
+    # (dx, dy), so no training goal ever reached the real height: nearest
+    # thread goal to the real operating point was 91.7 mm, 0 % within 90 mm.
+    # The hanger origin sits 0.2 below its arm tip, hence 6.213 - 0.2.
     'hangcloth': {
         'entities': {
             'urdf/hanger.urdf': {
-                'basePosition': [0.0, 0, 8],
+                'basePosition': [1.366, -1.266, 6.013],
                 'baseOrientation': [0, 0, 0],
                 'globalScaling': 10.0,
 
             },
+            # The rod MUST follow the hanger: tallrod.urdf is a 0.8 m cylinder
+            # at globalScaling=10, so its top is always base + 8.0, and the
+            # original preset paired hanger z=8.0 with rod z=0 precisely so the
+            # peg sat ON the post. Re-centring the hanger to the measured tip
+            # (6.013) while leaving the rod at 0 left a bare post standing 1.79
+            # units (80 mm) ABOVE the goal point: the scripted expert was
+            # threading the cloth onto a spike, and its success fell 42% -> 2%.
+            # base = hanger z - 8.0. Sinking it into the floor is correct -- a
+            # lower peg is a SHORTER post, and the floor hides the remainder.
             'urdf/tallrod.urdf': {
-                'basePosition': [0.00, 0.00, 0],
+                'basePosition': [1.366, -1.266, -1.987],
                 'baseOrientation': [0, 0, 0],
                 'globalScaling': 10.0,
                 'useTexture': True,
             },
 
         },
-        'goal_pos': [[0, 0.00, 8.2]],
+        'goal_pos': [[1.366, -1.266, 6.213]],
     },
     'hangcloth_real': {
         'entities': {

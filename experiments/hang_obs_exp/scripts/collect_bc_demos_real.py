@@ -168,6 +168,23 @@ parser.add_argument('--randomize_goal_radius', type=float, default=0.0,
                          'saved per pkl as `randomize_goal_radius` and the '
                          'training script enforces strict parity across the '
                          'demo dir.')
+# Cloth material. These were never fitted to real fabric -- the preset values
+# were chosen to keep the explicit spring solver stable, and at the pinned real
+# cloth size (258 x 230 mm) they are not: the sheet diverges around t=36.
+# Explicit mass-spring stability needs dt < 2*sqrt(m_node/k), and with
+# mass 0.1 over ~219 nodes against elastic 120 that margin is only ~2x at
+# sim_freq 500. Exposed so the trade (softer springs vs finer timestep) can be
+# measured rather than guessed.
+parser.add_argument('--deform_elastic_stiffness', type=float, default=None)
+parser.add_argument('--deform_bending_stiffness', type=float, default=None)
+parser.add_argument('--deform_damping_stiffness', type=float, default=None)
+parser.add_argument('--deform_mass', type=float, default=None)
+parser.add_argument('--proc_cloth_wh', type=float, nargs=2, default=None,
+                    help='Pin the cloth to WIDTH HEIGHT in obj units (before '
+                         'deform_scale). The two anchors are the TOP corners, '
+                         'so WIDTH is exactly the gripper separation -- this '
+                         'is how the grippers get initialised at a measured '
+                         'real pose. Unset samples the size as before.')
 parser.add_argument('--cam_viewmat', type=float, nargs=6,
                     default=[0.63, -5.0, 45.0, 0.5, 0.0, 0.21],
                     help='dedo cam_viewmat: dist pitch yaw tx ty tz. '
@@ -273,8 +290,17 @@ sys.argv = [
     *[str(x) for x in extra.cam_viewmat],
     f'--randomize_goal_radius={extra.randomize_goal_radius}',
 ]
+# preset_override_util re-applies DEFORM_INFO on every reset and only skips an
+# arg whose name is already in sys.argv, so a material override has to be named
+# here or it is silently reverted at the first reset.
+for _n in ('deform_elastic_stiffness', 'deform_bending_stiffness',
+           'deform_damping_stiffness', 'deform_mass'):
+    _v = getattr(extra, _n)
+    if _v is not None:
+        sys.argv += [f'--{_n}={_v}']
 args, _ = get_args_parser()
 args_postprocess(args)
+args.proc_cloth_wh = extra.proc_cloth_wh
 args.debug = False
 args.viz = getattr(extra, 'viz', False)
 args.uint8_pixels = True  # we manage RGB ourselves; this is a defensive default

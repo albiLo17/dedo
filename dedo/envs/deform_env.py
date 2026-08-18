@@ -36,6 +36,26 @@ from ..utils.args import preset_override_util
 from ..utils.process_camera import ProcessCamera, cameraConfig
 
 
+def _sample_node_density(args):
+    """Per-episode mesh resolution for the procedural cloth generators.
+
+    `node_density` sets the cloth's grid resolution, so it drives vertex count,
+    triangle size and — because hole extents are expressed as a fraction of it
+    — the granularity of the hole boundary. Drawn per episode when
+    `--node_density_range lo hi` is given, otherwise the historical fixed 15.
+    """
+    rng = getattr(args, 'node_density_range', None)
+    if rng is None:
+        return 15
+    lo, hi = int(rng[0]), int(rng[1])
+    if lo < 6 or hi < lo:
+        raise ValueError(
+            f'--node_density_range must be 6 <= lo <= hi, got {lo} {hi}. '
+            f'Below ~6 the hole constraints (2..density-2) leave no room to '
+            f'place a hole at all.')
+    return int(np.random.randint(lo, hi + 1))
+
+
 class DeformEnv(gym.Env):
     MAX_OBS_VEL = 20.0  # max vel (in m/s) for the anchor observations
     MAX_ACT_VEL = 10.0  # max vel (in m/s) for the anchor actions
@@ -126,7 +146,7 @@ class DeformEnv(gym.Env):
             'yaw': yaw,
             'cameraTargetPosition': [pos_x, pos_y, pos_z],
             'upAxisIndex': 2,
-            'roll': 0,
+            'roll': float(getattr(self.args, 'cam_roll_deg', 0.0)),
         }
         view_mat = self.sim.computeViewMatrixFromYawPitchRoll(**cam)
         return view_mat
@@ -164,7 +184,11 @@ class DeformEnv(gym.Env):
         if args.override_deform_obj is not None:
             deform_obj = args.override_deform_obj
         elif self.args.task == 'HangProcCloth':  # procedural gen. for hanging
-            args.node_density = 15
+            # Mesh resolution was pinned at 15 for EVERY cloth ever generated,
+            # so the whole dataset shared one triangulation density and the
+            # policy never saw a coarser or finer mesh than it trained on.
+            # --node_density_range makes it a per-episode draw; unset keeps 15.
+            args.node_density = _sample_node_density(args)
             if args.version == 0:
                 args.num_holes = np.random.randint(2)+1
             elif args.version in [1,2]:
@@ -289,12 +313,19 @@ class DeformEnv(gym.Env):
             texture_file = None
             if 'useTexture' in kwargs and kwargs['useTexture']:
                 texture_file = self.get_texture_path(args.rigid_texture_file)
-            # Apply the same dxy shift to hanger + tallrod for hangcloth scenes.
+            # dx, dy AND dz shift hanger + tallrod together. dz used to move the
+            # hanger only, on the reasoning that the rod stands on the floor and
+            # shifting it would sink it -- but sinking it is exactly right.
+            # tallrod.urdf is 8.0 sim units tall, so its top is always base+8.0;
+            # sliding the hanger down a fixed rod leaves a bare post standing
+            # ABOVE the goal, and the expert then threads the cloth onto a
+            # spike. That cost 42% -> 2% success when the scene was re-centred,
+            # and with --randomize_goal_dz it re-created the same fault on every
+            # episode. A lower peg is a SHORTER post; the floor hides the rest.
             base_position = list(kwargs['basePosition'])
             if _is_hangcloth_scene:
-                base_position[0] = float(base_position[0]) + float(goal_delta[0])
-                base_position[1] = float(base_position[1]) + float(goal_delta[1])
-                base_position[2] = float(base_position[2]) + float(goal_delta[2])
+                base_position = [float(base_position[i]) + float(goal_delta[i])
+                                 for i in range(3)]
             id = load_rigid_object(
                 sim, os.path.join(data_path, name), kwargs['globalScaling'],
                 base_position, kwargs['baseOrientation'],

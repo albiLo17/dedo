@@ -128,6 +128,16 @@ def get_args_parser():
                         help='Generate the view matrix for rendering camera'
                              '(not the debug camera). '
                              '[distance, pitch, yaw, posX, posY, posZ]')
+    parser.add_argument('--cam_roll_deg', type=float, default=0.0,
+                        help='Roll of the rendering camera about its optical '
+                             'axis. Kept out of --cam_viewmat so the existing '
+                             '6-element arity (and every recorded pkl) stays '
+                             'valid. The real ZED carries ~6 deg of roll, '
+                             'which the previous hardcoded roll=0 could not '
+                             'express. Note this barely affects a WORLD-frame '
+                             'point cloud — it rotates the sampling lattice, '
+                             'not the set of visible surface points — so it '
+                             'matters for the rgb obs mode, not pcd.')
     parser.add_argument('--randomize_goal_radius', type=float, default=0.0,
                         help='HangProcCloth only: half-extent (meters) of a '
                              'uniform xy box around the nominal hanger pose. '
@@ -144,12 +154,12 @@ def get_args_parser():
                              'a uniform shift along z for the hanger goal, '
                              'sampled independently of --randomize_goal_radius. '
                              'Randomizes peg HEIGHT so the policy cannot learn '
-                             'a fixed lift amplitude. Shifts hanger + tallrod + '
-                             'goal_pos[*] together. NB the tallrod is a static '
-                             '(mass=0) body, so a positive dz leaves a cosmetic '
-                             'gap under it and a negative dz sinks it into the '
-                             'floor - dynamically harmless, but keep |dz| small '
-                             'relative to the rod length. Units follow the '
+                             'a fixed lift amplitude. Shifts the HANGER and '
+                             'goal_pos[*]; the tallrod keeps its z because it '
+                             'stands on the floor and moving it would sink or '
+                             'float the base. Physically this is a coat-rack '
+                             'arm sliding along a planted pole. Units follow '
+                             'the '
                              'scene: sim units for hangcloth (~22x real), '
                              'metres for hangcloth_real. Default 0 = off.')
     #
